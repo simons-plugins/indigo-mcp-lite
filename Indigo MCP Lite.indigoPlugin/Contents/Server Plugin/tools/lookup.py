@@ -1,10 +1,50 @@
 """Lookup tools — read-only primitives over Indigo's object model.
 
 Each tool wraps a single Indigo iter / lookup; no business logic.
-Real implementations land per-task: this module starts with a
-``list_devices`` stub (Task 3.1) that returns an empty paginated
-result, and Task 3.2 fills the body in.
+``_normalize_pagination`` and ``_serialize_device`` are deliberately
+top-level so the next list/get tools (list_variables,
+list_action_groups, get_devices_by_type, get_devices_by_state, etc.)
+share the same wire shape.
 """
+
+
+_DEFAULT_LIMIT = 50
+_MAX_LIMIT = 500
+
+
+def _normalize_pagination(args):
+    """Coerce + clamp limit/offset for any list-style tool.
+
+    limit: defaults to 50, capped at 500, floored at 1.
+    offset: defaults to 0, floored at 0.
+    Reused by list_variables, list_action_groups, get_devices_by_type,
+    get_devices_by_state — all subsequent list-paginated tools.
+    """
+    limit = args.get("limit", _DEFAULT_LIMIT)
+    limit = max(1, min(_MAX_LIMIT, int(limit)))
+    offset = max(0, int(args.get("offset", 0)))
+    return limit, offset
+
+
+def _serialize_device(d):
+    """Stable dict shape for a single Indigo device.
+
+    Used by list_devices, get_device_by_id, get_devices_by_type,
+    get_devices_by_state. Centralised so the wire shape never drifts
+    between tools.
+    """
+    return {
+        "id": d.id,
+        "name": d.name,
+        "type": getattr(d, "deviceTypeId", ""),
+        "model": getattr(d, "model", ""),
+        "address": getattr(d, "address", ""),
+        "description": getattr(d, "description", ""),
+        "folder_id": getattr(d, "folderId", 0),
+        "plugin_id": getattr(d, "pluginId", ""),
+        "on_state": getattr(d, "onState", None),
+        "brightness": getattr(d, "brightness", None),
+    }
 
 
 def register(handler, *, indigo_module):
@@ -29,15 +69,15 @@ def register(handler, *, indigo_module):
 
 
 def _list_devices_handler(args, indigo_module):
-    """Stub — real implementation lands in Task 3.2.
-
-    Shape matches the paginated envelope every list-style tool will
-    return, so callers and tests can already key off it.
-    """
+    """Return a paginated, serialized snapshot of ``indigo.devices``."""
+    limit, offset = _normalize_pagination(args)
+    all_devices = list(indigo_module.devices)
+    total = len(all_devices)
+    page = all_devices[offset:offset + limit]
     return {
-        "results": [],
-        "total_count": 0,
-        "offset": 0,
-        "limit": 50,
-        "has_more": False,
+        "results": [_serialize_device(d) for d in page],
+        "total_count": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
     }
