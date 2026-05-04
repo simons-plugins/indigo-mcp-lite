@@ -159,6 +159,20 @@ def register(handler, *, indigo_module):
         },
         handler=lambda args: _get_action_group_handler(args, indigo_module),
     )
+    handler.register_tool(
+        name="get_devices_by_type",
+        description="List Indigo devices filtered by deviceTypeId.",
+        input_schema={
+            "type": "object",
+            "required": ["device_type"],
+            "properties": {
+                "device_type": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        handler=lambda args: _get_devices_by_type_handler(args, indigo_module),
+    )
 
 
 def _list_devices_handler(args, indigo_module):
@@ -279,3 +293,34 @@ def _get_action_group_handler(args, indigo_module):
     group_id = _require_int_id(args)
     group = _lookup_or_raise(indigo_module.actionGroups, group_id, "action group")
     return _serialize_action_group(group)
+
+
+def _paginate_devices(matched, limit, offset):
+    """Bundle a filtered device list into the standard list envelope.
+
+    Shared between get_devices_by_type and get_devices_by_state — both
+    filter then paginate, so the wire shape and the slicing live here
+    once.
+    """
+    total = len(matched)
+    page = matched[offset:offset + limit]
+    return {
+        "results": [_serialize_device(d) for d in page],
+        "total_count": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
+    }
+
+
+def _get_devices_by_type_handler(args, indigo_module):
+    """Return paginated devices whose deviceTypeId matches ``device_type``."""
+    device_type = args.get("device_type")
+    if not isinstance(device_type, str):
+        raise ValueError("device_type must be a string")
+    limit, offset = _normalize_pagination(args)
+    matched = [
+        d for d in indigo_module.devices
+        if getattr(d, "deviceTypeId", "") == device_type
+    ]
+    return _paginate_devices(matched, limit, offset)
