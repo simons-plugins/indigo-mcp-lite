@@ -129,6 +129,36 @@ def register(handler, *, indigo_module):
         input_schema={"type": "object", "properties": {}},
         handler=lambda args: _list_device_folders_handler(args, indigo_module),
     )
+    handler.register_tool(
+        name="get_device_by_id",
+        description="Return a single Indigo device by id.",
+        input_schema={
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "integer"}},
+        },
+        handler=lambda args: _get_device_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="get_variable_by_id",
+        description="Return a single Indigo variable by id.",
+        input_schema={
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "integer"}},
+        },
+        handler=lambda args: _get_variable_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="get_action_group_by_id",
+        description="Return a single Indigo action group by id.",
+        input_schema={
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "integer"}},
+        },
+        handler=lambda args: _get_action_group_handler(args, indigo_module),
+    )
 
 
 def _list_devices_handler(args, indigo_module):
@@ -206,3 +236,46 @@ def _list_variable_folders_handler(_args, indigo_module):
 def _list_device_folders_handler(_args, indigo_module):
     """Return all device folders as ``{results, total_count}``."""
     return _list_folders(indigo_module.devices.folders)
+
+
+def _require_int_id(args):
+    """Pull an ``id`` int out of args or raise a clear ValueError.
+
+    Booleans are rejected even though ``isinstance(True, int)`` is
+    True — the schema says integer, and a bool id is almost always a
+    caller bug rather than a meaningful query.
+    """
+    raw = args.get("id")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError("id must be an integer")
+    return raw
+
+
+def _lookup_or_raise(collection, entity_id, entity_label):
+    """Subscript ``collection[entity_id]`` and translate Indigo's
+    KeyError / IndexError / ValueError into a friendly ValueError."""
+    try:
+        return collection[entity_id]
+    except (KeyError, IndexError, ValueError):
+        raise ValueError(f"no {entity_label} with id {entity_id}")
+
+
+def _get_device_handler(args, indigo_module):
+    """Return a single serialised device by id."""
+    device_id = _require_int_id(args)
+    dev = _lookup_or_raise(indigo_module.devices, device_id, "device")
+    return _serialize_device(dev)
+
+
+def _get_variable_handler(args, indigo_module):
+    """Return a single serialised variable by id."""
+    variable_id = _require_int_id(args)
+    var = _lookup_or_raise(indigo_module.variables, variable_id, "variable")
+    return _serialize_variable(var)
+
+
+def _get_action_group_handler(args, indigo_module):
+    """Return a single serialised action group by id."""
+    group_id = _require_int_id(args)
+    group = _lookup_or_raise(indigo_module.actionGroups, group_id, "action group")
+    return _serialize_action_group(group)
