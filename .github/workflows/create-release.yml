@@ -1,0 +1,53 @@
+name: Create Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from Info.plist
+        id: get_version
+        run: |
+          VERSION=$(grep -A1 '<key>PluginVersion</key>' "Indigo MCP Lite.indigoPlugin/Contents/Info.plist" | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Found version: $VERSION"
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          if git tag -l | grep -q "^${VERSION}$"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag ${VERSION} already exists, skipping release creation"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag ${VERSION} does not exist, will create release"
+          fi
+
+      - name: Create plugin bundle zip
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          zip -r "Indigo MCP Lite.indigoPlugin.zip" "Indigo MCP Lite.indigoPlugin"
+          echo "Created Indigo MCP Lite.indigoPlugin.zip"
+
+      - name: Create Release
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}
+          name: Release ${{ steps.get_version.outputs.version }}
+          generate_release_notes: true
+          files: Indigo MCP Lite.indigoPlugin.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
