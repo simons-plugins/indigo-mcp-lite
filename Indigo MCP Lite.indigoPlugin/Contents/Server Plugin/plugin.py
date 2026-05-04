@@ -1,8 +1,8 @@
 """indigo-mcp-lite — stdlib-only MCP server plugin.
 
-Lifecycle: indexer + MCP handler are wired up in startup;
-indexer subscribes to Indigo entity events. MCP requests arrive
-via Indigo's IWS as Action callbacks (handle_mcp).
+Lifecycle: MCP handler is constructed in __init__ so it's ready
+before any IWS Action callback can fire. MCP requests arrive via
+Indigo's IWS as Action callbacks (handle_mcp).
 """
 
 import json
@@ -68,9 +68,12 @@ class Plugin(indigo.PluginBase):
         try:
             return self.mcp_handler.handle_request(http_method, headers, body)
         except Exception as exc:
+            # Mirrors the inner handler's discipline at mcp_handler.py
+            # (-32603 "Internal error"): keep exception detail in logs,
+            # return a fixed message to avoid leaking paths/types.
             self.logger.exception(f"MCP handler raised: {exc}")
             return {
                 "status": 500,
                 "headers": {"Content-Type": "application/json"},
-                "content": json.dumps({"error": str(exc)}),
+                "content": json.dumps({"error": "internal_error"}),
             }
