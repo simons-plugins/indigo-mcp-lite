@@ -47,6 +47,33 @@ def _serialize_device(d):
     }
 
 
+def _serialize_variable(v):
+    """Stable dict shape for an Indigo variable.
+
+    Used by list_variables and get_variable_by_id.
+    """
+    return {
+        "id": v.id,
+        "name": v.name,
+        "value": getattr(v, "value", ""),
+        "folder_id": getattr(v, "folderId", 0),
+        "description": getattr(v, "description", ""),
+    }
+
+
+def _serialize_action_group(a):
+    """Stable dict shape for an Indigo action group.
+
+    Used by list_action_groups and get_action_group_by_id.
+    """
+    return {
+        "id": a.id,
+        "name": a.name,
+        "description": getattr(a, "description", ""),
+        "folder_id": getattr(a, "folderId", 0),
+    }
+
+
 def register(handler, *, indigo_module):
     """Register every lookup tool onto the given MCPHandler.
 
@@ -66,6 +93,30 @@ def register(handler, *, indigo_module):
         },
         handler=lambda args: _list_devices_handler(args, indigo_module),
     )
+    handler.register_tool(
+        name="list_variables",
+        description="List Indigo variables with optional pagination.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        handler=lambda args: _list_variables_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="list_action_groups",
+        description="List Indigo action groups with optional pagination.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        handler=lambda args: _list_action_groups_handler(args, indigo_module),
+    )
 
 
 def _list_devices_handler(args, indigo_module):
@@ -76,6 +127,36 @@ def _list_devices_handler(args, indigo_module):
     page = all_devices[offset:offset + limit]
     return {
         "results": [_serialize_device(d) for d in page],
+        "total_count": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
+    }
+
+
+def _list_variables_handler(args, indigo_module):
+    """Return a paginated, serialized snapshot of ``indigo.variables``."""
+    limit, offset = _normalize_pagination(args)
+    all_variables = list(indigo_module.variables)
+    total = len(all_variables)
+    page = all_variables[offset:offset + limit]
+    return {
+        "results": [_serialize_variable(v) for v in page],
+        "total_count": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
+    }
+
+
+def _list_action_groups_handler(args, indigo_module):
+    """Return a paginated, serialized snapshot of ``indigo.actionGroups``."""
+    limit, offset = _normalize_pagination(args)
+    all_groups = list(indigo_module.actionGroups)
+    total = len(all_groups)
+    page = all_groups[offset:offset + limit]
+    return {
+        "results": [_serialize_action_group(a) for a in page],
         "total_count": total,
         "offset": offset,
         "limit": limit,
