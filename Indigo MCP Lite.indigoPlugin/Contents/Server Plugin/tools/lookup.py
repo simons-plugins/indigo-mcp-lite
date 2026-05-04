@@ -117,6 +117,18 @@ def register(handler, *, indigo_module):
         },
         handler=lambda args: _list_action_groups_handler(args, indigo_module),
     )
+    handler.register_tool(
+        name="list_variable_folders",
+        description="List Indigo variable folders (id + name).",
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda args: _list_variable_folders_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="list_device_folders",
+        description="List Indigo device folders (id + name).",
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda args: _list_device_folders_handler(args, indigo_module),
+    )
 
 
 def _list_devices_handler(args, indigo_module):
@@ -162,3 +174,35 @@ def _list_action_groups_handler(args, indigo_module):
         "limit": limit,
         "has_more": offset + limit < total,
     }
+
+
+def _serialize_folder(f):
+    """Stable dict shape for a variable or device folder.
+
+    Folders are minimal in the IOM (id + name); kept in a single
+    helper because both folder list tools serialise identically.
+    """
+    return {"id": f.id, "name": f.name}
+
+
+def _list_folders(folder_iterable):
+    """Materialise + serialise a folder iterable.
+
+    No pagination — folder counts are small (tens, not hundreds),
+    so the full list always fits in one response.
+    """
+    folders = list(folder_iterable)
+    return {
+        "results": [_serialize_folder(f) for f in folders],
+        "total_count": len(folders),
+    }
+
+
+def _list_variable_folders_handler(_args, indigo_module):
+    """Return all variable folders as ``{results, total_count}``."""
+    return _list_folders(indigo_module.variables.folders)
+
+
+def _list_device_folders_handler(_args, indigo_module):
+    """Return all device folders as ``{results, total_count}``."""
+    return _list_folders(indigo_module.devices.folders)
