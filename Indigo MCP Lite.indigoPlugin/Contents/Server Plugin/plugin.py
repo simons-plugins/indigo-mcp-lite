@@ -30,6 +30,10 @@ class Plugin(indigo.PluginBase):
 
     def startup(self):
         self.logger.info("indigo-mcp-lite startup")
+        # Deferred import: keeps test imports of `plugin` from pulling
+        # in the whole tool tree at module-load time.
+        from tool_registry import register_all
+        register_all(self.mcp_handler, indigo_module=indigo)
 
     def shutdown(self):
         self.logger.info("indigo-mcp-lite shutdown")
