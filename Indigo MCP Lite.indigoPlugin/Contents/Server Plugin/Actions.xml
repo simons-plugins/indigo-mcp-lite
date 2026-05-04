@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<Actions>
+    <!-- MCP (Model Context Protocol) endpoint. JSON-RPC 2.0 over HTTP POST.
+         Claude Desktop / Claude Code connect here via the `mcp-remote`
+         bridge or (for clients that support it) native HTTP transport.
+         URL: POST /message/com.simons-plugins.indigo-mcp-lite/mcp -->
+    <Action id="mcp" uiPath="hidden">
+        <Name>MCP Endpoint</Name>
+        <CallbackMethod>handle_mcp</CallbackMethod>
+    </Action>
+</Actions>

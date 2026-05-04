@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<MenuItems>
+    <MenuItem id="reindexNow">
+        <Name>Reindex Search Database</Name>
+        <CallbackMethod>menuReindexNow</CallbackMethod>
+    </MenuItem>
+</MenuItems>

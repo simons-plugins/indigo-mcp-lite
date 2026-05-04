@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<Devices>
+    <!-- No devices in this plugin. The MCP transport runs in plugin.py. -->
+</Devices>

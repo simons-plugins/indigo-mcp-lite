@@ -1,0 +1,30 @@
+name: Version Check
+
+on:
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from Info.plist
+        id: get_version
+        run: |
+          VERSION=$(grep -A1 '<key>PluginVersion</key>' "Indigo MCP Lite.indigoPlugin/Contents/Info.plist" | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Found version: $VERSION"
+
+      - name: Check if version tag already exists
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          if git tag -l | grep -q "^${VERSION}$"; then
+            echo "::error::Version ${VERSION} already exists as a tag. Please update the version in Info.plist."
+            exit 1
+          fi
+          echo "Version ${VERSION} is unique - check passed"
