@@ -1,9 +1,23 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local env
+.env
+.env.local
+
+# macOS / IDE
 .DS_Store
 .vscode/
 .idea/
-*.egg-info/
+
+# Build outputs
 build/
 dist/
+
+# Indigo plugin runtime
+*.indigoPluginPrefs
