@@ -7,6 +7,8 @@ list_action_groups, get_devices_by_type, get_devices_by_state, etc.)
 share the same wire shape.
 """
 
+from tools.state_filter import matches as _state_matches
+
 
 _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 500
@@ -173,6 +175,24 @@ def register(handler, *, indigo_module):
         },
         handler=lambda args: _get_devices_by_type_handler(args, indigo_module),
     )
+    handler.register_tool(
+        name="get_devices_by_state",
+        description=(
+            "List Indigo devices matching a state spec. "
+            "Spec is a JSON object whose keys are state names; values are "
+            "either literals (==) or string-prefixed comparators "
+            "(>=, <=, >, <), e.g. {\"onState\": true, \"batteryLevel\": \"<20\"}."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "state_spec": {"type": "object", "additionalProperties": True},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        handler=lambda args: _get_devices_by_state_handler(args, indigo_module),
+    )
 
 
 def _list_devices_handler(args, indigo_module):
@@ -323,4 +343,18 @@ def _get_devices_by_type_handler(args, indigo_module):
         d for d in indigo_module.devices
         if getattr(d, "deviceTypeId", "") == device_type
     ]
+    return _paginate_devices(matched, limit, offset)
+
+
+def _get_devices_by_state_handler(args, indigo_module):
+    """Return paginated devices matching a state spec.
+
+    See ``tools.state_filter`` for the spec format. An empty (or
+    missing) spec matches every device — symmetric with list_devices.
+    """
+    spec = args.get("state_spec", {})
+    if not isinstance(spec, dict):
+        raise ValueError("state_spec must be an object")
+    limit, offset = _normalize_pagination(args)
+    matched = [d for d in indigo_module.devices if _state_matches(d, spec)]
     return _paginate_devices(matched, limit, offset)
