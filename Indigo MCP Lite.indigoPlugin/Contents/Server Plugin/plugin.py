@@ -27,14 +27,14 @@ class Plugin(indigo.PluginBase):
     def shutdown(self):
         self.logger.info("indigo-mcp-lite shutdown")
 
-    def closedPrefsConfigUi(self, values_dict, user_cancelled):
-        if not user_cancelled:
+    def closedPrefsConfigUi(self, valuesDict, userCancelled):
+        if not userCancelled:
             self._apply_log_level()
 
     def menuReindexNow(self):
         # Wired in Phase 6
         self.logger.info("Reindex Now: stub (wired in Phase 6)")
 
-    def handle_mcp(self, action, dev=None, callerWaitingForResult=True):
+    def handle_mcp(self, action, dev=None, callerWaitingForResult=None):
         # Wired in Phase 2
         return {"status": 503, "headers": {"Content-Type": "text/plain"}, "content": "MCP not wired yet"}
