@@ -93,7 +93,7 @@ def register(handler, *, indigo_module):
                 "offset": {"type": "integer", "minimum": 0},
             },
         },
-        handler=lambda args: _list_devices_handler(args, indigo_module),
+        handler=lambda **args: _list_devices_handler(args, indigo_module),
     )
     handler.register_tool(
         name="list_variables",
@@ -105,7 +105,7 @@ def register(handler, *, indigo_module):
                 "offset": {"type": "integer", "minimum": 0},
             },
         },
-        handler=lambda args: _list_variables_handler(args, indigo_module),
+        handler=lambda **args: _list_variables_handler(args, indigo_module),
     )
     handler.register_tool(
         name="list_action_groups",
@@ -117,19 +117,19 @@ def register(handler, *, indigo_module):
                 "offset": {"type": "integer", "minimum": 0},
             },
         },
-        handler=lambda args: _list_action_groups_handler(args, indigo_module),
+        handler=lambda **args: _list_action_groups_handler(args, indigo_module),
     )
     handler.register_tool(
         name="list_variable_folders",
         description="List Indigo variable folders (id + name).",
         input_schema={"type": "object", "properties": {}},
-        handler=lambda args: _list_variable_folders_handler(args, indigo_module),
+        handler=lambda **args: _list_variable_folders_handler(args, indigo_module),
     )
     handler.register_tool(
         name="list_device_folders",
         description="List Indigo device folders (id + name).",
         input_schema={"type": "object", "properties": {}},
-        handler=lambda args: _list_device_folders_handler(args, indigo_module),
+        handler=lambda **args: _list_device_folders_handler(args, indigo_module),
     )
     handler.register_tool(
         name="get_device_by_id",
@@ -139,7 +139,7 @@ def register(handler, *, indigo_module):
             "required": ["id"],
             "properties": {"id": {"type": "integer"}},
         },
-        handler=lambda args: _get_device_handler(args, indigo_module),
+        handler=lambda **args: _get_device_handler(args, indigo_module),
     )
     handler.register_tool(
         name="get_variable_by_id",
@@ -149,7 +149,7 @@ def register(handler, *, indigo_module):
             "required": ["id"],
             "properties": {"id": {"type": "integer"}},
         },
-        handler=lambda args: _get_variable_handler(args, indigo_module),
+        handler=lambda **args: _get_variable_handler(args, indigo_module),
     )
     handler.register_tool(
         name="get_action_group_by_id",
@@ -159,7 +159,7 @@ def register(handler, *, indigo_module):
             "required": ["id"],
             "properties": {"id": {"type": "integer"}},
         },
-        handler=lambda args: _get_action_group_handler(args, indigo_module),
+        handler=lambda **args: _get_action_group_handler(args, indigo_module),
     )
     handler.register_tool(
         name="get_devices_by_type",
@@ -173,7 +173,7 @@ def register(handler, *, indigo_module):
                 "offset": {"type": "integer", "minimum": 0},
             },
         },
-        handler=lambda args: _get_devices_by_type_handler(args, indigo_module),
+        handler=lambda **args: _get_devices_by_type_handler(args, indigo_module),
     )
     handler.register_tool(
         name="get_devices_by_state",
@@ -191,7 +191,7 @@ def register(handler, *, indigo_module):
                 "offset": {"type": "integer", "minimum": 0},
             },
         },
-        handler=lambda args: _get_devices_by_state_handler(args, indigo_module),
+        handler=lambda **args: _get_devices_by_state_handler(args, indigo_module),
     )
 
 
