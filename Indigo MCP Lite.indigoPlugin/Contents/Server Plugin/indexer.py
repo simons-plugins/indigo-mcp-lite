@@ -79,8 +79,10 @@ class Indexer:
         the live Indigo collections.
 
         Idempotent — safe to call from a Reindex Now menu action or
-        repeatedly during startup recovery. Variables and action
-        groups land in Task 6.4.
+        repeatedly during startup recovery. Sweeps in
+        device → variable → action order; the order is incidental
+        for FTS5 (results rank by bm25 not insertion) but predictable
+        ordering helps debugging.
         """
         cur = self.connection.cursor()
         cur.execute("DROP TABLE IF EXISTS entities")
@@ -89,6 +91,10 @@ class Indexer:
 
         for dev in self.indigo.devices:
             self._insert_device(cur, dev)
+        for var in self.indigo.variables:
+            self._insert_variable(cur, var)
+        for action in self.indigo.actionGroups:
+            self._insert_action(cur, action)
 
         self.connection.commit()
 
@@ -160,3 +166,86 @@ class Indexer:
             ),
         )
         self._snapshots[("device", getattr(dev, "id", 0))] = self._device_snapshot(dev)
+
+    # ---------------------------------------------------------------
+    # Variable indexing helpers
+    # ---------------------------------------------------------------
+
+    def _variable_folder_name(self, folder_id):
+        """Resolve a variable folder id to its display name.
+
+        Same shape as ``_device_folder_name`` but goes through
+        ``indigo.variables.folders``.
+        """
+        try:
+            return self.indigo.variables.folders.getName(folder_id) or ""
+        except Exception:
+            return ""
+
+    def _variable_snapshot(self, var):
+        """Static-field tuple for a variable. Variable values change
+        constantly (any rule-engine update flips them) — they are
+        NOT included so the short-circuit holds for value updates."""
+        return (
+            getattr(var, "name", ""),
+            getattr(var, "folderId", 0),
+        )
+
+    def _insert_variable(self, cursor, var):
+        """Insert one variable row + cache its snapshot."""
+        folder_name = self._variable_folder_name(getattr(var, "folderId", 0))
+        cursor.execute(
+            "INSERT INTO entities (entity_type, entity_id, name, description, "
+            "type_label, folder, aliases, extra) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "variable",
+                getattr(var, "id", 0),
+                getattr(var, "name", "") or "",
+                "",          # variables have no description in the IOM
+                "",          # no type_label
+                folder_name,
+                "",          # no alias expansion
+                "",          # no model/address
+            ),
+        )
+        self._snapshots[("variable", getattr(var, "id", 0))] = self._variable_snapshot(var)
+
+    # ---------------------------------------------------------------
+    # Action group indexing helpers
+    # ---------------------------------------------------------------
+
+    def _action_snapshot(self, action):
+        """Static-field tuple for an action group."""
+        return (
+            getattr(action, "name", ""),
+            getattr(action, "description", "") or "",
+            getattr(action, "folderId", 0),
+        )
+
+    def _insert_action(self, cursor, action):
+        """Insert one action group row + cache its snapshot.
+
+        Action groups don't have a separate folder collection in the
+        IOM — they share the variable folder space conceptually but
+        the SDK doesn't expose a public ``getName``-equivalent for
+        ``indigo.actionGroups.folders`` reliably across Indigo
+        versions. Leave folder empty for now; users typically
+        organise action groups by name prefix anyway.
+        """
+        cursor.execute(
+            "INSERT INTO entities (entity_type, entity_id, name, description, "
+            "type_label, folder, aliases, extra) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "action",
+                getattr(action, "id", 0),
+                getattr(action, "name", "") or "",
+                getattr(action, "description", "") or "",
+                "",          # no type_label
+                "",          # no folder name
+                "",          # no aliases
+                "",          # no extra
+            ),
+        )
+        self._snapshots[("action", getattr(action, "id", 0))] = self._action_snapshot(action)
