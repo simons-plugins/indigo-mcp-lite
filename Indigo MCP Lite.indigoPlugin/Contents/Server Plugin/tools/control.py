@@ -14,11 +14,13 @@ All tools register with ``handler.register_tool`` using the
 every real wire call. Phase 3 caught this; preserve it here.
 """
 
+from color_palette import lookup_named_color
 from tools.lookup import _require_int_id
 from tools.value_helpers import (
     byte_to_percent,
     clamp_percent,
     normalize_brightness,
+    parse_hex_color,
 )
 
 
@@ -92,6 +94,42 @@ def _set_rgb_percent_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _require_str(args, key):
+    """Pull a non-empty string out of args under ``key`` or raise."""
+    raw = args.get(key)
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{key} must be a non-empty string")
+    return raw
+
+
+def _set_color_from_bytes(indigo_module, device_id, rgb_bytes):
+    """Convert a (r, g, b) byte tuple to percent and call setColorLevels.
+
+    Used by both hex and named-colour tools so the byte→percent
+    conversion lives in exactly one place.
+    """
+    r, g, b = (byte_to_percent(c) for c in rgb_bytes)
+    indigo_module.dimmer.setColorLevels(
+        device_id, redLevel=r, greenLevel=g, blueLevel=b
+    )
+
+
+def _set_hex_color_handler(args, indigo_module):
+    """Set RGB colour from a hex string (#RRGGBB / RRGGBB / #RGB)."""
+    device_id = _require_int_id(args, "device_id")
+    rgb_bytes = parse_hex_color(_require_str(args, "color"))
+    _set_color_from_bytes(indigo_module, device_id, rgb_bytes)
+    return {"status": "ok"}
+
+
+def _set_named_color_handler(args, indigo_module):
+    """Set RGB colour from a CSS named colour (red, aliceblue, …)."""
+    device_id = _require_int_id(args, "device_id")
+    rgb_bytes = lookup_named_color(_require_str(args, "name"))
+    _set_color_from_bytes(indigo_module, device_id, rgb_bytes)
+    return {"status": "ok"}
+
+
 _DEVICE_ID_SCHEMA = {
     "type": "object",
     "required": ["device_id"],
@@ -115,6 +153,24 @@ _RGB_SCHEMA = {
         "red": {"type": "number"},
         "green": {"type": "number"},
         "blue": {"type": "number"},
+    },
+}
+
+_HEX_COLOR_SCHEMA = {
+    "type": "object",
+    "required": ["device_id", "color"],
+    "properties": {
+        "device_id": {"type": "integer"},
+        "color": {"type": "string"},
+    },
+}
+
+_NAMED_COLOR_SCHEMA = {
+    "type": "object",
+    "required": ["device_id", "name"],
+    "properties": {
+        "device_id": {"type": "integer"},
+        "name": {"type": "string"},
     },
 }
 
@@ -166,4 +222,24 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_RGB_SCHEMA,
         handler=lambda **args: _set_rgb_percent_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_set_hex_color",
+        description=(
+            "Set a colour-capable dimmer's RGB colour from a hex "
+            "string. Accepts #RRGGBB, RRGGBB, #RGB, or RGB."
+        ),
+        input_schema=_HEX_COLOR_SCHEMA,
+        handler=lambda **args: _set_hex_color_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_set_named_color",
+        description=(
+            "Set a colour-capable dimmer's RGB colour from a CSS "
+            "named colour (red, aliceblue, dodgerblue, …). 140 names "
+            "supported; case- and space-insensitive; British "
+            "*grey* spellings resolve to the *gray* equivalents."
+        ),
+        input_schema=_NAMED_COLOR_SCHEMA,
+        handler=lambda **args: _set_named_color_handler(args, indigo_module),
     )
