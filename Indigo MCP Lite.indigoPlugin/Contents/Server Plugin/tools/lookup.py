@@ -272,16 +272,19 @@ def _list_device_folders_handler(_args, indigo_module):
     return _list_folders(indigo_module.devices.folders)
 
 
-def _require_int_id(args):
-    """Pull an ``id`` int out of args or raise a clear ValueError.
+def _require_int_id(args, key="id"):
+    """Pull an integer id out of args under ``key`` or raise ValueError.
 
     Booleans are rejected even though ``isinstance(True, int)`` is
     True — the schema says integer, and a bool id is almost always a
-    caller bug rather than a meaningful query.
+    caller bug rather than a meaningful query. ``key`` defaults to
+    ``"id"`` for the lookup tools but Phase 4 control tools pass
+    ``"device_id"``, ``"variable_id"``, etc., so the same validator
+    applies everywhere without each tool reimplementing it.
     """
-    raw = args.get("id")
+    raw = args.get(key)
     if isinstance(raw, bool) or not isinstance(raw, int):
-        raise ValueError("id must be an integer")
+        raise ValueError(f"{key} must be an integer")
     return raw
 
 
