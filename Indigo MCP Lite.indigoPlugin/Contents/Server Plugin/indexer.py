@@ -75,16 +75,88 @@ class Indexer:
         self._snapshots: dict = {}
 
     def build(self):
-        """Drop and recreate the entities table.
+        """Drop and recreate the entities table, then populate from
+        the live Indigo collections.
 
         Idempotent — safe to call from a Reindex Now menu action or
-        repeatedly during startup recovery. Subsequent phase tasks
-        (6.3, 6.4) extend this to populate rows from the live
-        ``indigo.devices`` / ``indigo.variables`` / ``indigo.
-        actionGroups`` collections.
+        repeatedly during startup recovery. Variables and action
+        groups land in Task 6.4.
         """
         cur = self.connection.cursor()
         cur.execute("DROP TABLE IF EXISTS entities")
         cur.execute(_SCHEMA)
         self._snapshots = {}
+
+        for dev in self.indigo.devices:
+            self._insert_device(cur, dev)
+
         self.connection.commit()
+
+    # ---------------------------------------------------------------
+    # Device indexing helpers
+    # ---------------------------------------------------------------
+
+    def _device_folder_name(self, folder_id):
+        """Resolve a device folder id to its display name.
+
+        Uses ``indigo.devices.folders.getName`` (the read side of the
+        SDK's folder collection). Returns ``""`` for the root folder
+        or any unresolvable id — folders can be deleted out from
+        under us, and an empty string is what FTS5 expects (NULL
+        would reject the insert).
+        """
+        try:
+            return self.indigo.devices.folders.getName(folder_id) or ""
+        except Exception:
+            return ""
+
+    def _device_snapshot(self, dev):
+        """Capture the static fields that affect the FTS5 row.
+
+        Returns a tuple — hashable, cheap to compare in the short-
+        circuit handler. Anything that could change ``name`` /
+        ``description`` / ``type_label`` / ``folder`` / ``extra``
+        belongs here. State fields (``brightness``, ``onState``,
+        ``batteryLevel``, ``states[*]``) deliberately do not — they
+        change constantly and must NOT trigger reindex.
+        """
+        return (
+            getattr(dev, "name", ""),
+            getattr(dev, "description", "") or "",
+            getattr(dev, "deviceTypeId", "") or "",
+            getattr(dev, "folderId", 0),
+            getattr(dev, "model", "") or "",
+            getattr(dev, "address", "") or "",
+        )
+
+    def _insert_device(self, cursor, dev):
+        """Insert one device row + cache its snapshot.
+
+        Centralised so the initial-sweep build, the create handler
+        (Task 6.6), and the short-circuit reindex (Task 6.5) all
+        share the same row shape and snapshot bookkeeping.
+        """
+        folder_name = self._device_folder_name(getattr(dev, "folderId", 0))
+        aliases = TYPE_ALIASES.get(getattr(dev, "deviceTypeId", ""), "")
+        extra = " ".join(
+            s for s in (
+                getattr(dev, "model", "") or "",
+                getattr(dev, "address", "") or "",
+            ) if s
+        )
+        cursor.execute(
+            "INSERT INTO entities (entity_type, entity_id, name, description, "
+            "type_label, folder, aliases, extra) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "device",
+                getattr(dev, "id", 0),
+                getattr(dev, "name", "") or "",
+                getattr(dev, "description", "") or "",
+                getattr(dev, "deviceTypeId", "") or "",
+                folder_name,
+                aliases,
+                extra,
+            ),
+        )
+        self._snapshots[("device", getattr(dev, "id", 0))] = self._device_snapshot(dev)
