@@ -77,6 +77,62 @@ def test_tools_list_through_mcp_handler_includes_lookup_tools(mock_indigo):
     assert "restart_plugin" in names
 
 
+def test_find_devices_dispatches_through_mcp_handler(mock_indigo):
+    """End-to-end: find_devices routed through real MCPHandler with
+    a real Indexer. Confirms the indexer kwarg threading works and
+    the lambda **args: registration shape survives the JSON-RPC
+    wire path.
+    """
+    import json
+    from unittest.mock import MagicMock
+    from indexer import Indexer
+    from mcp_handler import MCPHandler
+    from tool_registry import register_all
+
+    class _AttrList(list):
+        pass
+
+    dev = MagicMock()
+    dev.id = 7; dev.name = "Kitchen Dimmer"
+    dev.deviceTypeId = "dimmer"; dev.folderId = 10
+    dev.description = ""; dev.model = ""; dev.address = ""
+
+    devs = _AttrList([dev])
+    devs.folders = MagicMock(getName=MagicMock(return_value="Kitchen"))
+    mock_indigo.devices = devs
+    vars_ = _AttrList(); vars_.folders = MagicMock(getName=MagicMock(return_value=""))
+    mock_indigo.variables = vars_
+    mock_indigo.actionGroups = _AttrList()
+
+    indexer = Indexer(indigo_module=mock_indigo)
+    indexer.build()
+
+    handler = MCPHandler(server_name="test", server_version="0")
+    register_all(handler, indigo_module=mock_indigo, indexer=indexer)
+
+    response = handler.handle_request(
+        http_method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "find_devices",
+                "arguments": {"query": "kitchen"},
+            },
+        }),
+    )
+
+    assert response["status"] == 200, response
+    body = json.loads(response["content"])
+    result = body["result"]
+    assert result.get("isError") is not True, f"tool returned error: {result}"
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["total_count"] >= 1
+    assert any(r["id"] == 7 for r in inner["results"])
+
+
 def test_tools_call_device_turn_on_dispatches_through_mcp_handler(mock_indigo):
     """End-to-end exercise of a Phase 4 control tool through the real
     JSON-RPC layer.

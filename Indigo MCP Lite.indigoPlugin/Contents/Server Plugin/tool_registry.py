@@ -9,16 +9,21 @@ phases (e.g. Phase 6) thread additional collaborators like an
 indexer through without breaking the existing call sites.
 """
 
-from tools import control, lookup, system
+from tools import control, find_devices, lookup, system
 
 
-def register_all(handler, *, indigo_module, **_):
+def register_all(handler, *, indigo_module, indexer=None, **_):
     """Register every tool onto ``handler``.
 
-    Extra kwargs are accepted (and ignored here) so future phases
-    can add collaborators (``indexer=...`` etc.) without touching
-    every call site at once.
+    ``indexer`` is required for ``find_devices``; if it isn't
+    supplied (e.g. unit tests that don't exercise search) the
+    find_devices tool is silently skipped rather than crashing the
+    whole registration. Extra kwargs are accepted via ``**_`` so
+    future phases can add more collaborators without touching every
+    call site at once.
     """
     lookup.register(handler, indigo_module=indigo_module)
     control.register(handler, indigo_module=indigo_module)
     system.register(handler, indigo_module=indigo_module)
+    if indexer is not None:
+        find_devices.register(handler, indexer=indexer)
