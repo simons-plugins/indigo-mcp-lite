@@ -31,6 +31,23 @@ import sqlite3
 _BM25_WEIGHTS = "0, 0, 3.0, 1.0, 1.0, 1.5, 2.0, 0.5"
 _VALID_ENTITY_TYPES = ("device", "variable", "action")
 
+_DEFAULT_LIMIT = 50
+_MAX_LIMIT = 500
+
+
+def _normalise_pagination(args):
+    """Coerce + clamp ``limit`` and ``offset`` for find_devices.
+
+    Mirrors ``tools.lookup._normalize_pagination`` in spirit (so the
+    wire shape matches the lookup tools) but lives here separately
+    because find_devices uses a slightly different fetch pattern
+    (LIMIT/OFFSET on the SQL query, not Python slicing of a list).
+    """
+    raw_limit = args.get("limit", _DEFAULT_LIMIT)
+    limit = max(1, min(_MAX_LIMIT, int(raw_limit)))
+    offset = max(0, int(args.get("offset", 0)))
+    return limit, offset
+
 
 def _build_match_query(query, room):
     """Compose the FTS5 MATCH expression from the user query + room.
@@ -77,33 +94,55 @@ def _normalise_entity_type(value):
     return tuple(out)
 
 
-def _execute_search(query, indexer, *, type_filter=None, entity_type_filter=None):
-    """Run the FTS5 MATCH query plus any SQL WHERE filters.
+def _build_where_clause(type_filter, entity_type_filter):
+    """Return the trailing ``AND ...`` clauses + parameter list shared
+    by the count and result queries.
 
-    ``query`` is the already-composed FTS5 expression (with ``room``
-    folded in by the caller). ``type_filter`` is the device-type
-    string (e.g. ``"dimmer"``); ``entity_type_filter`` is the tuple
-    of allowed entity types (or None for all).
+    Pulled out so the COUNT(*) query and the SELECT query stay
+    perfectly in sync — any filter added on one side must apply to
+    the other or pagination metadata silently drifts.
     """
-    sql_parts = [
-        "SELECT entity_type, entity_id, name, description, type_label,",
-        f"folder, bm25(entities, {_BM25_WEIGHTS}) AS score",
-        "FROM entities WHERE entities MATCH ?",
-    ]
-    params = [query]
-
+    parts = []
+    params = []
     if type_filter is not None:
-        sql_parts.append("AND type_label = ?")
+        parts.append("AND type_label = ?")
         params.append(type_filter)
     if entity_type_filter is not None:
         placeholders = ", ".join(["?"] * len(entity_type_filter))
-        sql_parts.append(f"AND entity_type IN ({placeholders})")
+        parts.append(f"AND entity_type IN ({placeholders})")
         params.extend(entity_type_filter)
+    return " ".join(parts), params
 
-    sql_parts.append("ORDER BY score")
 
-    cur = indexer.connection.execute(" ".join(sql_parts), params)
-    return [
+def _execute_search(query, indexer, *, type_filter=None, entity_type_filter=None,
+                     limit, offset):
+    """Run the FTS5 MATCH query plus any SQL WHERE filters and return
+    ``(rows, total_count)``.
+
+    The total_count comes from a separate ``COUNT(*)`` query so
+    pagination metadata stays correct under ``LIMIT``/``OFFSET`` —
+    if we just used ``len(rows)`` callers couldn't distinguish "this
+    is the last page" from "this is one of many pages".
+    """
+    where_extra, where_params = _build_where_clause(
+        type_filter, entity_type_filter
+    )
+
+    count_sql = f"SELECT COUNT(*) FROM entities WHERE entities MATCH ? {where_extra}"
+    total_count = indexer.connection.execute(
+        count_sql, [query] + where_params
+    ).fetchone()[0]
+
+    select_sql = (
+        "SELECT entity_type, entity_id, name, description, type_label, "
+        f"folder, bm25(entities, {_BM25_WEIGHTS}) AS score "
+        f"FROM entities WHERE entities MATCH ? {where_extra} "
+        "ORDER BY score LIMIT ? OFFSET ?"
+    )
+    cur = indexer.connection.execute(
+        select_sql, [query] + where_params + [limit, offset]
+    )
+    rows = [
         {
             "entity_type": r[0],
             "id": r[1],
@@ -115,6 +154,7 @@ def _execute_search(query, indexer, *, type_filter=None, entity_type_filter=None
         }
         for r in cur.fetchall()
     ]
+    return rows, total_count
 
 
 def _find_devices_handler(args, *, indexer):
@@ -137,16 +177,18 @@ def _find_devices_handler(args, *, indexer):
     entity_type_filter = _normalise_entity_type(args.get("entity_type"))
 
     fts_query = _build_match_query(query, args.get("room"))
+    limit, offset = _normalise_pagination(args)
 
-    results = _execute_search(
+    results, total_count = _execute_search(
         fts_query, indexer,
         type_filter=type_filter,
         entity_type_filter=entity_type_filter,
+        limit=limit, offset=offset,
     )
     return {
         "results": results,
-        "total_count": len(results),
-        "offset": 0,
-        "limit": len(results),
-        "has_more": False,
+        "total_count": total_count,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(results) < total_count,
     }
