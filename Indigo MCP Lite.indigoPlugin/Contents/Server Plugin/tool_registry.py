@@ -9,7 +9,7 @@ phases (e.g. Phase 6) thread additional collaborators like an
 indexer through without breaking the existing call sites.
 """
 
-from tools import lookup
+from tools import control, lookup
 
 
 def register_all(handler, *, indigo_module, **_):
@@ -20,3 +20,4 @@ def register_all(handler, *, indigo_module, **_):
     every call site at once.
     """
     lookup.register(handler, indigo_module=indigo_module)
+    control.register(handler, indigo_module=indigo_module)
