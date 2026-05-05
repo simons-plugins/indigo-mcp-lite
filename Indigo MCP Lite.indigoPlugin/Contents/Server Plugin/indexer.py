@@ -316,3 +316,47 @@ class Indexer:
             return False
         self._replace_row("action", entity_id, self._insert_action, action)
         return True
+
+    # ---------------------------------------------------------------
+    # Create handlers — straight insert, no short-circuit possible
+    # since we have no prior snapshot to compare against.
+    # ---------------------------------------------------------------
+
+    def on_device_created(self, dev):
+        cur = self.connection.cursor()
+        self._insert_device(cur, dev)
+        self.connection.commit()
+
+    def on_variable_created(self, var):
+        cur = self.connection.cursor()
+        self._insert_variable(cur, var)
+        self.connection.commit()
+
+    def on_action_created(self, action):
+        cur = self.connection.cursor()
+        self._insert_action(cur, action)
+        self.connection.commit()
+
+    # ---------------------------------------------------------------
+    # Delete handlers — drop the row + snapshot. Safe for unknown ids
+    # because Indigo can fire deleted events for entities we never
+    # indexed (plugin restart races).
+    # ---------------------------------------------------------------
+
+    def _drop_entity(self, entity_type, entity_id):
+        cur = self.connection.cursor()
+        cur.execute(
+            "DELETE FROM entities WHERE entity_type=? AND entity_id=?",
+            (entity_type, entity_id),
+        )
+        self.connection.commit()
+        self._snapshots.pop((entity_type, entity_id), None)
+
+    def on_device_deleted(self, dev):
+        self._drop_entity("device", getattr(dev, "id", 0))
+
+    def on_variable_deleted(self, var):
+        self._drop_entity("variable", getattr(var, "id", 0))
+
+    def on_action_deleted(self, action):
+        self._drop_entity("action", getattr(action, "id", 0))
