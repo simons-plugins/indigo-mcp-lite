@@ -255,6 +255,13 @@ def _variable_update_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _action_execute_group_handler(args, indigo_module):
+    """Execute an Indigo action group by id."""
+    action_group_id = _require_int_id(args, "action_group_id")
+    indigo_module.actionGroup.execute(action_group_id)
+    return {"status": "ok"}
+
+
 def _set_white_levels_handler(args, indigo_module):
     """Set warm/cool white levels and/or colour temperature.
 
@@ -341,6 +348,12 @@ _TEMPERATURE_SCHEMA = {
         "device_id": {"type": "integer"},
         "temperature": {"type": "number"},
     },
+}
+
+_ACTION_GROUP_ID_SCHEMA = {
+    "type": "object",
+    "required": ["action_group_id"],
+    "properties": {"action_group_id": {"type": "integer"}},
 }
 
 _VARIABLE_CREATE_SCHEMA = {
@@ -481,6 +494,12 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_TEMPERATURE_SCHEMA,
         handler=lambda **args: _set_cool_setpoint_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="action_execute_group",
+        description="Execute an Indigo action group by id.",
+        input_schema=_ACTION_GROUP_ID_SCHEMA,
+        handler=lambda **args: _action_execute_group_handler(args, indigo_module),
     )
     handler.register_tool(
         name="variable_create",
