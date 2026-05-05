@@ -130,6 +130,12 @@ def _set_named_color_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+_FAN_MODE_NAMES = {
+    "auto": "Auto",
+    "alwayson": "AlwaysOn",
+}
+
+
 _HVAC_MODE_NAMES = {
     "off": "Off",
     "heat": "Heat",
@@ -140,6 +146,34 @@ _HVAC_MODE_NAMES = {
     "programcool": "ProgramCool",
     "programheatcool": "ProgramHeatCool",
 }
+
+
+def _resolve_mode(args, name_map, *, mode_label):
+    """Resolve a friendly-string mode to a (raw, attr-name) pair.
+
+    Lower-cases input, strips spaces/underscores, looks up in
+    ``name_map``. Shared between hvac/fan mode tools so the
+    case-/space-insensitive matching lives once.
+    """
+    raw = args.get("mode")
+    if not isinstance(raw, str):
+        raise ValueError("mode must be a string")
+    key = raw.lower().replace("_", "").replace(" ", "")
+    if key not in name_map:
+        valid = ", ".join(sorted(name_map))
+        raise ValueError(
+            f"mode {raw!r} not recognised for {mode_label}; valid: {valid}"
+        )
+    return name_map[key]
+
+
+def _set_fan_mode_handler(args, indigo_module):
+    """Set a thermostat's fan mode (auto / alwayson)."""
+    device_id = _require_int_id(args, "device_id")
+    attr = _resolve_mode(args, _FAN_MODE_NAMES, mode_label="fan")
+    enum_value = getattr(indigo_module.kFanMode, attr)
+    indigo_module.thermostat.setFanMode(device_id, value=enum_value)
+    return {"status": "ok"}
 
 
 def _set_hvac_mode_handler(args, indigo_module):
@@ -153,14 +187,8 @@ def _set_hvac_mode_handler(args, indigo_module):
     label the dual-mode setting.
     """
     device_id = _require_int_id(args, "device_id")
-    raw = args.get("mode")
-    if not isinstance(raw, str):
-        raise ValueError("mode must be a string")
-    key = raw.lower().replace("_", "").replace(" ", "")
-    if key not in _HVAC_MODE_NAMES:
-        valid = ", ".join(sorted(_HVAC_MODE_NAMES))
-        raise ValueError(f"mode {raw!r} not recognised; valid: {valid}")
-    enum_value = getattr(indigo_module.kHvacMode, _HVAC_MODE_NAMES[key])
+    attr = _resolve_mode(args, _HVAC_MODE_NAMES, mode_label="hvac")
+    enum_value = getattr(indigo_module.kHvacMode, attr)
     indigo_module.thermostat.setHvacMode(device_id, value=enum_value)
     return {"status": "ok"}
 
@@ -251,7 +279,7 @@ _NAMED_COLOR_SCHEMA = {
     },
 }
 
-_HVAC_MODE_SCHEMA = {
+_MODE_SCHEMA = {
     "type": "object",
     "required": ["device_id", "mode"],
     "properties": {
@@ -356,8 +384,18 @@ def register(handler, *, indigo_module):
             "(case-insensitive): off, heat, cool, auto (= heatcool), "
             "heatcool, programheat, programcool, programheatcool."
         ),
-        input_schema=_HVAC_MODE_SCHEMA,
+        input_schema=_MODE_SCHEMA,
         handler=lambda **args: _set_hvac_mode_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="thermostat_set_fan_mode",
+        description=(
+            "Set a thermostat's fan mode. Accepts friendly names "
+            "(case-insensitive, spaces/underscores ignored): "
+            "auto, alwayson (or 'always on' / 'always_on')."
+        ),
+        input_schema=_MODE_SCHEMA,
+        handler=lambda **args: _set_fan_mode_handler(args, indigo_module),
     )
     handler.register_tool(
         name="thermostat_set_heat_setpoint",
