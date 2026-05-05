@@ -179,12 +179,31 @@ def _find_devices_handler(args, *, indexer):
     fts_query = _build_match_query(query, args.get("room"))
     limit, offset = _normalise_pagination(args)
 
-    results, total_count = _execute_search(
-        fts_query, indexer,
-        type_filter=type_filter,
-        entity_type_filter=entity_type_filter,
-        limit=limit, offset=offset,
-    )
+    try:
+        results, total_count = _execute_search(
+            fts_query, indexer,
+            type_filter=type_filter,
+            entity_type_filter=entity_type_filter,
+            limit=limit, offset=offset,
+        )
+    except sqlite3.OperationalError as exc:
+        # FTS5 raises OperationalError for malformed query syntax —
+        # bare AND/OR at unexpected positions, unmatched parens,
+        # standalone column-scope tokens. Retry the whole query as
+        # a quoted phrase so it falls back to a literal-substring
+        # match. Anything that's still malformed after wrapping
+        # bubbles up — that's a bug worth knowing about.
+        if "fts5" not in str(exc).lower() and "syntax" not in str(exc).lower():
+            raise
+        escaped = query.replace('"', '""')
+        fts_query = _build_match_query(f'"{escaped}"', args.get("room"))
+        results, total_count = _execute_search(
+            fts_query, indexer,
+            type_filter=type_filter,
+            entity_type_filter=entity_type_filter,
+            limit=limit, offset=offset,
+        )
+
     return {
         "results": results,
         "total_count": total_count,
