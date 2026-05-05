@@ -46,6 +46,28 @@ def normalize_rgb_percent(value):
     return int(round(_clamp(float(value), 0, 100) * 255 / 100))
 
 
+def clamp_percent(value):
+    """Clamp a numeric input to 0–100 and return an integer.
+
+    Indigo's ``setColorLevels`` and ``whiteLevel`` channels are
+    expressed as 0–100 percent, not 0–255 bytes — control tools that
+    accept percent input pass through this rather than the byte
+    helpers above so the units match the API call without an
+    intermediate round-trip through the 0–255 space.
+    """
+    return int(round(_clamp(float(value), 0, 100)))
+
+
+def byte_to_percent(value):
+    """Convert a 0–255 RGB byte to a 0–100 percent integer.
+
+    Used by control tools whose user-facing input is bytes (RGB
+    color, hex, CSS named colors) but whose Indigo API call
+    (``setColorLevels``) needs 0–100 percent.
+    """
+    return int(round(_clamp(float(value), 0, 255) * 100 / 255))
+
+
 def parse_hex_color(value):
     """Parse a CSS hex colour string into an ``(r, g, b)`` byte tuple.
 

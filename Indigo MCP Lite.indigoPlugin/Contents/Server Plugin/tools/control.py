@@ -15,7 +15,11 @@ every real wire call. Phase 3 caught this; preserve it here.
 """
 
 from tools.lookup import _require_int_id
-from tools.value_helpers import normalize_brightness
+from tools.value_helpers import (
+    byte_to_percent,
+    clamp_percent,
+    normalize_brightness,
+)
 
 
 def _require_numeric(args, key):
@@ -52,6 +56,42 @@ def _set_brightness_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _require_rgb_channels(args, *, percent):
+    """Pull and normalise red/green/blue channels from args.
+
+    Both RGB tools share required-key validation and channel
+    normalisation. ``percent=True`` means inputs are 0-100 (clamp +
+    round); ``percent=False`` means inputs are 0-255 bytes that need
+    converting to Indigo's 0-100 wire unit. Either way the return is
+    the (red, green, blue) percent tuple ready for ``setColorLevels``.
+    """
+    out = []
+    for channel in ("red", "green", "blue"):
+        raw = _require_numeric(args, channel)
+        out.append(clamp_percent(raw) if percent else byte_to_percent(raw))
+    return tuple(out)
+
+
+def _set_rgb_color_handler(args, indigo_module):
+    """Set RGB colour from 0-255 byte channels."""
+    device_id = _require_int_id(args, "device_id")
+    r, g, b = _require_rgb_channels(args, percent=False)
+    indigo_module.dimmer.setColorLevels(
+        device_id, redLevel=r, greenLevel=g, blueLevel=b
+    )
+    return {"status": "ok"}
+
+
+def _set_rgb_percent_handler(args, indigo_module):
+    """Set RGB colour from 0-100 percent channels."""
+    device_id = _require_int_id(args, "device_id")
+    r, g, b = _require_rgb_channels(args, percent=True)
+    indigo_module.dimmer.setColorLevels(
+        device_id, redLevel=r, greenLevel=g, blueLevel=b
+    )
+    return {"status": "ok"}
+
+
 _DEVICE_ID_SCHEMA = {
     "type": "object",
     "required": ["device_id"],
@@ -64,6 +104,17 @@ _BRIGHTNESS_SCHEMA = {
     "properties": {
         "device_id": {"type": "integer"},
         "brightness": {"type": "number"},
+    },
+}
+
+_RGB_SCHEMA = {
+    "type": "object",
+    "required": ["device_id", "red", "green", "blue"],
+    "properties": {
+        "device_id": {"type": "integer"},
+        "red": {"type": "number"},
+        "green": {"type": "number"},
+        "blue": {"type": "number"},
     },
 }
 
@@ -95,4 +146,24 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_BRIGHTNESS_SCHEMA,
         handler=lambda **args: _set_brightness_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_set_rgb_color",
+        description=(
+            "Set a colour-capable dimmer's RGB colour. "
+            "Channels are 0-255 byte values; out-of-range values "
+            "are clamped before being converted to Indigo's 0-100 "
+            "wire unit."
+        ),
+        input_schema=_RGB_SCHEMA,
+        handler=lambda **args: _set_rgb_color_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_set_rgb_percent",
+        description=(
+            "Set a colour-capable dimmer's RGB colour using 0-100 "
+            "percent channels (matches Indigo's native unit)."
+        ),
+        input_schema=_RGB_SCHEMA,
+        handler=lambda **args: _set_rgb_percent_handler(args, indigo_module),
     )
