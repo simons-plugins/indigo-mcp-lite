@@ -21,7 +21,10 @@ See design doc §7.2.
 TYPE_ALIASES = {
     # Lights
     "dimmer":               "light lamp bulb fixture lighting",
+    "zwDimmerType":         "light lamp bulb fixture lighting dimmer zwave",
+    "zigbeeGroupDimmer":    "light lamp group dimmer zigbee",
     "relay":                "switch outlet plug socket",
+    "pseudoRelay":          "group switch virtual",
     "shelly-plus-1-pm":     "switch relay outlet meter",
     "shelly-plus-plug":     "plug socket outlet",
     "shelly-plus-2-pm":     "switch relay outlet meter dual",
@@ -35,8 +38,11 @@ TYPE_ALIASES = {
     # Sensors
     "sensor":               "detector reading monitor",
     "leakSensor":           "leak moisture water damp flood wet",
+    "zwOnOffSensorType":    "sensor on off zwave",
     "smokeSensor":          "smoke fire alarm",
     "motionSensor":         "motion movement pir occupancy",
+    "activityZone":         "presence activity zone motion area",
+    "activityTimer":        "activity timer presence motion",
     "doorSensor":           "door window contact open close",
     "temperatureSensor":    "temperature thermometer warmth",
     "humiditySensor":       "humidity moisture damp",
