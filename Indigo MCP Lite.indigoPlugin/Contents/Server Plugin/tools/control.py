@@ -130,6 +130,41 @@ def _set_named_color_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+_HVAC_MODE_NAMES = {
+    "off": "Off",
+    "heat": "Heat",
+    "cool": "Cool",
+    "auto": "HeatCool",          # friendly alias
+    "heatcool": "HeatCool",
+    "programheat": "ProgramHeat",
+    "programcool": "ProgramCool",
+    "programheatcool": "ProgramHeatCool",
+}
+
+
+def _set_hvac_mode_handler(args, indigo_module):
+    """Set a thermostat's HVAC mode by friendly-string name.
+
+    The SDK takes ``indigo.kHvacMode.X`` enum constants — we accept
+    case-insensitive friendly names (off / heat / cool / auto /
+    heatcool / programheat / programcool / programheatcool) and
+    resolve to the right attribute via ``getattr``. ``auto`` is an
+    alias for ``HeatCool`` since "auto" is what most thermostats
+    label the dual-mode setting.
+    """
+    device_id = _require_int_id(args, "device_id")
+    raw = args.get("mode")
+    if not isinstance(raw, str):
+        raise ValueError("mode must be a string")
+    key = raw.lower().replace("_", "").replace(" ", "")
+    if key not in _HVAC_MODE_NAMES:
+        valid = ", ".join(sorted(_HVAC_MODE_NAMES))
+        raise ValueError(f"mode {raw!r} not recognised; valid: {valid}")
+    enum_value = getattr(indigo_module.kHvacMode, _HVAC_MODE_NAMES[key])
+    indigo_module.thermostat.setHvacMode(device_id, value=enum_value)
+    return {"status": "ok"}
+
+
 def _set_heat_setpoint_handler(args, indigo_module):
     """Set a thermostat's heating setpoint to ``temperature``."""
     device_id = _require_int_id(args, "device_id")
@@ -213,6 +248,15 @@ _NAMED_COLOR_SCHEMA = {
     "properties": {
         "device_id": {"type": "integer"},
         "name": {"type": "string"},
+    },
+}
+
+_HVAC_MODE_SCHEMA = {
+    "type": "object",
+    "required": ["device_id", "mode"],
+    "properties": {
+        "device_id": {"type": "integer"},
+        "mode": {"type": "string"},
     },
 }
 
@@ -304,6 +348,16 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_NAMED_COLOR_SCHEMA,
         handler=lambda **args: _set_named_color_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="thermostat_set_hvac_mode",
+        description=(
+            "Set a thermostat's HVAC mode. Accepts friendly names "
+            "(case-insensitive): off, heat, cool, auto (= heatcool), "
+            "heatcool, programheat, programcool, programheatcool."
+        ),
+        input_schema=_HVAC_MODE_SCHEMA,
+        handler=lambda **args: _set_hvac_mode_handler(args, indigo_module),
     )
     handler.register_tool(
         name="thermostat_set_heat_setpoint",
