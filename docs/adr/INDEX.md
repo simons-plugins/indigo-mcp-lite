@@ -4,4 +4,4 @@ ADRs follow MADR 4.0.0 (https://adr.github.io/madr/).
 
 | # | Title | Status |
 |---|---|---|
-| 0001 | FTS5, not vector search — relies on Claude-side synonym expansion | Pending (Phase 6) |
+| [0001](0001-fts5-not-vector-search.md) | FTS5, not vector search — rely on Claude-side synonym expansion | Accepted |
