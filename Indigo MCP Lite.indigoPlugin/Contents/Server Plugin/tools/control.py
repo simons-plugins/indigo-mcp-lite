@@ -94,10 +94,20 @@ def _set_rgb_percent_handler(args, indigo_module):
     return {"status": "ok"}
 
 
-def _require_str(args, key):
-    """Pull a non-empty string out of args under ``key`` or raise."""
+def _require_str(args, key, *, allow_empty=False):
+    """Pull a string out of args under ``key`` or raise.
+
+    Bools are rejected to match ``_require_int_id`` (they coerce
+    silently in some contexts and a stringly-typed bool is almost
+    always a caller bug). ``allow_empty`` defaults to False — most
+    callers (named colour, hex colour, variable name) want a
+    non-empty string. ``variable_update``/``variable_create`` set
+    ``allow_empty=True`` so callers can clear a variable's value.
+    """
     raw = args.get(key)
-    if not isinstance(raw, str) or not raw:
+    if isinstance(raw, bool) or not isinstance(raw, str):
+        raise ValueError(f"{key} must be a string")
+    if not allow_empty and not raw:
         raise ValueError(f"{key} must be a non-empty string")
     return raw
 
@@ -209,6 +219,42 @@ def _set_cool_setpoint_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _variable_create_handler(args, indigo_module):
+    """Create a new Indigo variable and return its serialised shape.
+
+    Both ``name`` and ``value`` are required; ``value`` may be empty
+    (Indigo treats variable values as strings on the wire and an
+    empty string is a valid initial state). ``folder`` is optional
+    and only forwarded when present so we don't override Indigo's
+    default ("(no folder)") with an explicit zero/None.
+    """
+    name = _require_str(args, "name")
+    value = _require_str(args, "value", allow_empty=True)
+    kwargs = {"value": value}
+    if "folder" in args:
+        kwargs["folder"] = _require_int_id(args, "folder")
+    var = indigo_module.variable.create(name, **kwargs)
+    return {
+        "status": "ok",
+        "id": getattr(var, "id", None),
+        "name": getattr(var, "name", name),
+        "value": getattr(var, "value", value),
+        "folder_id": getattr(var, "folderId", 0),
+    }
+
+
+def _variable_update_handler(args, indigo_module):
+    """Update an existing Indigo variable's value to ``value``.
+
+    Empty string is permitted — it's the canonical way to "clear" a
+    variable in Indigo's model.
+    """
+    variable_id = _require_int_id(args, "variable_id")
+    value = _require_str(args, "value", allow_empty=True)
+    indigo_module.variable.updateValue(variable_id, value=value)
+    return {"status": "ok"}
+
+
 def _set_white_levels_handler(args, indigo_module):
     """Set warm/cool white levels and/or colour temperature.
 
@@ -294,6 +340,25 @@ _TEMPERATURE_SCHEMA = {
     "properties": {
         "device_id": {"type": "integer"},
         "temperature": {"type": "number"},
+    },
+}
+
+_VARIABLE_CREATE_SCHEMA = {
+    "type": "object",
+    "required": ["name", "value"],
+    "properties": {
+        "name": {"type": "string"},
+        "value": {"type": "string"},
+        "folder": {"type": "integer"},
+    },
+}
+
+_VARIABLE_UPDATE_SCHEMA = {
+    "type": "object",
+    "required": ["variable_id", "value"],
+    "properties": {
+        "variable_id": {"type": "integer"},
+        "value": {"type": "string"},
     },
 }
 
@@ -416,6 +481,26 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_TEMPERATURE_SCHEMA,
         handler=lambda **args: _set_cool_setpoint_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="variable_create",
+        description=(
+            "Create a new Indigo variable. Returns the new variable's "
+            "id, name, value, and folder. Indigo variable values are "
+            "strings on the wire; numeric/bool callers must serialise "
+            "themselves before calling. Empty value is permitted."
+        ),
+        input_schema=_VARIABLE_CREATE_SCHEMA,
+        handler=lambda **args: _variable_create_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="variable_update",
+        description=(
+            "Update an existing Indigo variable's value. Empty value "
+            "clears the variable."
+        ),
+        input_schema=_VARIABLE_UPDATE_SCHEMA,
+        handler=lambda **args: _variable_update_handler(args, indigo_module),
     )
     handler.register_tool(
         name="device_set_white_levels",
