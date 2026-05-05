@@ -5,8 +5,18 @@ Phase 5 surface: ``query_event_log`` over the live Indigo event log,
 the installed plugin catalogue, and ``restart_plugin`` for one-shot
 plugin lifecycle control. Tool registrations follow the same
 ``lambda **args:`` shape as Phases 3-4 (handoff adjudication #6).
+
+**Why list_plugins scans the filesystem rather than calling
+``indigo.server.getPluginList()``**: smoke-tested 2026-05-05 against
+Indigo 2025.2 — ``getPluginList()`` returns ``[]`` on the live server
+even with ~30 plugins installed. The SDK docs say it returns "List
+of all installed plugin IDs"; in practice it doesn't. mlamoure's
+indigomcp uses the same filesystem-scan workaround, so we adopt it.
 """
 
+import glob
+import os
+import plistlib
 from datetime import datetime
 
 
@@ -179,17 +189,64 @@ def _lookup_plugin_or_raise(indigo_module, plugin_id):
         raise ValueError(f"no plugin with id {plugin_id!r}") from exc
 
 
+def _scan_plugin_bundles(indigo_module):
+    """Yield ``(plugin_id, bundle_path)`` for every installed plugin.
+
+    Resolves the Indigo install folder via
+    ``indigo.server.getInstallFolderPath()``, then scans
+    ``Plugins/`` and ``Plugins (Disabled)/`` for ``*.indigoPlugin``
+    bundles, parsing each ``Info.plist`` for its
+    ``CFBundleIdentifier``. Bundles missing or with unreadable
+    Info.plists are skipped silently — a malformed plugin shouldn't
+    fail the whole listing.
+
+    Filesystem scan exists because ``indigo.server.getPluginList()``
+    returns ``[]`` on Indigo 2025.x despite plugins being installed.
+    Smoke-tested 2026-05-05 on jarvis. mlamoure's indigomcp uses the
+    same workaround.
+    """
+    try:
+        install_path = indigo_module.server.getInstallFolderPath()
+    except Exception:
+        return
+    if not install_path:
+        return
+
+    for subdir in ("Plugins", "Plugins (Disabled)"):
+        plugins_dir = os.path.join(install_path, subdir)
+        if not os.path.isdir(plugins_dir):
+            continue
+        for bundle in glob.glob(os.path.join(plugins_dir, "*.indigoPlugin")):
+            info_plist = os.path.join(bundle, "Contents", "Info.plist")
+            if not os.path.isfile(info_plist):
+                continue
+            try:
+                with open(info_plist, "rb") as fh:
+                    data = plistlib.load(fh)
+            except Exception:
+                continue
+            plugin_id = data.get("CFBundleIdentifier")
+            if not plugin_id:
+                continue
+            yield plugin_id, bundle
+
+
 def _list_plugins_handler(_args, indigo_module):
-    """Return all installed plugins, ordered as Indigo lists them."""
-    ids = indigo_module.server.getPluginList() or []
+    """Return all installed plugins by scanning the filesystem.
+
+    Each bundle's id is resolved via ``getPlugin`` to populate the
+    live enabled/running/installed flags. Plugins whose object can't
+    be resolved (rare install race or partially-uninstalled bundle)
+    are still listed with bundle metadata only — install state can
+    be inferred from which subdir the bundle was in but we don't
+    expose that distinction here; callers asking 'is X running?'
+    should use ``get_plugin_status`` for an authoritative answer.
+    """
     results = []
-    for pid in ids:
+    for plugin_id, _bundle in _scan_plugin_bundles(indigo_module):
         try:
-            plugin = indigo_module.server.getPlugin(pid)
+            plugin = indigo_module.server.getPlugin(plugin_id)
         except Exception:
-            # Plugins can disappear between getPluginList and the
-            # individual getPlugin call (install/uninstall race);
-            # skip rather than fail the whole listing.
             continue
         results.append(_serialize_plugin(plugin))
     return {"results": results, "total_count": len(results)}
