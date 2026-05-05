@@ -211,3 +211,53 @@ def _find_devices_handler(args, *, indexer):
         "limit": limit,
         "has_more": offset + len(results) < total_count,
     }
+
+
+def register(handler, *, indexer):
+    """Register ``find_devices`` onto the given MCPHandler.
+
+    Takes ``indexer`` as a kwarg rather than ``indigo_module`` because
+    the tool consults the FTS5 index, not the Indigo runtime
+    directly. ``tool_registry.register_all`` threads the indexer
+    through so this stays consistent with how lookup/control/system
+    tools take ``indigo_module``.
+
+    Lambda uses ``**args:`` per handoff adjudication #6 — the
+    ``args`` form fails on every real MCP wire call.
+    """
+    handler.register_tool(
+        name="find_devices",
+        description=(
+            "Natural-language search over Indigo devices, variables, "
+            "and action groups via SQLite FTS5. Free-text 'query' "
+            "matches name + description + folder + type aliases (so "
+            "'light' finds dimmers, 'leak' finds leak sensors, etc.). "
+            "Optional filters: 'room' (folder name, case-insensitive), "
+            "'type' (deviceTypeId exact match — only surfaces "
+            "devices), 'entity_type' (string or list of "
+            "device/variable/action). Pagination via 'limit' (default "
+            "50, max 500) and 'offset'."
+        ),
+        input_schema={
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string"},
+                "room": {"type": "string"},
+                "type": {"type": "string"},
+                "entity_type": {
+                    "anyOf": [
+                        {"type": "string",
+                         "enum": list(_VALID_ENTITY_TYPES)},
+                        {"type": "array",
+                         "items": {"type": "string",
+                                   "enum": list(_VALID_ENTITY_TYPES)}},
+                    ],
+                },
+                "limit": {"type": "integer",
+                          "minimum": 1, "maximum": _MAX_LIMIT},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        handler=lambda **args: _find_devices_handler(args, indexer=indexer),
+    )
