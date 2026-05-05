@@ -224,6 +224,36 @@ _PLUGIN_ID_SCHEMA = {
     "properties": {"plugin_id": {"type": "string"}},
 }
 
+# Bundle identifier of *this* plugin. Imported by the restart_plugin
+# handler to refuse self-restart, which would kill the in-flight MCP
+# request mid-response. Kept here (not in plugin.py) so the system
+# tools module is self-contained — control/lookup tools don't need
+# to know who they're running inside, but this one does.
+_SELF_PLUGIN_ID = "com.simons-plugins.indigo-mcp-lite"
+
+
+def _restart_plugin_handler(args, indigo_module):
+    """Restart another Indigo plugin via ``plugin.restart``.
+
+    Refuses to restart self (``com.simons-plugins.indigo-mcp-lite``) —
+    a self-restart would terminate the IndigoPluginHost3 process
+    mid-MCP-response, and the caller would see a transport error
+    rather than a clean tool result. ``waitUntilDone=True`` matches
+    HI's pattern and gives the caller deterministic ordering: the
+    response only returns once Indigo confirms the restart sequence
+    has completed.
+    """
+    plugin_id = _require_plugin_id(args)
+    if plugin_id == _SELF_PLUGIN_ID:
+        raise ValueError(
+            f"refusing to restart self ({_SELF_PLUGIN_ID}) — would kill "
+            "the in-flight MCP request mid-response. Restart this "
+            "plugin via Indigo's UI or another MCP client instead."
+        )
+    plugin = _lookup_plugin_or_raise(indigo_module, plugin_id)
+    plugin.restart(waitUntilDone=True)
+    return {"status": "ok", "plugin_id": plugin_id}
+
 
 def register(handler, *, indigo_module):
     """Register every system tool onto the given MCPHandler."""
@@ -280,4 +310,16 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_PLUGIN_ID_SCHEMA,
         handler=lambda **args: _get_plugin_status_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="restart_plugin",
+        description=(
+            f"Restart an Indigo plugin by id. REFUSES to restart "
+            f"itself ({_SELF_PLUGIN_ID}) — a self-restart would kill "
+            f"the in-flight MCP request mid-response and the caller "
+            f"would see a transport error rather than a clean tool "
+            f"result. Restart this plugin via Indigo's UI instead."
+        ),
+        input_schema=_PLUGIN_ID_SCHEMA,
+        handler=lambda **args: _restart_plugin_handler(args, indigo_module),
     )
