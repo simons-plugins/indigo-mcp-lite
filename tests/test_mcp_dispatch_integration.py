@@ -69,6 +69,12 @@ def test_tools_list_through_mcp_handler_includes_lookup_tools(mock_indigo):
     assert "thermostat_set_hvac_mode" in names
     assert "variable_update" in names
     assert "action_execute_group" in names
+    # Phase 5 system tools — same regression-prevention coverage.
+    assert "query_event_log" in names
+    assert "list_plugins" in names
+    assert "get_plugin_by_id" in names
+    assert "get_plugin_status" in names
+    assert "restart_plugin" in names
 
 
 def test_tools_call_device_turn_on_dispatches_through_mcp_handler(mock_indigo):
@@ -140,3 +146,77 @@ def test_tools_call_device_set_brightness_dispatches_through_mcp_handler(mock_in
     result = body["result"]
     assert result.get("isError") is not True, f"tool returned error: {result}"
     mock_indigo.dimmer.setBrightness.assert_called_once_with(42, value=75)
+
+
+def test_tools_call_query_event_log_dispatches_through_mcp_handler(mock_indigo):
+    """Phase 5 integration coverage: query_event_log routed through
+    real ``MCPHandler.handle_request``. Confirms the system tool
+    family registers correctly and survives the dispatcher's
+    ``handler(**tool_args)`` shape.
+    """
+    from mcp_handler import MCPHandler
+    from tool_registry import register_all
+
+    mock_indigo.server.getEventLogList.return_value = [
+        {"TimeStamp": "2026-05-05 10:00:00.000",
+         "TypeStr": "Server", "Message": "Started"},
+    ]
+
+    handler = MCPHandler(server_name="test", server_version="0")
+    register_all(handler, indigo_module=mock_indigo)
+
+    response = handler.handle_request(
+        http_method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "query_event_log",
+                "arguments": {"limit": 5},
+            },
+        }),
+    )
+
+    assert response["status"] == 200, response
+    body = json.loads(response["content"])
+    result = body["result"]
+    assert result.get("isError") is not True, f"tool returned error: {result}"
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["total_count"] == 1
+    assert inner["results"][0]["message"] == "Started"
+
+
+def test_tools_call_restart_plugin_self_guard_returns_clean_error(mock_indigo):
+    """The self-restart guard must surface a clean tool error, NOT a
+    transport-level failure. ``isError`` should be True with an
+    explanatory message; the dispatcher should not have called
+    getPlugin at all.
+    """
+    from mcp_handler import MCPHandler
+    from tool_registry import register_all
+
+    handler = MCPHandler(server_name="test", server_version="0")
+    register_all(handler, indigo_module=mock_indigo)
+
+    response = handler.handle_request(
+        http_method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "restart_plugin",
+                "arguments": {"plugin_id": "com.simons-plugins.indigo-mcp-lite"},
+            },
+        }),
+    )
+
+    assert response["status"] == 200, response
+    body = json.loads(response["content"])
+    result = body["result"]
+    assert result.get("isError") is True, f"expected error, got: {result}"
+    assert "self" in result["content"][0]["text"].lower()
+    mock_indigo.server.getPlugin.assert_not_called()
