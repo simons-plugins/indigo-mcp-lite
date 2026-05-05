@@ -137,6 +137,94 @@ def _query_event_log_handler(args, indigo_module):
     }
 
 
+def _require_plugin_id(args):
+    """Pull a non-empty ``plugin_id`` string out of args or raise.
+
+    Plugin ids are reverse-DNS strings (e.g. ``com.foo.bar``) — we
+    don't enforce that pattern here since Indigo handles the
+    not-found case, but the type and emptiness checks live here so
+    every plugin tool surfaces the same error shape.
+    """
+    raw = args.get("plugin_id")
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("plugin_id must be a non-empty string")
+    return raw
+
+
+def _serialize_plugin(plugin):
+    """Stable dict shape for an Indigo plugin object.
+
+    Status methods (``isEnabled``/``isRunning``/``isInstalled``) are
+    callables, not properties, so each is invoked once per call —
+    don't replace the parens with attribute access.
+    """
+    return {
+        "plugin_id": getattr(plugin, "pluginId", ""),
+        "display_name": getattr(plugin, "pluginDisplayName", ""),
+        "version": getattr(plugin, "pluginVersion", ""),
+        "folder_path": getattr(plugin, "pluginFolderPath", ""),
+        "enabled": bool(plugin.isEnabled()),
+        "running": bool(plugin.isRunning()),
+        "installed": bool(plugin.isInstalled()),
+    }
+
+
+def _lookup_plugin_or_raise(indigo_module, plugin_id):
+    """Resolve a plugin id to a plugin object, mapping any SDK error
+    (KeyError / IndexError / ValueError / generic Exception) into a
+    clean ValueError so the JSON-RPC layer maps it to ``isError``."""
+    try:
+        return indigo_module.server.getPlugin(plugin_id)
+    except (KeyError, IndexError, ValueError, Exception) as exc:
+        raise ValueError(f"no plugin with id {plugin_id!r}") from exc
+
+
+def _list_plugins_handler(_args, indigo_module):
+    """Return all installed plugins, ordered as Indigo lists them."""
+    ids = indigo_module.server.getPluginList() or []
+    results = []
+    for pid in ids:
+        try:
+            plugin = indigo_module.server.getPlugin(pid)
+        except Exception:
+            # Plugins can disappear between getPluginList and the
+            # individual getPlugin call (install/uninstall race);
+            # skip rather than fail the whole listing.
+            continue
+        results.append(_serialize_plugin(plugin))
+    return {"results": results, "total_count": len(results)}
+
+
+def _get_plugin_by_id_handler(args, indigo_module):
+    """Return one serialised plugin by id."""
+    plugin_id = _require_plugin_id(args)
+    return _serialize_plugin(_lookup_plugin_or_raise(indigo_module, plugin_id))
+
+
+def _get_plugin_status_handler(args, indigo_module):
+    """Return runtime state (enabled/running/installed) only.
+
+    Subset of ``get_plugin_by_id`` for callers who just want the
+    health flags without the static metadata. Cheaper at the wire
+    layer for poll-style use cases.
+    """
+    plugin_id = _require_plugin_id(args)
+    plugin = _lookup_plugin_or_raise(indigo_module, plugin_id)
+    return {
+        "plugin_id": getattr(plugin, "pluginId", plugin_id),
+        "enabled": bool(plugin.isEnabled()),
+        "running": bool(plugin.isRunning()),
+        "installed": bool(plugin.isInstalled()),
+    }
+
+
+_PLUGIN_ID_SCHEMA = {
+    "type": "object",
+    "required": ["plugin_id"],
+    "properties": {"plugin_id": {"type": "string"}},
+}
+
+
 def register(handler, *, indigo_module):
     """Register every system tool onto the given MCPHandler."""
     handler.register_tool(
@@ -160,4 +248,36 @@ def register(handler, *, indigo_module):
             },
         },
         handler=lambda **args: _query_event_log_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="list_plugins",
+        description=(
+            "List every installed Indigo plugin with id, display name, "
+            "version, install path, and live enabled/running/installed "
+            "flags. Plugins that disappear between enumeration and "
+            "lookup (rare install/uninstall race) are skipped silently."
+        ),
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda **args: _list_plugins_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="get_plugin_by_id",
+        description=(
+            "Return a single plugin by id with full metadata + live "
+            "enabled/running/installed flags. Raises if the id is not "
+            "installed."
+        ),
+        input_schema=_PLUGIN_ID_SCHEMA,
+        handler=lambda **args: _get_plugin_by_id_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="get_plugin_status",
+        description=(
+            "Return only the live status flags (enabled/running/"
+            "installed) for one plugin. Cheaper than get_plugin_by_id "
+            "for poll-style health checks where the static metadata "
+            "isn't needed."
+        ),
+        input_schema=_PLUGIN_ID_SCHEMA,
+        handler=lambda **args: _get_plugin_status_handler(args, indigo_module),
     )
