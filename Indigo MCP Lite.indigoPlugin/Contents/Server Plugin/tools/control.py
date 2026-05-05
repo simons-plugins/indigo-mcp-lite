@@ -130,6 +130,22 @@ def _set_named_color_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _set_heat_setpoint_handler(args, indigo_module):
+    """Set a thermostat's heating setpoint to ``temperature``."""
+    device_id = _require_int_id(args, "device_id")
+    temperature = _require_numeric(args, "temperature")
+    indigo_module.thermostat.setHeatSetpoint(device_id, value=temperature)
+    return {"status": "ok"}
+
+
+def _set_cool_setpoint_handler(args, indigo_module):
+    """Set a thermostat's cooling setpoint to ``temperature``."""
+    device_id = _require_int_id(args, "device_id")
+    temperature = _require_numeric(args, "temperature")
+    indigo_module.thermostat.setCoolSetpoint(device_id, value=temperature)
+    return {"status": "ok"}
+
+
 def _set_white_levels_handler(args, indigo_module):
     """Set warm/cool white levels and/or colour temperature.
 
@@ -197,6 +213,15 @@ _NAMED_COLOR_SCHEMA = {
     "properties": {
         "device_id": {"type": "integer"},
         "name": {"type": "string"},
+    },
+}
+
+_TEMPERATURE_SCHEMA = {
+    "type": "object",
+    "required": ["device_id", "temperature"],
+    "properties": {
+        "device_id": {"type": "integer"},
+        "temperature": {"type": "number"},
     },
 }
 
@@ -279,6 +304,26 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_NAMED_COLOR_SCHEMA,
         handler=lambda **args: _set_named_color_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="thermostat_set_heat_setpoint",
+        description=(
+            "Set a thermostat's heating setpoint. Temperature units "
+            "follow the thermostat's own configuration (°F or °C); "
+            "Indigo handles the conversion."
+        ),
+        input_schema=_TEMPERATURE_SCHEMA,
+        handler=lambda **args: _set_heat_setpoint_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="thermostat_set_cool_setpoint",
+        description=(
+            "Set a thermostat's cooling setpoint. Temperature units "
+            "follow the thermostat's own configuration (°F or °C); "
+            "Indigo handles the conversion."
+        ),
+        input_schema=_TEMPERATURE_SCHEMA,
+        handler=lambda **args: _set_cool_setpoint_handler(args, indigo_module),
     )
     handler.register_tool(
         name="device_set_white_levels",
