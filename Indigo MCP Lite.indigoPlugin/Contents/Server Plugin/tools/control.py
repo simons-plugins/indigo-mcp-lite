@@ -130,6 +130,32 @@ def _set_named_color_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _set_white_levels_handler(args, indigo_module):
+    """Set warm/cool white levels and/or colour temperature.
+
+    All three keys (``white``, ``white2``, ``temperature``) are
+    optional individually but at least one must be present —
+    otherwise the SDK call would have nothing to set and the tool
+    would silently no-op. White levels go through ``clamp_percent``
+    (0-100); ``temperature`` is passed through as Kelvin since
+    devices vary in supported range (typically 2000-6500).
+    """
+    device_id = _require_int_id(args, "device_id")
+    kwargs = {}
+    if "white" in args:
+        kwargs["whiteLevel"] = clamp_percent(_require_numeric(args, "white"))
+    if "white2" in args:
+        kwargs["whiteLevel2"] = clamp_percent(_require_numeric(args, "white2"))
+    if "temperature" in args:
+        kwargs["whiteTemperature"] = int(_require_numeric(args, "temperature"))
+    if not kwargs:
+        raise ValueError(
+            "must supply at least one of: white, white2, temperature"
+        )
+    indigo_module.dimmer.setColorLevels(device_id, **kwargs)
+    return {"status": "ok"}
+
+
 _DEVICE_ID_SCHEMA = {
     "type": "object",
     "required": ["device_id"],
@@ -171,6 +197,17 @@ _NAMED_COLOR_SCHEMA = {
     "properties": {
         "device_id": {"type": "integer"},
         "name": {"type": "string"},
+    },
+}
+
+_WHITE_LEVELS_SCHEMA = {
+    "type": "object",
+    "required": ["device_id"],
+    "properties": {
+        "device_id": {"type": "integer"},
+        "white": {"type": "number"},
+        "white2": {"type": "number"},
+        "temperature": {"type": "number"},
     },
 }
 
@@ -242,4 +279,16 @@ def register(handler, *, indigo_module):
         ),
         input_schema=_NAMED_COLOR_SCHEMA,
         handler=lambda **args: _set_named_color_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_set_white_levels",
+        description=(
+            "Set warm/cool white levels and/or colour temperature on "
+            "an RGBW or dual-white dimmer. All three keys (white, "
+            "white2, temperature in Kelvin) are individually optional "
+            "but at least one must be supplied. White levels are "
+            "0-100; temperatures are typically 2000-6500K."
+        ),
+        input_schema=_WHITE_LEVELS_SCHEMA,
+        handler=lambda **args: _set_white_levels_handler(args, indigo_module),
     )
