@@ -249,3 +249,70 @@ class Indexer:
             ),
         )
         self._snapshots[("action", getattr(action, "id", 0))] = self._action_snapshot(action)
+
+    # ---------------------------------------------------------------
+    # Update handlers — the load-bearing short-circuit lives here.
+    # ---------------------------------------------------------------
+    #
+    # Each on_*_updated returns True if it reindexed, False if it
+    # short-circuited. Plugin.py's deviceUpdated callback doesn't
+    # check the return — it's surfaced for tests + future telemetry.
+    # ---------------------------------------------------------------
+
+    def _replace_row(self, entity_type, entity_id, insert_fn, entity):
+        """Common upsert path: delete existing row, run the
+        type-specific insert helper. Caller manages the snapshot
+        cache around this so the cache and the row stay in lockstep
+        even if commit fails partway."""
+        cur = self.connection.cursor()
+        cur.execute(
+            "DELETE FROM entities WHERE entity_type=? AND entity_id=?",
+            (entity_type, entity_id),
+        )
+        insert_fn(cur, entity)
+        self.connection.commit()
+
+    def on_device_updated(self, dev):
+        """Reindex a device only if a static field changed.
+
+        Compares a freshly-derived snapshot of the post-update
+        device against the cached snapshot. Returns False (no work)
+        for state-only changes, True (reindex committed) for static-
+        field changes. Unknown ids fall through to create-style
+        handling so a missed deviceCreated event doesn't permanently
+        leave the entity unindexed.
+        """
+        entity_id = getattr(dev, "id", 0)
+        new_snapshot = self._device_snapshot(dev)
+        if self._snapshots.get(("device", entity_id)) == new_snapshot:
+            return False
+        self._replace_row("device", entity_id, self._insert_device, dev)
+        # _insert_device already updates _snapshots, so we're done.
+        return True
+
+    def on_variable_updated(self, var):
+        """Reindex a variable only if a static field changed.
+
+        Variable VALUES change constantly (any rule update flips
+        them). Per ``_variable_snapshot`` only ``(name, folderId)``
+        are tracked, so a value flip naturally short-circuits.
+        """
+        entity_id = getattr(var, "id", 0)
+        new_snapshot = self._variable_snapshot(var)
+        if self._snapshots.get(("variable", entity_id)) == new_snapshot:
+            return False
+        self._replace_row("variable", entity_id, self._insert_variable, var)
+        return True
+
+    def on_action_updated(self, action):
+        """Reindex an action group only if a static field changed.
+
+        Action groups don't change as often as devices/variables but
+        the same short-circuit pattern applies for consistency.
+        """
+        entity_id = getattr(action, "id", 0)
+        new_snapshot = self._action_snapshot(action)
+        if self._snapshots.get(("action", entity_id)) == new_snapshot:
+            return False
+        self._replace_row("action", entity_id, self._insert_action, action)
+        return True
