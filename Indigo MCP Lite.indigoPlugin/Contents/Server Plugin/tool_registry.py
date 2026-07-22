@@ -9,8 +9,8 @@ phases (e.g. Phase 6) thread additional collaborators like an
 indexer through without breaking the existing call sites.
 """
 
-from tools import (automations, control, find_devices, history, lookup,
-                   system, zwave)
+from tools import (automations, control, find_devices, history,
+                   irrigation_speed, lookup, system, zwave)
 
 
 def register_all(handler, *, indigo_module, indexer=None,
@@ -29,6 +29,7 @@ def register_all(handler, *, indigo_module, indexer=None,
     system.register(handler, indigo_module=indigo_module)
     zwave.register(handler, indigo_module=indigo_module)
     automations.register(handler, indigo_module=indigo_module)
+    irrigation_speed.register(handler, indigo_module=indigo_module)
     if indexer is not None:
         find_devices.register(handler, indexer=indexer)
     # History tools always register; an absent provider yields the
