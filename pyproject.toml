@@ -1,6 +1,6 @@
 [project]
 name = "indigo-mcp-lite"
-version = "2026.6.0"
+version = "2026.6.1"
 description = "Stdlib-only Indigo MCP server plugin (Intel Mac / Python 3.13 replacement for indigo-mcp-server)"
 requires-python = ">=3.10"
 
