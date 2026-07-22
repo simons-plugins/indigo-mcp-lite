@@ -67,8 +67,17 @@ _SYSTEM_TOOLS = frozenset({
 })
 
 
+# Automation-contents tools (.indiDb reader) get their own group;
+# without this, find_automation_references would match no predicate
+# and silently vanish from the table.
+_AUTOMATION_CONTENT_TOOLS = frozenset({
+    "get_automation_contents", "find_automation_references",
+    "list_automation_scripts",
+})
+
+
 def _is_lookup(n):
-    if n in _SYSTEM_TOOLS:
+    if n in _SYSTEM_TOOLS or n in _AUTOMATION_CONTENT_TOOLS:
         return False
     return n.startswith("list_") or n.startswith("get_")
 
@@ -82,6 +91,7 @@ def _is_control(n):
 
 _GROUPS = (
     ("Lookup", _is_lookup),
+    ("Automation contents", lambda n: n in _AUTOMATION_CONTENT_TOOLS),
     ("Control", _is_control),
     ("System", lambda n: n in _SYSTEM_TOOLS),
     ("Search", lambda n: n == "find_devices"),
