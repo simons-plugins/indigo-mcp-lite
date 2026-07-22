@@ -331,11 +331,79 @@ def _lookup_or_raise(collection, entity_id, entity_label):
         raise ValueError(f"no {entity_label} with id {entity_id}")
 
 
+# Attributes worth surfacing on a single-device lookup beyond the slim
+# list shape. Curated rather than a blind dict(dev) dump: these are the
+# fields an assistant actually reasons about, and several are subclass-
+# specific so getattr-with-None keeps one serializer for all types.
+_DETAIL_ATTRS = (
+    ("battery_level", "batteryLevel"),
+    ("enabled", "enabled"),
+    ("error_state", "errorState"),
+    ("sensor_value", "sensorValue"),
+    ("display_state_ui", "displayStateValUi"),
+    ("hvac_mode", "hvacMode"),
+    ("fan_mode", "fanMode"),
+    ("heat_setpoint", "heatSetpoint"),
+    ("cool_setpoint", "coolSetpoint"),
+    ("speed_index", "speedIndex"),
+    ("speed_level", "speedLevel"),
+    ("active_zone", "activeZone"),
+    ("zone_count", "zoneCount"),
+    ("zone_names", "zoneNames"),
+    ("energy_cur_level", "energyCurLevel"),
+    ("energy_accum_total", "energyAccumTotal"),
+    ("last_changed", "lastChanged"),
+    ("last_successful_comm", "lastSuccessfulComm"),
+)
+
+
+def _serialize_device_detail(d):
+    """Full single-device shape: slim fields + states + subclass attrs.
+
+    Only used by get_device_by_id — the list tools keep the slim shape
+    so a 500-row page doesn't balloon the prompt. Values go through
+    the same JSON-safe coercion as the Z-Wave props (enums and
+    datetimes degrade to strings, indigo.Dict/List to dict/list).
+    """
+    from tools.zwave import _json_safe
+
+    out = _serialize_device(d)
+    out["protocol"] = str(getattr(d, "protocol", "")) or None
+    attr_read_errors = 0
+    for key, attr in _DETAIL_ATTRS:
+        try:
+            value = getattr(d, attr, None)
+        except Exception:
+            # Count rather than fully swallow: a systemically broken
+            # IOM must not read as "this device has no attributes".
+            attr_read_errors += 1
+            value = None
+        if value is not None:
+            if hasattr(value, "isoformat"):
+                value = value.isoformat()  # match the zwave serializer
+            out[key] = _json_safe(value)
+    if attr_read_errors:
+        out["attr_read_errors"] = attr_read_errors
+    states = getattr(d, "states", None)
+    if states is not None and hasattr(states, "items"):
+        # Dot-suffixed sub-states (enum `state.option` booleans, `.ui`
+        # display strings) duplicate their base state — drop them only
+        # when the base key actually exists, so a genuine state id that
+        # happens to contain a dot survives.
+        keys = {str(k) for k in states}
+        out["states"] = {
+            str(k): _json_safe(v)
+            for k, v in states.items()
+            if "." not in str(k) or str(k).split(".", 1)[0] not in keys
+        }
+    return out
+
+
 def _get_device_handler(args, indigo_module):
-    """Return a single serialised device by id."""
+    """Return a single fully-serialised device by id (incl. states)."""
     device_id = _require_int_id(args)
     dev = _lookup_or_raise(indigo_module.devices, device_id, "device")
-    return _serialize_device(dev)
+    return _serialize_device_detail(dev)
 
 
 def _get_variable_handler(args, indigo_module):
