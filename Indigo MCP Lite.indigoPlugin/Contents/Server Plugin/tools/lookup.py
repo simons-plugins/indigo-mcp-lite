@@ -369,21 +369,32 @@ def _serialize_device_detail(d):
 
     out = _serialize_device(d)
     out["protocol"] = str(getattr(d, "protocol", "")) or None
+    attr_read_errors = 0
     for key, attr in _DETAIL_ATTRS:
         try:
             value = getattr(d, attr, None)
         except Exception:
+            # Count rather than fully swallow: a systemically broken
+            # IOM must not read as "this device has no attributes".
+            attr_read_errors += 1
             value = None
         if value is not None:
             if hasattr(value, "isoformat"):
                 value = value.isoformat()  # match the zwave serializer
             out[key] = _json_safe(value)
+    if attr_read_errors:
+        out["attr_read_errors"] = attr_read_errors
     states = getattr(d, "states", None)
     if states is not None and hasattr(states, "items"):
-        # Enumerated states also appear as `state.option` boolean keys;
-        # drop those duplicates to keep the payload readable.
+        # Dot-suffixed sub-states (enum `state.option` booleans, `.ui`
+        # display strings) duplicate their base state — drop them only
+        # when the base key actually exists, so a genuine state id that
+        # happens to contain a dot survives.
+        keys = {str(k) for k in states}
         out["states"] = {
-            str(k): _json_safe(v) for k, v in states.items() if "." not in str(k)
+            str(k): _json_safe(v)
+            for k, v in states.items()
+            if "." not in str(k) or str(k).split(".", 1)[0] not in keys
         }
     return out
 

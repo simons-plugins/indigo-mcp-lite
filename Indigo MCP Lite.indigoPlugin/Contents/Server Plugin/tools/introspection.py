@@ -81,11 +81,16 @@ def _dependencies_handler(args, indigo_module):
     )
     raw = getattr(indigo_module, command_ns).getDependencies(entity_id)
     dependencies = _json_safe(raw)
-    if not isinstance(dependencies, dict):
+    if isinstance(dependencies, dict) and all(
+        isinstance(v, list) for v in dependencies.values()
+    ):
+        total = sum(len(v) for v in dependencies.values())
+    else:
+        # Unrecognised shape — report unknown rather than a false 0,
+        # since the description tells agents to trust this before
+        # destructive operations.
         dependencies = {"raw": dependencies}
-    total = sum(
-        len(v) for v in dependencies.values() if isinstance(v, list)
-    )
+        total = None
     return {
         "entity_type": entity_type,
         "id": entity_id,
@@ -106,9 +111,12 @@ def _device_group_handler(args, indigo_module):
     if group_ids:
         try:
             root = indigo_module.devices[group_ids[0]]
+        except (KeyError, IndexError, ValueError):
+            root = None  # group root vanished between calls; ids still useful
+        if root is not None:
+            # Serialization stays OUTSIDE the catch — a serializer bug
+            # should surface loudly, not read as a vanished root.
             root_out = _serialize_device(root)
             root_out["battery_level"] = getattr(root, "batteryLevel", None)
             result["root_device"] = root_out
-        except (KeyError, IndexError, ValueError):
-            pass  # group root vanished between calls; ids still useful
     return result

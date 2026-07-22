@@ -63,7 +63,8 @@ def test_device_detail_serializer_subclass_fields():
         lastChanged=datetime(2026, 7, 22, 9, 0),
         lastSuccessfulComm=None,
         states={"hvacOperationModeIsHeat": True, "temperatureInput1": 21.4,
-                "hvacOperationMode.heat": True},
+                "hvacOperationMode": "heat", "hvacOperationMode.heat": True,
+                "com.vendor.dotted": 1},
     )
     out = _serialize_device_detail(dev)
     assert out["hvac_mode"] == "Heat"
@@ -73,6 +74,7 @@ def test_device_detail_serializer_subclass_fields():
     assert "cool_setpoint" not in out  # None attrs omitted
     assert out["states"]["temperatureInput1"] == 21.4
     assert "hvacOperationMode.heat" not in out["states"]  # enum dup dropped
+    assert out["states"]["com.vendor.dotted"] == 1  # no base key -> kept
     assert "2026-07-22" in out["last_changed"]
 
 
@@ -86,3 +88,107 @@ def test_register_all_includes_introspection(mock_indigo):
         for call in handler.register_tool.call_args_list
     }
     assert {"get_dependencies", "get_device_group"} <= names
+
+
+def test_dependencies_all_five_namespaces(mock_indigo):
+    for entity_type, (ns, coll) in (
+        ("device", ("device", "devices")),
+        ("variable", ("variable", "variables")),
+        ("trigger", ("trigger", "triggers")),
+        ("schedule", ("schedule", "schedules")),
+        ("action_group", ("actionGroup", "actionGroups")),
+    ):
+        getattr(mock_indigo, coll).__getitem__.side_effect = lambda i: object()
+        getattr(mock_indigo, ns).getDependencies.return_value = {"triggers": []}
+        out = _dependencies_handler({"entity_type": entity_type, "id": 1},
+                                    mock_indigo)
+        getattr(mock_indigo, ns).getDependencies.assert_called_once_with(1)
+        assert out["total_dependents"] == 0
+
+
+def test_dependencies_unrecognised_shape_reports_unknown(mock_indigo):
+    mock_indigo.variables.__getitem__.side_effect = lambda i: object()
+    mock_indigo.variable.getDependencies.return_value = ["weird"]
+    out = _dependencies_handler({"entity_type": "variable", "id": 1},
+                                mock_indigo)
+    assert out["total_dependents"] is None
+    assert out["dependencies"] == {"raw": ["weird"]}
+
+
+def test_device_group_non_list_and_mixed_returns(mock_indigo):
+    fake = SimpleNamespace(id=1, name="R", deviceTypeId="", model="",
+                           address="", description="", folderId=0,
+                           pluginId="", onState=None, brightness=None,
+                           batteryLevel=None)
+    mock_indigo.devices.__getitem__.side_effect = lambda i: fake
+    mock_indigo.device.getGroupList.return_value = None
+    assert _device_group_handler({"device_id": 1}, mock_indigo)["group_ids"] == []
+    mock_indigo.device.getGroupList.return_value = [1, "x", 2.5]
+    out = _device_group_handler({"device_id": 1}, mock_indigo)
+    assert out["group_ids"] == [1]
+
+
+def test_detail_attr_read_errors_counted():
+    class _Broken:
+        id = 1
+        name = "B"
+        deviceTypeId = ""
+        model = ""
+        address = ""
+        description = ""
+        folderId = 0
+        pluginId = ""
+        onState = None
+        brightness = None
+        protocol = "ZWave"
+        states = {}
+
+        @property
+        def batteryLevel(self):
+            raise RuntimeError("server link down")
+
+        @property
+        def sensorValue(self):
+            raise RuntimeError("server link down")
+
+    out = _serialize_device_detail(_Broken())
+    assert out["attr_read_errors"] == 2
+    assert "battery_level" not in out
+
+
+def test_get_device_by_id_returns_detail_shape(mock_indigo):
+    from tools.lookup import _get_device_handler
+
+    dev = SimpleNamespace(
+        id=42, name="X", deviceTypeId="sensor", model="", address="",
+        description="", folderId=0, pluginId="", onState=None,
+        brightness=None, protocol="ZWave", batteryLevel=55,
+        states={"sensorValue": 21.4},
+    )
+    mock_indigo.devices.__getitem__.side_effect = lambda i: {42: dev}[i]
+    out = _get_device_handler({"id": 42}, mock_indigo)
+    assert out["battery_level"] == 55
+    assert out["states"] == {"sensorValue": 21.4}
+
+
+def test_wire_dispatch_introspection(mock_indigo):
+    import json as _json
+
+    from mcp_handler import MCPHandler
+    from tool_registry import register_all
+
+    handler = MCPHandler(server_name="test", server_version="0")
+    register_all(handler, indigo_module=mock_indigo)
+    mock_indigo.variables.__getitem__.side_effect = lambda i: object()
+    mock_indigo.variable.getDependencies.return_value = {"triggers": []}
+    response = handler.handle_request(
+        http_method="POST",
+        headers={"Content-Type": "application/json"},
+        body=_json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "get_dependencies",
+                       "arguments": {"entity_type": "variable", "id": 7}},
+        }),
+    )
+    result = _json.loads(response["content"])["result"]
+    assert result.get("isError") is not True, result
