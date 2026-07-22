@@ -136,3 +136,22 @@ def test_mutating_tools_reject_unknown_id(mock_indigo):
 def test_unknown_arg_rejected(mock_indigo):
     with pytest.raises(ValueError, match="unknown argument"):
         _trigger_execute_handler({"id": 5, "force": True}, mock_indigo)
+
+
+def test_enable_with_duration_self_rearm(mock_indigo):
+    mock_indigo.schedules.__getitem__.side_effect = lambda i: _fake_schedule(6, "S")
+    _schedule_enable_handler(
+        {"id": 6, "enabled": False, "duration": 1209600}, mock_indigo)
+    mock_indigo.schedule.enable.assert_called_once_with(
+        6, value=False, duration=1209600)
+    mock_indigo.triggers.__getitem__.side_effect = lambda i: _fake_trigger(5, "T")
+    _trigger_enable_handler(
+        {"id": 5, "enabled": True, "delay": 60}, mock_indigo)
+    mock_indigo.trigger.enable.assert_called_once_with(5, value=True, delay=60)
+
+
+def test_enable_rejects_negative_duration(mock_indigo):
+    mock_indigo.schedules.__getitem__.side_effect = lambda i: _fake_schedule(6, "S")
+    with pytest.raises(ValueError, match="duration"):
+        _schedule_enable_handler(
+            {"id": 6, "enabled": False, "duration": -5}, mock_indigo)
