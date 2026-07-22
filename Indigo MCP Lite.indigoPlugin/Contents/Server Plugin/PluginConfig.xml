@@ -9,4 +9,49 @@
             <Option value="ERROR">Error</Option>
         </List>
     </Field>
+
+    <Field id="separator1" type="separator" />
+
+    <Field id="historyLabel" type="label">
+        <Label>Indigo SQL Logger Database (optional)</Label>
+    </Field>
+    <Field id="historyHelp" type="label" fontSize="small" fontColor="darkgray">
+        <Label>Enables the query_sql_logger / list_sql_logger_columns history tools. Leave as "Not configured" if you don't use the SQL Logger plugin.</Label>
+    </Field>
+
+    <Field id="dbType" type="menu" defaultValue="none">
+        <Label>Database type:</Label>
+        <List>
+            <Option value="none">Not configured</Option>
+            <Option value="sqlite">SQLite</Option>
+            <Option value="postgresql">PostgreSQL</Option>
+        </List>
+    </Field>
+
+    <Field id="sqlitePath" type="textfield" defaultValue=""
+           visibleBindingId="dbType" visibleBindingValue="sqlite">
+        <Label>SQLite database path:</Label>
+        <Description>Full path to the SQL Logger .sqlite file.</Description>
+    </Field>
+
+    <Field id="pgHost" type="textfield" defaultValue="127.0.0.1"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Host:</Label>
+    </Field>
+    <Field id="pgPort" type="textfield" defaultValue="5432"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Port:</Label>
+    </Field>
+    <Field id="pgUser" type="textfield" defaultValue="postgres"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Username:</Label>
+    </Field>
+    <Field id="pgPassword" type="textfield" defaultValue="" secure="true"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Password:</Label>
+    </Field>
+    <Field id="pgDatabase" type="textfield" defaultValue="indigo_history"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Database name:</Label>
+    </Field>
 </PluginConfig>

@@ -21,6 +21,9 @@ class Plugin(indigo.PluginBase):
             server_name="indigo-mcp-lite",
             server_version=plugin_version,
         )
+        # Built in startup()/_build_history_db(); None = history tools
+        # report "not configured".
+        self.history_db = None
 
     def _apply_log_level(self):
         level_name = self.pluginPrefs.get("logLevel", "INFO")
@@ -45,8 +48,10 @@ class Plugin(indigo.PluginBase):
         indigo.variables.subscribeToChanges()
         indigo.actionGroups.subscribeToChanges()
 
+        self._build_history_db()
         register_all(self.mcp_handler, indigo_module=indigo,
-                     indexer=self.indexer)
+                     indexer=self.indexer,
+                     history_db_provider=lambda: self.history_db)
 
     def shutdown(self):
         self.logger.info("indigo-mcp-lite shutdown")
@@ -54,6 +59,61 @@ class Plugin(indigo.PluginBase):
     def closedPrefsConfigUi(self, valuesDict, userCancelled):
         if not userCancelled:
             self._apply_log_level()
+            # Rebuild the SQL Logger connection so pref edits take
+            # effect without a plugin restart. The history tools hold a
+            # provider (not the instance), so the swap is picked up on
+            # the next tool call.
+            self._build_history_db()
+
+    def _build_history_db(self):
+        """(Re)build the SQL Logger reader from prefs.
+
+        ``self.history_db`` stays None when unconfigured (dbType pref
+        of "none", the default) — the history tools then return a
+        friendly "not configured" error. A failed connection test
+        logs but still keeps the instance: transient DB outages
+        shouldn't require a plugin restart to recover from."""
+        from history_db import HistoryDB
+
+        db_type = self.pluginPrefs.get("dbType", "none")
+        if db_type == "postgresql":
+            self.history_db = HistoryDB(
+                db_type="postgresql",
+                logger=self.logger,
+                pg_host=self.pluginPrefs.get("pgHost", "127.0.0.1"),
+                pg_port=self.pluginPrefs.get("pgPort", "5432"),
+                pg_user=self.pluginPrefs.get("pgUser", "postgres"),
+                pg_password=self.pluginPrefs.get("pgPassword", ""),
+                pg_database=self.pluginPrefs.get("pgDatabase", "indigo_history"),
+            )
+            target = (
+                f"postgresql @ {self.history_db.pg_config['host']}"
+                f"/{self.history_db.pg_config['database']}"
+            )
+        elif db_type == "sqlite":
+            sqlite_path = self.pluginPrefs.get("sqlitePath", "").strip()
+            if not sqlite_path:
+                self.logger.warning(
+                    "SQL Logger dbType is sqlite but no path is set; "
+                    "history tools stay unconfigured"
+                )
+                self.history_db = None
+                return
+            self.history_db = HistoryDB(
+                db_type="sqlite", logger=self.logger, sqlite_path=sqlite_path
+            )
+            target = f"sqlite @ {sqlite_path}"
+        else:
+            self.history_db = None
+            return
+
+        if self.history_db.test_connection():
+            self.logger.info(f"SQL Logger ready: {target}")
+        else:
+            self.logger.warning(
+                f"SQL Logger configured ({target}) but connection test "
+                "failed; history tools will error until fixed"
+            )
 
     def menuReindexNow(self):
         """Indigo menu callback: rebuild the FTS5 index from scratch.
