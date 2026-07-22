@@ -56,18 +56,40 @@ def test_enable_requires_boolean(mock_indigo):
         _enable_handler({"device_id": 5, "enabled": "yes"}, mock_indigo)
 
 
-def test_status_request_suppresses_logging(mock_indigo):
-    _status_request_handler({"device_id": 5}, mock_indigo)
+def test_status_request_logs_and_notes_async(mock_indigo):
+    out = _status_request_handler({"device_id": 5}, mock_indigo)
     mock_indigo.device.statusRequest.assert_called_once_with(
-        5, suppressLogging=True
+        5, suppressLogging=False
     )
+    assert out["status"] == "requested" and "asynchronous" in out["note"]
 
 
 def test_lock_unlock_with_duration(mock_indigo):
-    _lock_handler({"device_id": 7, "duration": 30}, mock_indigo)
+    out = _lock_handler({"device_id": 7, "duration": 30}, mock_indigo)
     mock_indigo.device.lock.assert_called_once_with(7, duration=30)
-    _unlock_handler({"device_id": 7}, mock_indigo)
+    assert out["status"] == "dispatched" and "on_state" in out["note"]
+    out = _unlock_handler({"device_id": 7}, mock_indigo)
     mock_indigo.device.unlock.assert_called_once_with(7)
+    assert out["status"] == "dispatched"
+
+
+def test_unknown_arg_rejected_with_valid_list(mock_indigo):
+    with pytest.raises(ValueError, match="delay_seconds.*valid.*delay"):
+        _turn_on_handler({"device_id": 5, "delay_seconds": 10}, mock_indigo)
+    mock_indigo.device.turnOn.assert_not_called()
+
+
+def test_integral_floats_coerce(mock_indigo):
+    _toggle_handler({"device_id": 5.0, "delay": 10.0}, mock_indigo)
+    mock_indigo.device.toggle.assert_called_once_with(5, delay=10)
+    with pytest.raises(ValueError, match="delay"):
+        _toggle_handler({"device_id": 5, "delay": 1.5}, mock_indigo)
+
+
+def test_ping_unexpected_result_raises(mock_indigo):
+    mock_indigo.device.ping.return_value = None
+    with pytest.raises(ValueError, match="may not support ping"):
+        _ping_handler({"device_id": 9}, mock_indigo)
 
 
 def test_brighten_dim_relative(mock_indigo):
@@ -85,7 +107,8 @@ def test_brighten_by_out_of_range(mock_indigo):
 
 
 def test_brighten_rejects_duration(mock_indigo):
-    with pytest.raises(ValueError, match="delay only"):
+    # Caught by the unknown-arg guard (duration isn't a brighten arg).
+    with pytest.raises(ValueError, match="unknown argument"):
         _brighten_handler({"device_id": 3, "duration": 5}, mock_indigo)
 
 

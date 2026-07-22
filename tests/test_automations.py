@@ -1,4 +1,4 @@
-"""Tests for the trigger & schedule tools (control wave 2)."""
+"""Tests for the trigger & schedule tools (control-wave PR #29)."""
 
 from datetime import datetime
 from types import SimpleNamespace
@@ -104,3 +104,35 @@ def test_register_all_includes_automation_tools(mock_indigo):
         "trigger_execute", "list_schedules", "get_schedule_by_id",
         "schedule_enable", "schedule_execute",
     } <= names
+
+
+def test_paginate_defaults_and_overflow():
+    items = [_fake_trigger(i, f"T{i}") for i in range(3)]
+    out = _paginate(items, {})
+    assert (out["limit"], out["offset"], out["total_count"]) == (50, 0, 3)
+    out = _paginate(items, {"offset": 10})
+    assert out["results"] == [] and out["has_more"] is False
+
+
+def test_enable_missing_enabled_rejected(mock_indigo):
+    mock_indigo.triggers.__getitem__.side_effect = lambda i: _fake_trigger(5, "X")
+    with pytest.raises(ValueError, match="enabled must be a boolean"):
+        _trigger_enable_handler({"id": 5}, mock_indigo)
+
+
+def test_mutating_tools_reject_unknown_id(mock_indigo):
+    def _missing(i):
+        raise KeyError(i)
+    mock_indigo.triggers.__getitem__.side_effect = _missing
+    mock_indigo.schedules.__getitem__.side_effect = _missing
+    with pytest.raises(ValueError, match="no trigger with id 999"):
+        _trigger_execute_handler({"id": 999}, mock_indigo)
+    with pytest.raises(ValueError, match="no schedule with id 999"):
+        _schedule_enable_handler({"id": 999, "enabled": True}, mock_indigo)
+    mock_indigo.trigger.execute.assert_not_called()
+    mock_indigo.schedule.enable.assert_not_called()
+
+
+def test_unknown_arg_rejected(mock_indigo):
+    with pytest.raises(ValueError, match="unknown argument"):
+        _trigger_execute_handler({"id": 5, "force": True}, mock_indigo)
