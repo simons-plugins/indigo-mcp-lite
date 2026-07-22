@@ -92,3 +92,28 @@ def test_register_all_includes_wave3_tools(mock_indigo):
         "speedcontrol_set_level", "speedcontrol_increase",
         "speedcontrol_decrease", "variable_delete", "variable_move_to_folder",
     } <= names
+
+
+def test_unknown_device_id_friendly_error(mock_indigo):
+    def _missing(i):
+        raise KeyError(i)
+    mock_indigo.devices.__getitem__.side_effect = _missing
+    with pytest.raises(ValueError, match="no device with id 404"):
+        _sprinkler_simple({"device_id": 404}, mock_indigo, "stop")
+    mock_indigo.sprinkler.stop.assert_not_called()
+
+
+def test_variable_delete_unknown_id(mock_indigo):
+    def _missing(i):
+        raise KeyError(i)
+    mock_indigo.variables.__getitem__.side_effect = _missing
+    with pytest.raises(ValueError, match="no variable with id 404"):
+        _variable_delete_handler({"variable_id": 404}, mock_indigo)
+    mock_indigo.variable.delete.assert_not_called()
+
+
+def test_unknown_arg_and_float_coercion(mock_indigo):
+    with pytest.raises(ValueError, match="unknown argument"):
+        _run_zone_handler({"device_id": 1, "zone_index": 3}, mock_indigo)
+    _run_zone_handler({"device_id": 1, "zone": 3.0}, mock_indigo)
+    mock_indigo.sprinkler.setActiveZone.assert_called_once_with(1, index=3)

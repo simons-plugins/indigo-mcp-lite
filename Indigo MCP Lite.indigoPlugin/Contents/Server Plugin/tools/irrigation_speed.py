@@ -5,16 +5,26 @@ device categories. Thin wrappers over ``indigo.sprinkler.*`` and
 ``indigo.speedcontrol.*`` in the ``tools/control.py`` shape.
 """
 
-from tools.lookup import _require_int_id
+from tools.lookup import (_coerce_int, _lookup_or_raise,
+                          _reject_unknown_args, _require_int_id)
 
 
 def _optional_positive_int(args, key):
     raw = args.get(key)
     if raw is None:
         return None
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+    value = _coerce_int(raw)
+    if value is None or value < 1:
         raise ValueError(f"{key} must be a positive integer")
-    return raw
+    return value
+
+
+def _require_device(args, indigo_module):
+    """Validate device_id + existence; unknown ids become friendly
+    isError results instead of -32603 protocol errors."""
+    device_id = _require_int_id(args, "device_id")
+    _lookup_or_raise(indigo_module.devices, device_id, "device")
+    return device_id
 
 
 def register(handler, *, indigo_module, **_):
@@ -30,7 +40,7 @@ def register(handler, *, indigo_module, **_):
         name="sprinkler_run_zone",
         description=(
             "Turn on ONE sprinkler zone (1-based index); any active zone "
-            "stops first. Runs until sprinkler_stop or another zone starts."
+            "stops first. Runs until stopped, another zone starts, or the zone's max duration elapses."
         ),
         input_schema={
             "type": "object",
@@ -101,7 +111,7 @@ def register(handler, *, indigo_module, **_):
         name="speedcontrol_set_index",
         description=(
             "Set a speed-control device (e.g. ceiling fan) to a discrete "
-            "speed index: 0=off, then 1..N per the device's speed count."
+            "speed index: 0=off; valid indexes are 0 to speedIndexCount-1 (e.g. a 4-index fan is off/low/medium/high = 0-3)."
         ),
         input_schema={
             "type": "object",
@@ -188,16 +198,18 @@ def register(handler, *, indigo_module, **_):
 
 
 def _run_zone_handler(args, indigo_module):
-    device_id = _require_int_id(args, "device_id")
-    zone = args.get("zone")
-    if isinstance(zone, bool) or not isinstance(zone, int) or zone < 1:
+    _reject_unknown_args(args, ("device_id", "zone"))
+    device_id = _require_device(args, indigo_module)
+    zone = _coerce_int(args.get("zone"))
+    if zone is None or zone < 1:
         raise ValueError("zone must be a 1-based integer zone index")
     indigo_module.sprinkler.setActiveZone(device_id, index=zone)
     return {"status": "ok"}
 
 
 def _run_schedule_handler(args, indigo_module):
-    device_id = _require_int_id(args, "device_id")
+    _reject_unknown_args(args, ("device_id", "durations"))
+    device_id = _require_device(args, indigo_module)
     durations = args.get("durations")
     if (
         not isinstance(durations, list)
@@ -216,32 +228,35 @@ def _run_schedule_handler(args, indigo_module):
 
 
 def _sprinkler_simple(args, indigo_module, method):
-    device_id = _require_int_id(args, "device_id")
+    _reject_unknown_args(args, ("device_id",))
+    device_id = _require_device(args, indigo_module)
     getattr(indigo_module.sprinkler, method)(device_id)
     return {"status": "ok"}
 
 
 def _set_speed_index_handler(args, indigo_module):
-    device_id = _require_int_id(args, "device_id")
-    index = args.get("index")
-    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+    _reject_unknown_args(args, ("device_id", "index"))
+    device_id = _require_device(args, indigo_module)
+    index = _coerce_int(args.get("index"))
+    if index is None or index < 0:
         raise ValueError("index must be a non-negative integer")
     indigo_module.speedcontrol.setSpeedIndex(device_id, value=index)
     return {"status": "ok"}
 
 
 def _set_speed_level_handler(args, indigo_module):
-    device_id = _require_int_id(args, "device_id")
-    level = args.get("level")
-    if isinstance(level, bool) or not isinstance(level, int) \
-            or not 0 <= level <= 100:
+    _reject_unknown_args(args, ("device_id", "level"))
+    device_id = _require_device(args, indigo_module)
+    level = _coerce_int(args.get("level"))
+    if level is None or not 0 <= level <= 100:
         raise ValueError("level must be an integer 0-100")
     indigo_module.speedcontrol.setSpeedLevel(device_id, value=level)
     return {"status": "ok"}
 
 
 def _speed_step_handler(args, indigo_module, method):
-    device_id = _require_int_id(args, "device_id")
+    _reject_unknown_args(args, ("device_id", "by"))
+    device_id = _require_device(args, indigo_module)
     by = _optional_positive_int(args, "by")
     kwargs = {"by": by} if by is not None else {}
     getattr(indigo_module.speedcontrol, method)(device_id, **kwargs)
@@ -249,13 +264,19 @@ def _speed_step_handler(args, indigo_module, method):
 
 
 def _variable_delete_handler(args, indigo_module):
-    indigo_module.variable.delete(_require_int_id(args, "variable_id"))
+    _reject_unknown_args(args, ("variable_id",))
+    variable_id = _require_int_id(args, "variable_id")
+    _lookup_or_raise(indigo_module.variables, variable_id, "variable")
+    indigo_module.variable.delete(variable_id)
     return {"status": "ok"}
 
 
 def _variable_move_handler(args, indigo_module):
+    _reject_unknown_args(args, ("variable_id", "folder_id"))
+    variable_id = _require_int_id(args, "variable_id")
+    _lookup_or_raise(indigo_module.variables, variable_id, "variable")
     indigo_module.variable.moveToFolder(
-        _require_int_id(args, "variable_id"),
+        variable_id,
         value=_require_int_id(args, "folder_id"),
     )
     return {"status": "ok"}

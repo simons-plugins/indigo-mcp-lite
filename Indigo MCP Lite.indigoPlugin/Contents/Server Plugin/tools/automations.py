@@ -13,6 +13,7 @@ description, matching the IOM's own guidance.
 from tools.lookup import (
     _lookup_or_raise,
     _normalize_pagination,
+    _reject_unknown_args,
     _require_int_id,
 )
 
@@ -173,6 +174,8 @@ def _get_schedule_handler(args, indigo_module):
 
 
 def _trigger_enable_handler(args, indigo_module):
+    _reject_unknown_args(args, ("id", "enabled"))
+    _lookup_or_raise(indigo_module.triggers, _require_int_id(args), "trigger")
     indigo_module.trigger.enable(
         _require_int_id(args), value=_optional_bool(args, "enabled", None)
     )
@@ -180,6 +183,8 @@ def _trigger_enable_handler(args, indigo_module):
 
 
 def _schedule_enable_handler(args, indigo_module):
+    _reject_unknown_args(args, ("id", "enabled"))
+    _lookup_or_raise(indigo_module.schedules, _require_int_id(args), "schedule")
     indigo_module.schedule.enable(
         _require_int_id(args), value=_optional_bool(args, "enabled", None)
     )
@@ -187,6 +192,8 @@ def _schedule_enable_handler(args, indigo_module):
 
 
 def _trigger_execute_handler(args, indigo_module):
+    _reject_unknown_args(args, ("id", "ignore_conditions"))
+    _lookup_or_raise(indigo_module.triggers, _require_int_id(args), "trigger")
     indigo_module.trigger.execute(
         _require_int_id(args),
         ignoreConditions=_optional_bool(args, "ignore_conditions", False),
@@ -195,6 +202,8 @@ def _trigger_execute_handler(args, indigo_module):
 
 
 def _schedule_execute_handler(args, indigo_module):
+    _reject_unknown_args(args, ("id", "ignore_conditions"))
+    _lookup_or_raise(indigo_module.schedules, _require_int_id(args), "schedule")
     indigo_module.schedule.execute(
         _require_int_id(args),
         ignoreConditions=_optional_bool(args, "ignore_conditions", False),

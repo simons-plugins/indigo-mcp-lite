@@ -276,3 +276,40 @@ def test_tools_call_restart_plugin_self_guard_returns_clean_error(mock_indigo):
     assert result.get("isError") is True, f"expected error, got: {result}"
     assert "self" in result["content"][0]["text"].lower()
     mock_indigo.server.getPlugin.assert_not_called()
+
+
+def _wire_call(mock_indigo, name, arguments):
+    from mcp_handler import MCPHandler
+    from tool_registry import register_all
+
+    handler = MCPHandler(server_name="test", server_version="0")
+    register_all(handler, indigo_module=mock_indigo)
+    response = handler.handle_request(
+        http_method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }),
+    )
+    assert response["status"] == 200, response
+    return json.loads(response["content"])["result"]
+
+
+def test_wire_dispatch_control_wave_toggle(mock_indigo):
+    result = _wire_call(mock_indigo, "device_toggle", {"device_id": 5})
+    assert result.get("isError") is not True, result
+    mock_indigo.device.toggle.assert_called_once_with(5)
+
+
+def test_wire_dispatch_automations_list(mock_indigo):
+    mock_indigo.triggers = []
+    result = _wire_call(mock_indigo, "list_triggers", {})
+    assert result.get("isError") is not True, result
+    assert json.loads(result["content"][0]["text"])["total_count"] == 0
+
+
+def test_wire_dispatch_irrigation_stop(mock_indigo):
+    result = _wire_call(mock_indigo, "sprinkler_stop", {"device_id": 3})
+    assert result.get("isError") is not True, result
+    mock_indigo.sprinkler.stop.assert_called_once_with(3)

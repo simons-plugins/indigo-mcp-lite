@@ -272,20 +272,54 @@ def _list_device_folders_handler(_args, indigo_module):
     return _list_folders(indigo_module.devices.folders)
 
 
+def _coerce_int(raw):
+    """Return ``raw`` as an int if it is integer-valued, else None.
+
+    Accepts ints and integral floats (JSON Schema treats ``5.0`` as a
+    valid ``"integer"``, and JSON clients routinely emit floats), but
+    rejects bools, fractional floats, and strings.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float) and raw.is_integer():
+        return int(raw)
+    return None
+
+
 def _require_int_id(args, key="id"):
     """Pull an integer id out of args under ``key`` or raise ValueError.
 
     Booleans are rejected even though ``isinstance(True, int)`` is
     True — the schema says integer, and a bool id is almost always a
-    caller bug rather than a meaningful query. ``key`` defaults to
-    ``"id"`` for the lookup tools but Phase 4 control tools pass
-    ``"device_id"``, ``"variable_id"``, etc., so the same validator
-    applies everywhere without each tool reimplementing it.
+    caller bug rather than a meaningful query. Integral floats coerce
+    (see ``_coerce_int``). ``key`` defaults to ``"id"`` for the lookup
+    tools but Phase 4 control tools pass ``"device_id"``,
+    ``"variable_id"``, etc., so the same validator applies everywhere
+    without each tool reimplementing it.
     """
-    raw = args.get(key)
-    if isinstance(raw, bool) or not isinstance(raw, int):
+    value = _coerce_int(args.get(key))
+    if value is None:
         raise ValueError(f"{key} must be an integer")
-    return raw
+    return value
+
+
+def _reject_unknown_args(args, allowed):
+    """Raise if ``args`` contains keys outside ``allowed``.
+
+    MCPHandler does no schema validation and every handler is
+    ``lambda **args``, so a misspelled optional key (``delay_seconds``
+    for ``delay``) would otherwise be silently dropped and the command
+    would fire immediately — the caller's real intent lost with a
+    misleading ok. Naming the valid keys lets an LLM self-correct.
+    """
+    unknown = set(args) - set(allowed)
+    if unknown:
+        raise ValueError(
+            f"unknown argument(s) {sorted(unknown)}; "
+            f"valid: {sorted(allowed)}"
+        )
 
 
 def _lookup_or_raise(collection, entity_id, entity_label):

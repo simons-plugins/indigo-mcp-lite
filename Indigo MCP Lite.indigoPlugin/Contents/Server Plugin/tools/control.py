@@ -15,7 +15,7 @@ every real wire call. Phase 3 caught this; preserve it here.
 """
 
 from color_palette import lookup_named_color
-from tools.lookup import _require_int_id
+from tools.lookup import _coerce_int, _reject_unknown_args, _require_int_id
 from tools.value_helpers import (
     byte_to_percent,
     clamp_percent,
@@ -50,14 +50,16 @@ def _optional_delay_duration(args):
         raw = args.get(key)
         if raw is None:
             continue
-        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        value = _coerce_int(raw)
+        if value is None or value < 0:
             raise ValueError(f"{key} must be a non-negative integer (seconds)")
-        out[key] = raw
+        out[key] = value
     return out
 
 
 def _turn_on_handler(args, indigo_module):
     """Turn a device on by id, optionally delayed / for a duration."""
+    _reject_unknown_args(args, ("device_id", "delay", "duration"))
     indigo_module.device.turnOn(
         _require_int_id(args, "device_id"), **_optional_delay_duration(args)
     )
@@ -66,6 +68,7 @@ def _turn_on_handler(args, indigo_module):
 
 def _turn_off_handler(args, indigo_module):
     """Turn a device off by id, optionally delayed / for a duration."""
+    _reject_unknown_args(args, ("device_id", "delay", "duration"))
     indigo_module.device.turnOff(
         _require_int_id(args, "device_id"), **_optional_delay_duration(args)
     )
@@ -74,6 +77,7 @@ def _turn_off_handler(args, indigo_module):
 
 def _toggle_handler(args, indigo_module):
     """Toggle a device on<->off, optionally delayed / for a duration."""
+    _reject_unknown_args(args, ("device_id", "delay", "duration"))
     indigo_module.device.toggle(
         _require_int_id(args, "device_id"), **_optional_delay_duration(args)
     )
@@ -82,6 +86,7 @@ def _toggle_handler(args, indigo_module):
 
 def _enable_handler(args, indigo_module):
     """Enable or disable a device's communication."""
+    _reject_unknown_args(args, ("device_id", "enabled"))
     enabled = args.get("enabled")
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be a boolean")
@@ -93,26 +98,41 @@ def _enable_handler(args, indigo_module):
 
 def _status_request_handler(args, indigo_module):
     """Ask the hardware to refresh its status in Indigo."""
+    _reject_unknown_args(args, ("device_id",))
     indigo_module.device.statusRequest(
-        _require_int_id(args, "device_id"), suppressLogging=True
+        _require_int_id(args, "device_id"), suppressLogging=False
     )
-    return {"status": "ok"}
+    return {
+        "status": "requested",
+        "note": "refresh is asynchronous — re-read the device state (or "
+                "query_event_log) to see the result",
+    }
 
 
 def _lock_handler(args, indigo_module):
     """Lock a lock-subtype relay device."""
+    _reject_unknown_args(args, ("device_id", "delay", "duration"))
     indigo_module.device.lock(
         _require_int_id(args, "device_id"), **_optional_delay_duration(args)
     )
-    return {"status": "ok"}
+    return {
+        "status": "dispatched",
+        "note": "command sent; confirm the lock actually happened via the "
+                "device's on_state before reporting it to the user",
+    }
 
 
 def _unlock_handler(args, indigo_module):
     """Unlock a lock-subtype relay device."""
+    _reject_unknown_args(args, ("device_id", "delay", "duration"))
     indigo_module.device.unlock(
         _require_int_id(args, "device_id"), **_optional_delay_duration(args)
     )
-    return {"status": "ok"}
+    return {
+        "status": "dispatched",
+        "note": "command sent; confirm the unlock actually happened via the "
+                "device's on_state before reporting it to the user",
+    }
 
 
 def _relative_brightness_kwargs(args):
@@ -120,10 +140,10 @@ def _relative_brightness_kwargs(args):
     out = {}
     raw_by = args.get("by")
     if raw_by is not None:
-        if isinstance(raw_by, bool) or not isinstance(raw_by, int) \
-                or not 1 <= raw_by <= 100:
+        by = _coerce_int(raw_by)
+        if by is None or not 1 <= by <= 100:
             raise ValueError("by must be an integer 1-100")
-        out["by"] = raw_by
+        out["by"] = by
     delay = _optional_delay_duration(args)
     if "duration" in delay:
         raise ValueError("brighten/dim take delay only, not duration")
@@ -133,6 +153,7 @@ def _relative_brightness_kwargs(args):
 
 def _brighten_handler(args, indigo_module):
     """Brighten a dimmer relative to its current level."""
+    _reject_unknown_args(args, ("device_id", "by", "delay"))
     indigo_module.dimmer.brighten(
         _require_int_id(args, "device_id"), **_relative_brightness_kwargs(args)
     )
@@ -141,6 +162,7 @@ def _brighten_handler(args, indigo_module):
 
 def _dim_handler(args, indigo_module):
     """Dim a dimmer relative to its current level."""
+    _reject_unknown_args(args, ("device_id", "by", "delay"))
     indigo_module.dimmer.dim(
         _require_int_id(args, "device_id"), **_relative_brightness_kwargs(args)
     )
@@ -149,23 +171,31 @@ def _dim_handler(args, indigo_module):
 
 def _ping_handler(args, indigo_module):
     """Ping a Z-Wave/Insteon module and report round-trip time."""
-    result = indigo_module.device.ping(
-        _require_int_id(args, "device_id"), suppressLogging=True
-    )
+    _reject_unknown_args(args, ("device_id",))
+    device_id = _require_int_id(args, "device_id")
+    result = indigo_module.device.ping(device_id, suppressLogging=True)
+    if not isinstance(result, dict) or "Success" not in result:
+        raise ValueError(
+            f"ping returned no result for device {device_id} — the device "
+            "may not support ping (Z-Wave/Insteon only)"
+        )
+    success = bool(result.get("Success"))
     return {
-        "success": bool(result["Success"]),
-        "time_ms": result["TimeDelta"] if result["Success"] else None,
+        "success": success,
+        "time_ms": result.get("TimeDelta") if success else None,
     }
 
 
 def _beep_handler(args, indigo_module):
     """Ask the device to emit an audible beep (hardware permitting)."""
+    _reject_unknown_args(args, ("device_id",))
     indigo_module.device.beep(_require_int_id(args, "device_id"))
     return {"status": "ok"}
 
 
 def _reset_energy_handler(args, indigo_module):
     """Reset a device's accumulated-energy counter."""
+    _reject_unknown_args(args, ("device_id",))
     indigo_module.device.resetEnergyAccumTotal(
         _require_int_id(args, "device_id")
     )
