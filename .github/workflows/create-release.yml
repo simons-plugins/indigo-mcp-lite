@@ -74,6 +74,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.get_version.outputs.version }}
+          # Pin the tag to the commit that triggered this run. Without
+          # this the Releases API tags the default branch's HEAD at
+          # creation time, so back-to-back merges tag the wrong commit
+          # (v2026.5.0 got tagged on a 2026.6.0 plist and broke the
+          # Indigo Plugin Store's version check, 2026-07-22).
+          target_commitish: ${{ github.sha }}
           name: Release v${{ steps.get_version.outputs.version }}
           generate_release_notes: true
           draft: false
