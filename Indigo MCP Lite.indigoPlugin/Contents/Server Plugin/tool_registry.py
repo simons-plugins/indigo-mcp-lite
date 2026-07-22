@@ -9,10 +9,11 @@ phases (e.g. Phase 6) thread additional collaborators like an
 indexer through without breaking the existing call sites.
 """
 
-from tools import control, find_devices, lookup, system, zwave
+from tools import control, find_devices, history, lookup, system, zwave
 
 
-def register_all(handler, *, indigo_module, indexer=None, **_):
+def register_all(handler, *, indigo_module, indexer=None,
+                 history_db_provider=None, **_):
     """Register every tool onto ``handler``.
 
     ``indexer`` is required for ``find_devices``; if it isn't
@@ -28,3 +29,10 @@ def register_all(handler, *, indigo_module, indexer=None, **_):
     zwave.register(handler, indigo_module=indigo_module)
     if indexer is not None:
         find_devices.register(handler, indexer=indexer)
+    # History tools always register; an absent provider yields the
+    # friendly "not configured" tool-result error rather than a missing
+    # tool, so agents can discover the capability and tell the user
+    # what to configure.
+    history.register(
+        handler, history_db_provider=history_db_provider or (lambda: None)
+    )
