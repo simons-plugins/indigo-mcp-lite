@@ -75,45 +75,7 @@ class Plugin(indigo.PluginBase):
         shouldn't require a plugin restart to recover from."""
         from history_db import HistoryDB
 
-        db_type = self.pluginPrefs.get("dbType", "none")
-        if db_type == "postgresql":
-            self.history_db = HistoryDB(
-                db_type="postgresql",
-                logger=self.logger,
-                pg_host=self.pluginPrefs.get("pgHost", "127.0.0.1"),
-                pg_port=self.pluginPrefs.get("pgPort", "5432"),
-                pg_user=self.pluginPrefs.get("pgUser", "postgres"),
-                pg_password=self.pluginPrefs.get("pgPassword", ""),
-                pg_database=self.pluginPrefs.get("pgDatabase", "indigo_history"),
-            )
-            target = (
-                f"postgresql @ {self.history_db.pg_config['host']}"
-                f"/{self.history_db.pg_config['database']}"
-            )
-        elif db_type == "sqlite":
-            sqlite_path = self.pluginPrefs.get("sqlitePath", "").strip()
-            if not sqlite_path:
-                self.logger.warning(
-                    "SQL Logger dbType is sqlite but no path is set; "
-                    "history tools stay unconfigured"
-                )
-                self.history_db = None
-                return
-            self.history_db = HistoryDB(
-                db_type="sqlite", logger=self.logger, sqlite_path=sqlite_path
-            )
-            target = f"sqlite @ {sqlite_path}"
-        else:
-            self.history_db = None
-            return
-
-        if self.history_db.test_connection():
-            self.logger.info(f"SQL Logger ready: {target}")
-        else:
-            self.logger.warning(
-                f"SQL Logger configured ({target}) but connection test "
-                "failed; history tools will error until fixed"
-            )
+        self.history_db = HistoryDB.from_prefs(self.pluginPrefs, self.logger)
 
     def menuReindexNow(self):
         """Indigo menu callback: rebuild the FTS5 index from scratch.

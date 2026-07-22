@@ -59,6 +59,58 @@ class HistoryDB:
             "database": pg_database or "indigo_history",
         }
 
+    @classmethod
+    def from_prefs(cls, prefs, logger):
+        """Build a HistoryDB from plugin prefs; None when unconfigured.
+
+        Malformed prefs (e.g. non-numeric pgPort) log an error and
+        return None rather than raising — a bad pref must not crash
+        plugin startup or the prefs-save callback. A failed connection
+        test keeps the instance (transient outages shouldn't need a
+        restart to recover) but warns."""
+        db_type = prefs.get("dbType", "none")
+        try:
+            if db_type == "postgresql":
+                db = cls(
+                    db_type="postgresql",
+                    logger=logger,
+                    pg_host=prefs.get("pgHost", "127.0.0.1"),
+                    pg_port=prefs.get("pgPort", "5432"),
+                    pg_user=prefs.get("pgUser", "postgres"),
+                    pg_password=prefs.get("pgPassword", ""),
+                    pg_database=prefs.get("pgDatabase", "indigo_history"),
+                )
+                target = (
+                    f"postgresql @ {db.pg_config['host']}"
+                    f"/{db.pg_config['database']}"
+                )
+            elif db_type == "sqlite":
+                sqlite_path = (prefs.get("sqlitePath", "") or "").strip()
+                if not sqlite_path:
+                    logger.warning(
+                        "SQL Logger dbType is sqlite but no path is set; "
+                        "history tools stay unconfigured"
+                    )
+                    return None
+                db = cls(db_type="sqlite", logger=logger, sqlite_path=sqlite_path)
+                target = f"sqlite @ {sqlite_path}"
+            else:
+                return None
+        except Exception as exc:
+            logger.error(
+                f"SQL Logger config invalid; history tools disabled: {exc}"
+            )
+            return None
+
+        if db.test_connection():
+            logger.info(f"SQL Logger ready: {target}")
+        else:
+            logger.warning(
+                f"SQL Logger configured ({target}) but connection test "
+                "failed; history tools will error until fixed"
+            )
+        return db
+
     # Recognisable fragments of psql stderr mapped to an actionable
     # one-liner. Matched on lowercased stderr; the first hit wins, so
     # specific patterns MUST precede generic ones. In particular
@@ -91,8 +143,7 @@ class HistoryDB:
         sees *what* to fix rather than just the raw psql stderr."""
         try:
             if self.db_type == "sqlite":
-                conn = sqlite3.connect(self.sqlite_path)
-                conn.execute("PRAGMA query_only = ON")
+                conn = self._connect_sqlite()
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
                 conn.close()
             else:
@@ -111,11 +162,22 @@ class HistoryDB:
                 self.logger.error(f"SQL Logger connection test failed: {msg}")
             return False
 
+    def _connect_sqlite(self):
+        """Open the SQLite DB strictly read-only via a URI.
+
+        Plain ``sqlite3.connect(path)`` silently CREATES an empty
+        database at a typo'd path — the connection "succeeds", logs
+        "SQL Logger ready", and every later query reports "no history".
+        ``mode=ro`` makes a wrong path fail loudly at connect time,
+        and is a second enforcement layer under PRAGMA query_only."""
+        conn = sqlite3.connect(f"file:{self.sqlite_path}?mode=ro", uri=True)
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
     def _execute_sqlite(self, sql, params=()):
         """Execute a read-only SQLite query and return rows."""
-        conn = sqlite3.connect(self.sqlite_path)
+        conn = self._connect_sqlite()
         try:
-            conn.execute("PRAGMA query_only = ON")
             cursor = conn.execute(sql, params)
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
@@ -209,36 +271,39 @@ class HistoryDB:
             return []
 
     def get_columns(self, device_id):
-        """Return list of columns and their types for a device history table."""
-        table_name = f"device_history_{device_id}"
-        try:
-            if self.db_type == "sqlite":
-                sql = f'SELECT name, type FROM pragma_table_info("{table_name}")'
-                _, rows = self._execute(sql)
-            else:
-                sql = ("SELECT column_name, data_type FROM information_schema.columns "
-                       "WHERE table_name = %s AND table_schema = 'public'")
-                _, rows = self._execute(sql, (table_name,))
+        """Return list of columns and their types for a device history table.
 
-            columns = []
-            for name, col_type in rows:
-                if name in ("id", "ts"):
-                    continue
-                # Normalise type names
-                col_type_lower = col_type.lower()
-                if col_type_lower in ("bool", "boolean"):
-                    mapped = "bool"
-                elif col_type_lower in ("integer", "int", "bigint", "smallint"):
-                    mapped = "int"
-                elif col_type_lower in ("real", "float", "double precision", "numeric"):
-                    mapped = "float"
-                else:
-                    mapped = "text"
-                columns.append({"name": name, "type": mapped})
-            return columns
-        except Exception as e:
-            self.logger.error(f"Error getting columns for device {device_id}: {e}")
-            return []
+        Connection/query failures PROPAGATE — swallowing them into ``[]``
+        would make a Postgres outage indistinguishable from "this device
+        has no history table", which is exactly the wrong self-correction
+        signal for an agent. An empty list therefore reliably means the
+        metadata query succeeded and found no columns."""
+        table_name = f"device_history_{device_id}"
+        if self.db_type == "sqlite":
+            sql = f'SELECT name, type FROM pragma_table_info("{table_name}")'
+            _, rows = self._execute(sql)
+        else:
+            sql = ("SELECT column_name, data_type FROM information_schema.columns "
+                   "WHERE table_name = %s AND table_schema = 'public'")
+            _, rows = self._execute(sql, (table_name,))
+
+        columns = []
+        for row in rows:
+            name, col_type = row[0], row[1]
+            if name in ("id", "ts"):
+                continue
+            # Normalise type names
+            col_type_lower = col_type.lower()
+            if col_type_lower in ("bool", "boolean"):
+                mapped = "bool"
+            elif col_type_lower in ("integer", "int", "bigint", "smallint"):
+                mapped = "int"
+            elif col_type_lower in ("real", "float", "double precision", "numeric"):
+                mapped = "float"
+            else:
+                mapped = "text"
+            columns.append({"name": name, "type": mapped})
+        return columns
 
     def query_history(self, device_id, column, time_range="24h", max_points=300):
         """
@@ -330,6 +395,10 @@ class HistoryDB:
 
         points = []
         for row in rows:
+            # psql --unaligned trims trailing NULL fields, so a row can
+            # come back with fewer tab-separated values than selected.
+            if len(row) < 2:
+                continue
             epoch_raw = row[0]
             value_raw = row[1]
             if epoch_raw is None or epoch_raw == "":
@@ -346,9 +415,15 @@ class HistoryDB:
                 elif value_raw == "":
                     continue
                 else:
-                    value = float(value_raw)
+                    try:
+                        value = float(value_raw)
+                    except ValueError:
+                        continue  # text value in the series — skip, don't abort
             elif value_raw is not None:
-                value = float(value_raw)
+                try:
+                    value = float(value_raw)
+                except (TypeError, ValueError):
+                    continue
             else:
                 continue
             points.append({"t": epoch, "v": value})
@@ -379,6 +454,10 @@ class HistoryDB:
 
         points = []
         for row in rows:
+            # psql --unaligned trims trailing NULL fields, so a row can
+            # come back with fewer tab-separated values than selected.
+            if len(row) < 2:
+                continue
             epoch_raw = row[0]
             value_raw = row[1]
             if epoch_raw is None or epoch_raw == "":

@@ -118,7 +118,11 @@ def _query_sql_logger_handler(args, history_db_provider):
 def _list_columns_handler(args, history_db_provider):
     device_id = _require_int_id(args, key="device_id")
     history_db = _require_history_db(history_db_provider)
-    columns = history_db.get_columns(device_id)
+    try:
+        columns = history_db.get_columns(device_id)
+    except Exception as exc:
+        # Connection-level failure — distinct from "no history table".
+        raise ValueError(f"SQL Logger query failed: {exc}")
     if not columns:
         raise ValueError(
             f"no SQL Logger history for device {device_id} "

@@ -197,3 +197,80 @@ def test_register_all_registers_history_tools(mock_indigo):
     ]
     assert "query_sql_logger" in names
     assert "list_sql_logger_columns" in names
+
+
+# ----- review-driven coverage (from_prefs, PG parsing, hints order) ------
+
+
+def test_from_prefs_none_and_blank_sqlite():
+    assert HistoryDB.from_prefs({"dbType": "none"}, MagicMock()) is None
+    logger = MagicMock()
+    assert HistoryDB.from_prefs(
+        {"dbType": "sqlite", "sqlitePath": " "}, logger) is None
+    assert logger.warning.called
+
+
+def test_from_prefs_sqlite_ready(sqlite_db):
+    logger = MagicMock()
+    db = HistoryDB.from_prefs(
+        {"dbType": "sqlite", "sqlitePath": sqlite_db}, logger)
+    assert db is not None and db.db_type == "sqlite"
+    assert any("SQL Logger ready" in str(c) for c in logger.info.call_args_list)
+
+
+def test_from_prefs_bad_pg_port_returns_none_logs_error():
+    logger = MagicMock()
+    db = HistoryDB.from_prefs(
+        {"dbType": "postgresql", "pgPort": "not-a-port"}, logger)
+    assert db is None
+    assert logger.error.called
+
+
+def test_from_prefs_failed_connection_keeps_instance(tmp_path):
+    logger = MagicMock()
+    db = HistoryDB.from_prefs(
+        {"dbType": "sqlite", "sqlitePath": str(tmp_path / "missing.sqlite")},
+        logger)
+    assert db is not None
+    assert logger.warning.called
+
+
+def test_sqlite_wrong_path_does_not_create_file(tmp_path):
+    path = tmp_path / "typo.sqlite"
+    db = HistoryDB(db_type="sqlite", logger=MagicMock(), sqlite_path=str(path))
+    assert db.test_connection() is False
+    assert not path.exists()
+
+
+def test_get_columns_connection_failure_propagates(tmp_path):
+    db = HistoryDB(db_type="sqlite", logger=MagicMock(),
+                   sqlite_path=str(tmp_path / "missing.sqlite"))
+    with pytest.raises(Exception):
+        db.get_columns(42)
+    with pytest.raises(ValueError, match="SQL Logger query failed"):
+        _list_columns_handler({"device_id": 42}, _provider(db))
+
+
+def test_pg_stdout_parsing_through_query_history():
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    responses = [
+        "onOffState\tboolean\nsensorValue\tdouble precision\n",  # get_columns
+        "1753100000\tt\n1753100600\tf\n1753101200\t\n",           # raw rows
+    ]
+
+    def fake_run(cmd, capture_output, text, timeout, env):
+        return type("R", (), {"returncode": 0,
+                              "stdout": responses.pop(0), "stderr": ""})()
+
+    with patch("history_db.subprocess.run", side_effect=fake_run):
+        result = db.query_history(42, "onoffstate", "1h")
+    assert result["type"] == "bool"
+    assert [p["v"] for p in result["points"]] == [1.0, 0.0]
+
+
+def test_pg_error_hints_order():
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    assert "database doesn't exist" in db._diagnose_pg_error(
+        'FATAL: database "typo" does not exist')
+    assert "role (user)" in db._diagnose_pg_error(
+        'FATAL: role "Simon" does not exist')

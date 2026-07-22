@@ -756,6 +756,8 @@ XKCD_COLORS = {
     "richblue": (2, 27, 249),
     "richpurple": (114, 0, 88),
     "robineggblue": (138, 241, 254),
+    "robinsegg": (109, 237, 253),
+    "robinseggblue": (152, 239, 249),
     "rosa": (254, 134, 164),
     "rose": (207, 98, 117),
     "rosepink": (247, 135, 154),
