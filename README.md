@@ -36,10 +36,12 @@ This is the whole point of "lite" — install on any Indigo-supported Mac and it
 
 ### Authentication
 
-All MCP requests require a Bearer token. Use either:
+Authentication is enforced by **Indigo's Web Server (IWS), in front of the plugin** — the plugin itself performs no Authorization check and never sees your credentials. Requests without a valid Bearer token are rejected by IWS before the MCP endpoint is invoked. Use either:
 
 - **Local secret** for LAN access — set up via `secrets.json` per [Indigo's local secrets docs](https://wiki.indigodomo.com/doku.php?id=indigo_2024.2_documentation:indigo_web_server#local_secrets) and pass as `Authorization: Bearer <local-secret>`.
 - **Reflector API key** for remote access — issued from your Indigo Reflector settings.
+
+Consequently, do not expose IWS's port directly to the internet without the local secret configured: with IWS auth disabled or bypassed there is no second line of defence, and every tool — including the control tools — would be reachable unauthenticated.
 
 ## Claude Code / Claude Desktop configuration
 
@@ -230,7 +232,7 @@ For the design rationale (FTS5 vs vector search, in-memory vs on-disk, alias-bas
 git clone https://github.com/simons-plugins/indigo-mcp-lite
 cd indigo-mcp-lite
 
-# Run the test suite (251 tests, ~1s)
+# Run the test suite (~1s)
 /Library/Frameworks/Python.framework/Versions/3.11/bin/pytest tests/ -q
 
 # Regenerate the README's tool table
