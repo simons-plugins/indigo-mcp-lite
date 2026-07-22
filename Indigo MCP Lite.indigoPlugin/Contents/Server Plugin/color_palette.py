@@ -11,6 +11,8 @@ at 140 (matches the plan and keeps the dict identical to the standard
 140-name X11/CSS3 set).
 """
 
+from xkcd_palette import XKCD_COLORS
+
 
 NAMED_COLORS = {
     "aliceblue":            (240, 248, 255),
@@ -164,7 +166,14 @@ def lookup_named_color(name):
     because that's the dict's canonical key. Raises ``ValueError`` on
     miss with a hint pointing at the CSS named-color list.
     """
-    key = name.lower().replace(" ", "").replace("-", "")
+    # Strip apostrophes and slashes too — XKCD survey names include
+    # forms like "robin's egg blue" and "purple/blue", and the
+    # xkcd_palette keys are normalised the same way.
+    key = (
+        name.lower()
+        .replace(" ", "").replace("-", "")
+        .replace("'", "").replace("/", "")
+    )
     # Normalise British "*grey" → US "*gray" so both spellings resolve
     # without doubling the dict (saves 7 redundant entries and keeps
     # len(NAMED_COLORS) at the canonical 140).
@@ -172,9 +181,18 @@ def lookup_named_color(name):
         candidate = key.replace("grey", "gray")
         if candidate in NAMED_COLORS:
             return NAMED_COLORS[candidate]
-    try:
+    if key in NAMED_COLORS:
         return NAMED_COLORS[key]
-    except KeyError as exc:
-        raise ValueError(
-            f"unknown color: {name!r} — see CSS named colors list"
-        ) from exc
+    # Fall back to the ~920-name XKCD colour-survey table (CC0) for
+    # the names people actually say — "burnt orange", "duck egg
+    # blue", "off white". CSS wins on collisions (checked first).
+    if key in XKCD_COLORS:
+        return XKCD_COLORS[key]
+    if "gray" in key:
+        candidate = key.replace("gray", "grey")
+        if candidate in XKCD_COLORS:
+            return XKCD_COLORS[candidate]
+    raise ValueError(
+        f"unknown color: {name!r} — see the CSS named colors list or "
+        "the xkcd colour survey (https://xkcd.com/color/rgb/)"
+    )

@@ -110,7 +110,7 @@ def test_set_named_color_unknown_raises(mock_indigo):
 
     with pytest.raises(ValueError, match="unknown color"):
         _set_named_color_handler(
-            {"device_id": 7, "name": "british racing green"}, mock_indigo
+            {"device_id": 7, "name": "glorble fizz"}, mock_indigo
         )
     mock_indigo.dimmer.setColorLevels.assert_not_called()
 

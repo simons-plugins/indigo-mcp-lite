@@ -21,6 +21,7 @@ import logging
 import sqlite3
 from typing import Optional
 
+from synonyms import expand as expand_synonyms
 from type_aliases import TYPE_ALIASES
 
 
@@ -143,7 +144,20 @@ class Indexer:
         share the same row shape and snapshot bookkeeping.
         """
         folder_name = self._device_folder_name(getattr(dev, "folderId", 0))
-        aliases = TYPE_ALIASES.get(getattr(dev, "deviceTypeId", ""), "")
+        type_words = TYPE_ALIASES.get(getattr(dev, "deviceTypeId", ""), "")
+        # Text-derived synonym expansion: words a person might search
+        # by that appear in no indexed column (e.g. "lounge" for a
+        # device filed under "Living Room"). See synonyms.py.
+        synonym_words = expand_synonyms(
+            " ".join(
+                s for s in (
+                    getattr(dev, "name", "") or "",
+                    getattr(dev, "model", "") or "",
+                    folder_name,
+                ) if s
+            )
+        )
+        aliases = " ".join(w for w in (type_words, synonym_words) if w)
         extra = " ".join(
             s for s in (
                 getattr(dev, "model", "") or "",

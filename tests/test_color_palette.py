@@ -24,7 +24,7 @@ def test_lookup_alice_blue_handles_spaces():
 
 def test_lookup_unknown_raises_valueerror():
     with pytest.raises(ValueError, match="unknown color"):
-        lookup_named_color("british racing green")
+        lookup_named_color("glorble fizz")
 
 
 @pytest.mark.parametrize("name,expected", [
