@@ -172,9 +172,21 @@ def lookup_named_color(name):
         candidate = key.replace("grey", "gray")
         if candidate in NAMED_COLORS:
             return NAMED_COLORS[candidate]
-    try:
+    if key in NAMED_COLORS:
         return NAMED_COLORS[key]
-    except KeyError as exc:
-        raise ValueError(
-            f"unknown color: {name!r} — see CSS named colors list"
-        ) from exc
+    # Fall back to the ~920-name XKCD colour-survey table (CC0) for
+    # the names people actually say — "burnt orange", "duck egg
+    # blue", "off white". CSS wins on collisions (checked first).
+    # XKCD names use British "grey"; retry the un-normalised key too.
+    from xkcd_palette import XKCD_COLORS
+
+    if key in XKCD_COLORS:
+        return XKCD_COLORS[key]
+    if "gray" in key:
+        candidate = key.replace("gray", "grey")
+        if candidate in XKCD_COLORS:
+            return XKCD_COLORS[candidate]
+    raise ValueError(
+        f"unknown color: {name!r} — see the CSS named colors list or "
+        "the xkcd colour survey (https://xkcd.com/color/rgb/)"
+    )
