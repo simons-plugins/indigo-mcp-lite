@@ -13,10 +13,14 @@ steps, condition trees, and embedded scripts:
   with its owner (audit surface)
 
 The reader is created at registration but does no I/O until the first
-tool call; parse results are cached on file mtime inside the reader.
-All failure modes (path unavailable, mid-write parse error) surface
-as friendly ValueError → isError tool results.
+tool call; parse results are cached on (path, mtime, size) inside the
+reader. All failure modes (path unavailable, unreadable file,
+mid-write parse error) surface as friendly ValueError → isError tool
+results, and degraded parses report a ``skipped_automations`` count
+rather than silently thinning results.
 """
+
+import logging
 
 from tools.lookup import _lookup_or_raise, _reject_unknown_args, _require_int_id
 
@@ -30,16 +34,22 @@ _KIND_LABELS = {
 }
 
 
-def register(handler, *, indigo_module, indidb_reader=None, **_):
+def register(handler, *, indigo_module, indidb_reader=None, logger=None, **_):
     """Register the automation-contents tools onto the given MCPHandler.
 
-    ``indidb_reader`` is injectable for tests; by default a lazy
-    ``IndiDbReader`` is constructed here (cheap — no I/O until the
-    first tool call touches the DB file).
+    ``indidb_reader`` is injectable for tests; by default an
+    ``IndiDbReader`` is constructed here — object construction is
+    eager but cheap, no I/O happens until the first tool call touches
+    the DB file. ``logger`` is the plugin's logger threaded through
+    ``tool_registry.register_all``; degraded reader paths (skips,
+    resolve failures, parse retries) log through it.
     """
     if indidb_reader is None:
         from indidb_reader import IndiDbReader
-        indidb_reader = IndiDbReader(indigo_module=indigo_module)
+        indidb_reader = IndiDbReader(
+            indigo_module=indigo_module,
+            logger=logger or logging.getLogger("Plugin"),
+        )
 
     handler.register_tool(
         name="get_automation_contents",
@@ -72,6 +82,11 @@ def register(handler, *, indigo_module, indidb_reader=None, **_):
             "which automations reference a device or variable, and in "
             "what role — acts_on (in an action step), condition (in "
             "the condition tree), watches (a trigger fires on it). "
+            "acts_on covers DIRECT references only: a schedule that "
+            "runs an action group which acts on the device is "
+            "reported via the action group, not the schedule — "
+            "follow execute-action-group results (via "
+            "get_automation_contents) to trace indirect chains. "
             "Pass exactly one of device_id or variable_id. Use before "
             "renaming/removing anything, or to answer 'what turns "
             "this on?'."
@@ -167,9 +182,9 @@ def _get_contents_handler(args, reader):
             f"got {entity_type!r}"
         )
     entity_id = _require_int_id(args)
+    data = reader.automations()
     record = _lookup_or_raise(
-        reader.automations()[entity_type], entity_id,
-        _KIND_LABELS[entity_type],
+        data[entity_type], entity_id, _KIND_LABELS[entity_type],
     )
     seen = {entity_id} if entity_type == "action_group" else set()
     out = {
@@ -186,6 +201,16 @@ def _get_contents_handler(args, reader):
         out["enabled"] = record["enabled"]
     if "watch" in record:
         out["watch"] = _annotate_watch(record["watch"], reader)
+    return _with_skip_count(out, data)
+
+
+def _with_skip_count(out, data):
+    """Attach the reader's degraded-parse counter when nonzero, so a
+    partially parsed database is visible in every tool response
+    instead of silently thinning results."""
+    skipped = data.get("skipped_automations", 0)
+    if skipped:
+        out["skipped_automations"] = skipped
     return out
 
 
@@ -256,12 +281,12 @@ def _find_references_handler(args, reader):
                     "roles": roles,
                 })
     collection = "devices" if key == "device_id" else "variables"
-    return {
+    return _with_skip_count({
         key: entity_id,
         "name": reader.resolve_name(collection, entity_id),
         "references": references,
         "total_count": len(references),
-    }
+    }, data)
 
 
 # ---------------------------------------------------------------------
@@ -287,4 +312,6 @@ def _list_scripts_handler(args, reader):
                     "source": step.get("source"),
                     "truncated": step.get("truncated", False),
                 })
-    return {"results": results, "total_count": len(results)}
+    return _with_skip_count(
+        {"results": results, "total_count": len(results)}, data
+    )

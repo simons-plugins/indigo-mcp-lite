@@ -51,7 +51,8 @@ class Plugin(indigo.PluginBase):
         self._build_history_db()
         register_all(self.mcp_handler, indigo_module=indigo,
                      indexer=self.indexer,
-                     history_db_provider=lambda: self.history_db)
+                     history_db_provider=lambda: self.history_db,
+                     logger=self.logger)
 
     def shutdown(self):
         self.logger.info("indigo-mcp-lite shutdown")

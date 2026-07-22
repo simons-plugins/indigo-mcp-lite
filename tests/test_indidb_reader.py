@@ -200,6 +200,7 @@ def test_parses_all_three_collections(reader):
     assert set(data["schedule"]) == {300}
     assert set(data["trigger"]) == {400, 401}
     assert set(data["action_group"]) == {100, 200}
+    assert data["skipped_automations"] == 0
 
 
 def test_schedule_record_shape_and_dotted_name(reader):
@@ -335,10 +336,35 @@ def test_mid_write_truncated_xml_raises_friendly_error(tmp_path, mock_indigo):
         reader.automations()
 
 
-def test_missing_file_raises_friendly_error(tmp_path, mock_indigo):
+def test_missing_file_points_at_path_permissions(tmp_path, mock_indigo):
     mock_indigo.server.getDbFilePath.return_value = str(tmp_path / "gone.indiDb")
     reader = IndiDbReader(indigo_module=mock_indigo)
-    with pytest.raises(ValueError, match="not readable"):
+    with pytest.raises(ValueError, match="check the database path/permissions"):
+        reader.automations()
+
+
+def test_permission_error_during_iterparse_points_at_path(
+        db_file, mock_indigo, monkeypatch):
+    mock_indigo.server.getDbFilePath.return_value = str(db_file)
+    reader = IndiDbReader(indigo_module=mock_indigo)
+
+    def _denied(*_a, **_k):
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr("indidb_reader.ET.iterparse", _denied)
+    with pytest.raises(ValueError, match="check the database path/permissions"):
+        reader.automations()
+
+
+def test_generic_oserror_keeps_retry_hint(db_file, mock_indigo, monkeypatch):
+    mock_indigo.server.getDbFilePath.return_value = str(db_file)
+    reader = IndiDbReader(indigo_module=mock_indigo)
+
+    def _disk_io(*_a, **_k):
+        raise OSError("Input/output error")
+
+    monkeypatch.setattr("indidb_reader.ET.iterparse", _disk_io)
+    with pytest.raises(ValueError, match="retry"):
         reader.automations()
 
 
@@ -372,6 +398,117 @@ def test_cache_reused_until_mtime_changes(db_file, reader):
     second = reader.automations()
     assert second is not first
     assert second["trigger"][400]["name"] == "Door closed"
+
+
+def test_db_path_switch_invalidates_cache(tmp_path, mock_indigo):
+    first_db = tmp_path / "First House.indiDb"
+    first_db.write_text(FIXTURE, encoding="utf-8")
+    second_db = tmp_path / "Second House.indiDb"
+    second_db.write_text(
+        FIXTURE.replace("Door opened", "Door renamed"), encoding="utf-8"
+    )
+    mock_indigo.server.getDbFilePath.return_value = str(first_db)
+    reader = IndiDbReader(indigo_module=mock_indigo)
+    first = reader.automations()
+    assert first["trigger"][400]["name"] == "Door opened"
+
+    # Server switches databases (File -> Open): same reader, new path.
+    mock_indigo.server.getDbFilePath.return_value = str(second_db)
+    second = reader.automations()
+    assert second is not first
+    assert second["trigger"][400]["name"] == "Door renamed"
+
+
+SKIP_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
+<Database type="dict">
+  <ActionGroupList type="vector">
+    <ActionGroup type="dict">
+      <ActionSteps type="vector" />
+      <Name type="string">Ghost Group</Name>
+    </ActionGroup>
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">1</Class>
+          <DeviceAction type="integer">4</DeviceAction>
+          <DeviceActionValue type="integer">0</DeviceActionValue>
+          <DeviceID type="integer">111</DeviceID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">900</ID>
+      <Name type="string">Good Group</Name>
+    </ActionGroup>
+  </ActionGroupList>
+</Database>
+"""
+
+
+def test_missing_id_automation_skipped_counted_and_logged(
+        tmp_path, mock_indigo):
+    from unittest.mock import MagicMock
+
+    path = tmp_path / "skip.indiDb"
+    path.write_text(SKIP_FIXTURE, encoding="utf-8")
+    mock_indigo.server.getDbFilePath.return_value = str(path)
+    logger = MagicMock()
+    reader = IndiDbReader(indigo_module=mock_indigo, logger=logger)
+    data = reader.automations()
+    assert set(data["action_group"]) == {900}
+    assert data["skipped_automations"] == 1
+    warned = " ".join(str(c) for c in logger.warning.call_args_list)
+    assert "ActionGroup" in warned and "Ghost Group" in warned
+
+
+CORRUPT_INT_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
+<Database type="dict">
+  <ActionGroupList type="vector">
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">1</Class>
+          <DeviceAction type="integer">4</DeviceAction>
+          <DeviceActionValue type="integer">0</DeviceActionValue>
+          <DeviceID type="integer">garbage</DeviceID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">901</ID>
+      <Name type="string">Corrupt Step Group</Name>
+    </ActionGroup>
+  </ActionGroupList>
+</Database>
+"""
+
+
+def test_corrupt_integer_field_counted_not_silent(tmp_path, mock_indigo):
+    from unittest.mock import MagicMock
+
+    path = tmp_path / "corrupt.indiDb"
+    path.write_text(CORRUPT_INT_FIXTURE, encoding="utf-8")
+    mock_indigo.server.getDbFilePath.return_value = str(path)
+    logger = MagicMock()
+    reader = IndiDbReader(indigo_module=mock_indigo, logger=logger)
+    data = reader.automations()
+    step = data["action_group"][901]["steps"][0]
+    assert step["device_id"] is None  # unparseable, never guessed
+    assert data["skipped_automations"] == 1
+    warned = " ".join(str(c) for c in logger.warning.call_args_list)
+    assert "DeviceID" in warned and "garbage" in warned
+
+
+def test_resolve_name_logs_unexpected_exception(mock_indigo, db_file):
+    from unittest.mock import MagicMock
+
+    mock_indigo.server.getDbFilePath.return_value = str(db_file)
+    logger = MagicMock()
+    reader = IndiDbReader(indigo_module=mock_indigo, logger=logger)
+    mock_indigo.devices.__getitem__.side_effect = RuntimeError("IOM wedged")
+    assert reader.resolve_name("devices", 111) is None
+    assert logger.warning.called
+    # Lookup-style misses stay quiet — no warning spam for deletions.
+    logger.warning.reset_mock()
+    mock_indigo.devices.__getitem__.side_effect = KeyError(111)
+    assert reader.resolve_name("devices", 111) is None
+    logger.warning.assert_not_called()
 
 
 def test_resolve_name_defensive(mock_indigo, db_file):

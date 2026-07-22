@@ -15,7 +15,7 @@ from tools import (automation_contents, automations, control, find_devices,
 
 
 def register_all(handler, *, indigo_module, indexer=None,
-                 history_db_provider=None, **_):
+                 history_db_provider=None, logger=None, **_):
     """Register every tool onto ``handler``.
 
     ``indexer`` is required for ``find_devices``; if it isn't
@@ -30,10 +30,14 @@ def register_all(handler, *, indigo_module, indexer=None,
     system.register(handler, indigo_module=indigo_module)
     zwave.register(handler, indigo_module=indigo_module)
     automations.register(handler, indigo_module=indigo_module)
-    # Always registered; the .indiDb reader inside lazy-inits on the
-    # first tool call and raises a friendly error if the database
-    # file is unavailable rather than blocking registration.
-    automation_contents.register(handler, indigo_module=indigo_module)
+    # Always registered; the .indiDb reader object is constructed
+    # eagerly (cheap) but does no I/O until the first tool call, and
+    # raises a friendly error if the database file is unavailable
+    # rather than blocking registration. The plugin's logger threads
+    # through so degraded parses are visible in the event log.
+    automation_contents.register(
+        handler, indigo_module=indigo_module, logger=logger
+    )
     irrigation_speed.register(handler, indigo_module=indigo_module)
     introspection.register(handler, indigo_module=indigo_module)
     if indexer is not None:

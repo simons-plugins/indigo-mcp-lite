@@ -16,7 +16,7 @@ from tools.automation_contents import (
     _list_scripts_handler,
 )
 
-from test_indidb_reader import FIXTURE
+from test_indidb_reader import FIXTURE, SKIP_FIXTURE
 
 
 class _Named:
@@ -175,6 +175,18 @@ def test_find_references_device_roles(reader):
     assert by_id[("trigger", 400)] == ["watches"]
     assert by_id[("action_group", 100)] == ["acts_on"]
     assert out["total_count"] == 3
+    # Clean parse -> no skipped_automations noise in the response.
+    assert "skipped_automations" not in out
+
+
+def test_find_references_acts_on_via_plugin_step_device(reader):
+    # Device 444 appears ONLY as the Class-999 plugin step's DeviceID
+    # in trigger 400 — plugin actions must count as acts_on.
+    out = _find_references_handler({"device_id": 444}, reader)
+    assert out["total_count"] == 1
+    ref = out["references"][0]
+    assert (ref["automation_type"], ref["id"]) == ("trigger", 400)
+    assert ref["roles"] == ["acts_on"]
 
 
 def test_find_references_variable_roles(reader):
@@ -227,6 +239,62 @@ def test_list_scripts_finds_all_with_owners(reader):
     assert by_owner[200]["truncated"] is False
     assert by_owner[200]["script_type_label"] == "python"
     assert by_owner[200]["step_index"] == 1
+
+
+def test_list_scripts_rejects_unknown_args(reader):
+    with pytest.raises(ValueError, match="unknown argument"):
+        _list_scripts_handler({"limit": 5}, reader)
+
+
+NO_SCRIPTS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
+<Database type="dict">
+  <ActionGroupList type="vector">
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">1</Class>
+          <DeviceAction type="integer">4</DeviceAction>
+          <DeviceActionValue type="integer">0</DeviceActionValue>
+          <DeviceID type="integer">111</DeviceID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">700</ID>
+      <Name type="string">Scriptless</Name>
+    </ActionGroup>
+  </ActionGroupList>
+</Database>
+"""
+
+
+def test_list_scripts_empty_when_none(tmp_path, mock_indigo):
+    path = tmp_path / "noscripts.indiDb"
+    path.write_text(NO_SCRIPTS_FIXTURE, encoding="utf-8")
+    mock_indigo.server.getDbFilePath.return_value = str(path)
+    reader = IndiDbReader(indigo_module=mock_indigo)
+    out = _list_scripts_handler({}, reader)
+    assert out == {"results": [], "total_count": 0}
+
+
+def test_skipped_automations_surfaced_in_all_three_tools(
+        tmp_path, mock_indigo):
+    path = tmp_path / "skip.indiDb"
+    path.write_text(SKIP_FIXTURE, encoding="utf-8")
+    mock_indigo.server.getDbFilePath.return_value = str(path)
+    _wire_names(mock_indigo)
+    reader = IndiDbReader(indigo_module=mock_indigo)
+
+    contents = _get_contents_handler(
+        {"entity_type": "action_group", "id": 900}, reader
+    )
+    assert contents["skipped_automations"] == 1
+
+    refs = _find_references_handler({"device_id": 111}, reader)
+    assert refs["skipped_automations"] == 1
+    assert refs["total_count"] == 1  # the good group still resolves
+
+    scripts = _list_scripts_handler({}, reader)
+    assert scripts["skipped_automations"] == 1
+    assert scripts["results"] == []
 
 
 # ---------------------------------------------------------------------
