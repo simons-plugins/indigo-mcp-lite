@@ -174,15 +174,20 @@ def _ping_handler(args, indigo_module):
     _reject_unknown_args(args, ("device_id",))
     device_id = _require_int_id(args, "device_id")
     result = indigo_module.device.ping(device_id, suppressLogging=True)
-    if not isinstance(result, dict) or "Success" not in result:
+    # Duck-typed: the live server returns an indigo.Dict, which is
+    # dict-like but NOT a dict subclass — isinstance(result, dict)
+    # wrongly rejected every real ping (caught on jarvis 2026-07-22).
+    try:
+        success = bool(result["Success"])
+        time_delta = result["TimeDelta"]
+    except (TypeError, KeyError, IndexError):
         raise ValueError(
-            f"ping returned no result for device {device_id} — the device "
-            "may not support ping (Z-Wave/Insteon only)"
+            f"ping returned no usable result for device {device_id} — the "
+            "device may not support ping (Z-Wave/Insteon only)"
         )
-    success = bool(result.get("Success"))
     return {
         "success": success,
-        "time_ms": result.get("TimeDelta") if success else None,
+        "time_ms": time_delta if success else None,
     }
 
 

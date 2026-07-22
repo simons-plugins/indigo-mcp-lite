@@ -90,6 +90,19 @@ def test_ping_unexpected_result_raises(mock_indigo):
     mock_indigo.device.ping.return_value = None
     with pytest.raises(ValueError, match="may not support ping"):
         _ping_handler({"device_id": 9}, mock_indigo)
+    mock_indigo.device.ping.return_value = {"unexpected": 1}
+    with pytest.raises(ValueError, match="may not support ping"):
+        _ping_handler({"device_id": 9}, mock_indigo)
+
+
+def test_ping_accepts_dict_like_indigo_result(mock_indigo):
+    class _IndigoDict:  # dict-like but not a dict subclass
+        def __init__(self, d): self._d = d
+        def __getitem__(self, k): return self._d[k]
+    mock_indigo.device.ping.return_value = _IndigoDict(
+        {"Success": True, "TimeDelta": 88})
+    assert _ping_handler({"device_id": 9}, mock_indigo) == {
+        "success": True, "time_ms": 88}
 
 
 def test_brighten_dim_relative(mock_indigo):
