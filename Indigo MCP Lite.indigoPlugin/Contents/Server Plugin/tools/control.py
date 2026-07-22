@@ -38,15 +38,137 @@ def _require_numeric(args, key):
     return raw
 
 
+def _optional_delay_duration(args):
+    """Extract optional ``delay``/``duration`` seconds as kwargs.
+
+    Only keys the caller actually supplied are forwarded, so the
+    Indigo command sees its own defaults otherwise. Bools rejected,
+    negatives rejected — a negative delay is always a caller bug.
+    """
+    out = {}
+    for key in ("delay", "duration"):
+        raw = args.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise ValueError(f"{key} must be a non-negative integer (seconds)")
+        out[key] = raw
+    return out
+
+
 def _turn_on_handler(args, indigo_module):
-    """Turn a device on by id."""
-    indigo_module.device.turnOn(_require_int_id(args, "device_id"))
+    """Turn a device on by id, optionally delayed / for a duration."""
+    indigo_module.device.turnOn(
+        _require_int_id(args, "device_id"), **_optional_delay_duration(args)
+    )
     return {"status": "ok"}
 
 
 def _turn_off_handler(args, indigo_module):
-    """Turn a device off by id."""
-    indigo_module.device.turnOff(_require_int_id(args, "device_id"))
+    """Turn a device off by id, optionally delayed / for a duration."""
+    indigo_module.device.turnOff(
+        _require_int_id(args, "device_id"), **_optional_delay_duration(args)
+    )
+    return {"status": "ok"}
+
+
+def _toggle_handler(args, indigo_module):
+    """Toggle a device on<->off, optionally delayed / for a duration."""
+    indigo_module.device.toggle(
+        _require_int_id(args, "device_id"), **_optional_delay_duration(args)
+    )
+    return {"status": "ok"}
+
+
+def _enable_handler(args, indigo_module):
+    """Enable or disable a device's communication."""
+    enabled = args.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    indigo_module.device.enable(
+        _require_int_id(args, "device_id"), value=enabled
+    )
+    return {"status": "ok"}
+
+
+def _status_request_handler(args, indigo_module):
+    """Ask the hardware to refresh its status in Indigo."""
+    indigo_module.device.statusRequest(
+        _require_int_id(args, "device_id"), suppressLogging=True
+    )
+    return {"status": "ok"}
+
+
+def _lock_handler(args, indigo_module):
+    """Lock a lock-subtype relay device."""
+    indigo_module.device.lock(
+        _require_int_id(args, "device_id"), **_optional_delay_duration(args)
+    )
+    return {"status": "ok"}
+
+
+def _unlock_handler(args, indigo_module):
+    """Unlock a lock-subtype relay device."""
+    indigo_module.device.unlock(
+        _require_int_id(args, "device_id"), **_optional_delay_duration(args)
+    )
+    return {"status": "ok"}
+
+
+def _relative_brightness_kwargs(args):
+    """Extract optional ``by`` (1-100) and ``delay`` for brighten/dim."""
+    out = {}
+    raw_by = args.get("by")
+    if raw_by is not None:
+        if isinstance(raw_by, bool) or not isinstance(raw_by, int) \
+                or not 1 <= raw_by <= 100:
+            raise ValueError("by must be an integer 1-100")
+        out["by"] = raw_by
+    delay = _optional_delay_duration(args)
+    if "duration" in delay:
+        raise ValueError("brighten/dim take delay only, not duration")
+    out.update(delay)
+    return out
+
+
+def _brighten_handler(args, indigo_module):
+    """Brighten a dimmer relative to its current level."""
+    indigo_module.dimmer.brighten(
+        _require_int_id(args, "device_id"), **_relative_brightness_kwargs(args)
+    )
+    return {"status": "ok"}
+
+
+def _dim_handler(args, indigo_module):
+    """Dim a dimmer relative to its current level."""
+    indigo_module.dimmer.dim(
+        _require_int_id(args, "device_id"), **_relative_brightness_kwargs(args)
+    )
+    return {"status": "ok"}
+
+
+def _ping_handler(args, indigo_module):
+    """Ping a Z-Wave/Insteon module and report round-trip time."""
+    result = indigo_module.device.ping(
+        _require_int_id(args, "device_id"), suppressLogging=True
+    )
+    return {
+        "success": bool(result["Success"]),
+        "time_ms": result["TimeDelta"] if result["Success"] else None,
+    }
+
+
+def _beep_handler(args, indigo_module):
+    """Ask the device to emit an audible beep (hardware permitting)."""
+    indigo_module.device.beep(_require_int_id(args, "device_id"))
+    return {"status": "ok"}
+
+
+def _reset_energy_handler(args, indigo_module):
+    """Reset a device's accumulated-energy counter."""
+    indigo_module.device.resetEnergyAccumTotal(
+        _require_int_id(args, "device_id")
+    )
     return {"status": "ok"}
 
 
@@ -294,6 +416,36 @@ _DEVICE_ID_SCHEMA = {
     "properties": {"device_id": {"type": "integer"}},
 }
 
+_DELAY_DURATION_PROPS = {
+    "delay": {
+        "type": "integer", "minimum": 0,
+        "description": "Seconds to wait before executing.",
+    },
+    "duration": {
+        "type": "integer", "minimum": 0,
+        "description": "Seconds until the device reverts to its prior state.",
+    },
+}
+
+_DEVICE_ID_DELAY_DURATION_SCHEMA = {
+    "type": "object",
+    "required": ["device_id"],
+    "properties": {"device_id": {"type": "integer"}, **_DELAY_DURATION_PROPS},
+}
+
+_RELATIVE_BRIGHTNESS_SCHEMA = {
+    "type": "object",
+    "required": ["device_id"],
+    "properties": {
+        "device_id": {"type": "integer"},
+        "by": {
+            "type": "integer", "minimum": 1, "maximum": 100,
+            "description": "Relative brightness change (default: Indigo's step).",
+        },
+        "delay": _DELAY_DURATION_PROPS["delay"],
+    },
+}
+
 _BRIGHTNESS_SCHEMA = {
     "type": "object",
     "required": ["device_id", "brightness"],
@@ -395,15 +547,112 @@ def register(handler, *, indigo_module):
     """
     handler.register_tool(
         name="device_turn_on",
-        description="Turn a device on by id.",
-        input_schema=_DEVICE_ID_SCHEMA,
+        description=(
+            "Turn a device on by id. Optional delay (seconds before) "
+            "and duration (seconds until it turns back off)."
+        ),
+        input_schema=_DEVICE_ID_DELAY_DURATION_SCHEMA,
         handler=lambda **args: _turn_on_handler(args, indigo_module),
     )
     handler.register_tool(
         name="device_turn_off",
-        description="Turn a device off by id.",
-        input_schema=_DEVICE_ID_SCHEMA,
+        description=(
+            "Turn a device off by id. Optional delay (seconds before) "
+            "and duration (seconds until it turns back on)."
+        ),
+        input_schema=_DEVICE_ID_DELAY_DURATION_SCHEMA,
         handler=lambda **args: _turn_off_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_toggle",
+        description=(
+            "Toggle a device between on and off. Optional delay and "
+            "duration (seconds until it toggles back)."
+        ),
+        input_schema=_DEVICE_ID_DELAY_DURATION_SCHEMA,
+        handler=lambda **args: _toggle_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_enable",
+        description=(
+            "Enable or disable a device's communication (take a "
+            "flapping/offline device out of service, or bring it back)."
+        ),
+        input_schema={
+            "type": "object",
+            "required": ["device_id", "enabled"],
+            "properties": {
+                "device_id": {"type": "integer"},
+                "enabled": {"type": "boolean"},
+            },
+        },
+        handler=lambda **args: _enable_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_status_request",
+        description=(
+            "Ask the device hardware to refresh its status in Indigo — "
+            "use when a device's shown state looks stale."
+        ),
+        input_schema=_DEVICE_ID_SCHEMA,
+        handler=lambda **args: _status_request_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_lock",
+        description=(
+            "Lock a lock device. Optional delay, and duration until it "
+            "auto-unlocks."
+        ),
+        input_schema=_DEVICE_ID_DELAY_DURATION_SCHEMA,
+        handler=lambda **args: _lock_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_unlock",
+        description=(
+            "Unlock a lock device. Optional delay, and duration until it "
+            "auto-locks."
+        ),
+        input_schema=_DEVICE_ID_DELAY_DURATION_SCHEMA,
+        handler=lambda **args: _unlock_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_brighten",
+        description=(
+            "Brighten a dimmer relative to its current level "
+            "(optional `by` 1-100, optional delay)."
+        ),
+        input_schema=_RELATIVE_BRIGHTNESS_SCHEMA,
+        handler=lambda **args: _brighten_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_dim",
+        description=(
+            "Dim a dimmer relative to its current level "
+            "(optional `by` 1-100, optional delay)."
+        ),
+        input_schema=_RELATIVE_BRIGHTNESS_SCHEMA,
+        handler=lambda **args: _dim_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_ping",
+        description=(
+            "Ping a Z-Wave/Insteon module and report round-trip time in "
+            "ms — checks reachability without changing state."
+        ),
+        input_schema=_DEVICE_ID_SCHEMA,
+        handler=lambda **args: _ping_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_beep",
+        description="Ask a device to emit an audible beep (hardware permitting) — useful for physically locating it.",
+        input_schema=_DEVICE_ID_SCHEMA,
+        handler=lambda **args: _beep_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="device_reset_energy_accum",
+        description="Reset a device's accumulated energy (kWh) counter to zero.",
+        input_schema=_DEVICE_ID_SCHEMA,
+        handler=lambda **args: _reset_energy_handler(args, indigo_module),
     )
     handler.register_tool(
         name="device_set_brightness",
