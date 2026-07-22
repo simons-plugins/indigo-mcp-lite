@@ -375,6 +375,8 @@ def _serialize_device_detail(d):
         except Exception:
             value = None
         if value is not None:
+            if hasattr(value, "isoformat"):
+                value = value.isoformat()  # match the zwave serializer
             out[key] = _json_safe(value)
     states = getattr(d, "states", None)
     if states is not None and hasattr(states, "items"):
