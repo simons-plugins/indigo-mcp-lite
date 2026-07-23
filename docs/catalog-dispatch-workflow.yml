@@ -1,0 +1,53 @@
+# ============================================================================
+# CATALOG-SIDE DISPATCH WORKFLOW — NOT ACTIVE IN THIS REPO
+# ============================================================================
+#
+# This file is documentation, kept here because cross-repo commits are out
+# of scope for indigo-mcp-lite PRs. To activate the auto-refresh pipeline
+# (issue #44), Simon must:
+#
+#   1. Copy this file into the CATALOG repo at:
+#        indigo-device-catalog/.github/workflows/dispatch-mcp-lite.yml
+#      (drop this comment header, or keep it — it's inert either way).
+#
+#   2. Create a fine-grained PAT with "Contents: read & write" (classic:
+#      `repo` scope) on simons-plugins/indigo-mcp-lite — the default
+#      GITHUB_TOKEN cannot send repository_dispatch to ANOTHER repo.
+#
+#   3. Add it as an Actions secret named LITE_DISPATCH_TOKEN in
+#      simons-plugins/indigo-device-catalog
+#      (Settings → Secrets and variables → Actions).
+#
+#   4. Also add a CATALOG_PR_TOKEN secret in simons-plugins/indigo-mcp-lite
+#      (fine-grained PAT, Contents + Pull requests: read & write on that
+#      repo) — the receiver workflow uses it so the auto-refresh PR
+#      actually triggers the required version-check CI (PRs pushed with
+#      the default GITHUB_TOKEN don't trigger workflows).
+#
+# Flow once installed: catalog merge to main touching catalog/ or schema/
+#   → repository_dispatch (type: catalog-updated) to indigo-mcp-lite
+#   → .github/workflows/catalog-refresh.yml there regenerates the vendored
+#     snapshot and, if it changed, opens a patch-bump PR.
+# ============================================================================
+
+name: Dispatch catalog update to indigo-mcp-lite
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "catalog/**"
+      - "schema/**"
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository_dispatch to indigo-mcp-lite
+        env:
+          GH_TOKEN: ${{ secrets.LITE_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/simons-plugins/indigo-mcp-lite/dispatches \
+            --method POST \
+            --field event_type=catalog-updated \
+            --field "client_payload[catalog_commit]=${GITHUB_SHA}"

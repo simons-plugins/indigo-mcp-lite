@@ -14,6 +14,7 @@ All tools register with ``handler.register_tool`` using the
 every real wire call. Phase 3 caught this; preserve it here.
 """
 
+from catalog import profile_for
 from color_palette import lookup_named_color
 from tools.lookup import _coerce_int, _reject_unknown_args, _require_int_id
 from tools.value_helpers import (
@@ -215,6 +216,47 @@ def _set_brightness_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _check_capability(indigo_module, device_id, flag, action_label,
+                      logger=None):
+    """Refuse a colour/white command the catalog says can't work.
+
+    Advisory pre-check against the vendored device-catalog snapshot:
+    only refuses when a profile exists AND explicitly carries
+    ``flag: False`` — an uncataloged device, an unreadable device, or
+    a profile without the flag all proceed exactly as before (never
+    block on missing data). The refusal names what the device DOES
+    support so an LLM caller can self-correct.
+    """
+    try:
+        dev = indigo_module.devices[device_id]
+    except Exception as exc:
+        # Unknown id / IOM hiccup: let the SDK call raise its own
+        # (equally friendly) error rather than second-guessing here —
+        # but leave a debug trace so a systematically failing pre-check
+        # is visible rather than silently skipped.
+        if logger is not None:
+            logger.debug(
+                "catalog capability pre-check skipped: device %s "
+                "unreadable (%s)", device_id, exc,
+            )
+        return
+    profile = profile_for(dev)
+    if profile is None:
+        return
+    caps = profile.get("capabilities") or {}
+    if caps.get(flag) is False:
+        supported = sorted(k for k, v in caps.items() if v is True)
+        supported_note = (
+            f"it does support: {', '.join(supported)}" if supported
+            else "it has no capability flags set"
+        )
+        raise ValueError(
+            f"device {device_id} does not support {action_label} — the "
+            f"device catalog lists {flag}=false for this device type "
+            f"({supported_note})"
+        )
+
+
 def _require_rgb_channels(args, *, percent):
     """Pull and normalise red/green/blue channels from args.
 
@@ -231,20 +273,26 @@ def _require_rgb_channels(args, *, percent):
     return tuple(out)
 
 
-def _set_rgb_color_handler(args, indigo_module):
+def _set_rgb_color_handler(args, indigo_module, logger=None):
     """Set RGB colour from 0-255 byte channels."""
     device_id = _require_int_id(args, "device_id")
     r, g, b = _require_rgb_channels(args, percent=False)
+    _check_capability(
+        indigo_module, device_id, "supportsRGB", "RGB colour", logger=logger
+    )
     indigo_module.dimmer.setColorLevels(
         device_id, redLevel=r, greenLevel=g, blueLevel=b
     )
     return {"status": "ok"}
 
 
-def _set_rgb_percent_handler(args, indigo_module):
+def _set_rgb_percent_handler(args, indigo_module, logger=None):
     """Set RGB colour from 0-100 percent channels."""
     device_id = _require_int_id(args, "device_id")
     r, g, b = _require_rgb_channels(args, percent=True)
+    _check_capability(
+        indigo_module, device_id, "supportsRGB", "RGB colour", logger=logger
+    )
     indigo_module.dimmer.setColorLevels(
         device_id, redLevel=r, greenLevel=g, blueLevel=b
     )
@@ -281,18 +329,24 @@ def _set_color_from_bytes(indigo_module, device_id, rgb_bytes):
     )
 
 
-def _set_hex_color_handler(args, indigo_module):
+def _set_hex_color_handler(args, indigo_module, logger=None):
     """Set RGB colour from a hex string (#RRGGBB / RRGGBB / #RGB)."""
     device_id = _require_int_id(args, "device_id")
     rgb_bytes = parse_hex_color(_require_str(args, "color"))
+    _check_capability(
+        indigo_module, device_id, "supportsRGB", "RGB colour", logger=logger
+    )
     _set_color_from_bytes(indigo_module, device_id, rgb_bytes)
     return {"status": "ok"}
 
 
-def _set_named_color_handler(args, indigo_module):
+def _set_named_color_handler(args, indigo_module, logger=None):
     """Set RGB colour from a CSS named colour (red, aliceblue, …)."""
     device_id = _require_int_id(args, "device_id")
     rgb_bytes = lookup_named_color(_require_str(args, "name"))
+    _check_capability(
+        indigo_module, device_id, "supportsRGB", "RGB colour", logger=logger
+    )
     _set_color_from_bytes(indigo_module, device_id, rgb_bytes)
     return {"status": "ok"}
 
@@ -419,7 +473,7 @@ def _action_execute_group_handler(args, indigo_module):
     return {"status": "ok"}
 
 
-def _set_white_levels_handler(args, indigo_module):
+def _set_white_levels_handler(args, indigo_module, logger=None):
     """Set warm/cool white levels and/or colour temperature.
 
     All three keys (``white``, ``white2``, ``temperature``) are
@@ -440,6 +494,24 @@ def _set_white_levels_handler(args, indigo_module):
     if not kwargs:
         raise ValueError(
             "must supply at least one of: white, white2, temperature"
+        )
+    # Per-argument capability pre-checks: each supplied key has its
+    # own catalog flag, so "white ok but temperature unsupported"
+    # refuses with the exact flag that failed.
+    if "whiteLevel" in kwargs:
+        _check_capability(
+            indigo_module, device_id, "supportsWhite", "white level",
+            logger=logger,
+        )
+    if "whiteLevel2" in kwargs:
+        _check_capability(
+            indigo_module, device_id, "supportsTwoWhiteLevels",
+            "a second white level", logger=logger,
+        )
+    if "whiteTemperature" in kwargs:
+        _check_capability(
+            indigo_module, device_id, "supportsWhiteTemperature",
+            "white colour temperature", logger=logger,
         )
     indigo_module.dimmer.setColorLevels(device_id, **kwargs)
     return {"status": "ok"}
@@ -574,11 +646,13 @@ _WHITE_LEVELS_SCHEMA = {
 }
 
 
-def register(handler, *, indigo_module):
+def register(handler, *, indigo_module, logger=None):
     """Register every control tool onto the given MCPHandler.
 
     ``indigo_module`` is injected (matches the lookup tools) so tests
     can pass a MagicMock without monkey-patching ``sys.modules``.
+    ``logger`` (optional) threads into the catalog capability
+    pre-checks so a skipped check leaves a debug trace.
     """
     handler.register_tool(
         name="device_turn_on",
@@ -708,7 +782,9 @@ def register(handler, *, indigo_module):
             "wire unit."
         ),
         input_schema=_RGB_SCHEMA,
-        handler=lambda **args: _set_rgb_color_handler(args, indigo_module),
+        handler=lambda **args: _set_rgb_color_handler(
+            args, indigo_module, logger=logger
+        ),
     )
     handler.register_tool(
         name="device_set_rgb_percent",
@@ -717,7 +793,9 @@ def register(handler, *, indigo_module):
             "percent channels (matches Indigo's native unit)."
         ),
         input_schema=_RGB_SCHEMA,
-        handler=lambda **args: _set_rgb_percent_handler(args, indigo_module),
+        handler=lambda **args: _set_rgb_percent_handler(
+            args, indigo_module, logger=logger
+        ),
     )
     handler.register_tool(
         name="device_set_hex_color",
@@ -726,7 +804,9 @@ def register(handler, *, indigo_module):
             "string. Accepts #RRGGBB, RRGGBB, #RGB, or RGB."
         ),
         input_schema=_HEX_COLOR_SCHEMA,
-        handler=lambda **args: _set_hex_color_handler(args, indigo_module),
+        handler=lambda **args: _set_hex_color_handler(
+            args, indigo_module, logger=logger
+        ),
     )
     handler.register_tool(
         name="device_set_named_color",
@@ -737,7 +817,9 @@ def register(handler, *, indigo_module):
             "*grey* spellings resolve to the *gray* equivalents."
         ),
         input_schema=_NAMED_COLOR_SCHEMA,
-        handler=lambda **args: _set_named_color_handler(args, indigo_module),
+        handler=lambda **args: _set_named_color_handler(
+            args, indigo_module, logger=logger
+        ),
     )
     handler.register_tool(
         name="thermostat_set_hvac_mode",
@@ -815,5 +897,7 @@ def register(handler, *, indigo_module):
             "0-100; temperatures are typically 2000-6500K."
         ),
         input_schema=_WHITE_LEVELS_SCHEMA,
-        handler=lambda **args: _set_white_levels_handler(args, indigo_module),
+        handler=lambda **args: _set_white_levels_handler(
+            args, indigo_module, logger=logger
+        ),
     )

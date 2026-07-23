@@ -26,7 +26,9 @@ def register_all(handler, *, indigo_module, indexer=None,
     call site at once.
     """
     lookup.register(handler, indigo_module=indigo_module)
-    control.register(handler, indigo_module=indigo_module)
+    # Logger threads into the catalog capability pre-checks so skipped
+    # checks (unreadable device) leave a debug trace.
+    control.register(handler, indigo_module=indigo_module, logger=logger)
     system.register(handler, indigo_module=indigo_module)
     zwave.register(handler, indigo_module=indigo_module)
     automations.register(handler, indigo_module=indigo_module)

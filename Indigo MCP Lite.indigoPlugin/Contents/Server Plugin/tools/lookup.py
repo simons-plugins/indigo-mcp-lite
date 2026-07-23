@@ -7,6 +7,7 @@ list_action_groups, get_devices_by_type, get_devices_by_state, etc.)
 share the same wire shape.
 """
 
+from catalog import profile_for, snapshot_meta
 from tools.state_filter import matches as _state_matches
 
 
@@ -174,6 +175,25 @@ def register(handler, *, indigo_module):
             },
         },
         handler=lambda **args: _get_devices_by_type_handler(args, indigo_module),
+    )
+    handler.register_tool(
+        name="list_uncataloged_devices",
+        description=(
+            "List plugin-owned Indigo devices that have no profile in "
+            "the vendored community device catalog — the gap report "
+            "for catalog contributions. Built-in/interface devices "
+            "(no pluginId) are excluded."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        handler=lambda **args: _list_uncataloged_devices_handler(
+            args, indigo_module
+        ),
     )
     handler.register_tool(
         name="get_devices_by_state",
@@ -396,6 +416,15 @@ def _serialize_device_detail(d):
             for k, v in states.items()
             if "." not in str(k) or str(k).split(".", 1)[0] not in keys
         }
+    # Community-catalog enrichment: capability flags for the matched
+    # (pluginId, deviceTypeId). The key is simply absent when the
+    # device is uncataloged — never an empty placeholder, so callers
+    # can distinguish "no colour support" from "no data". The schema
+    # carries no role/polarity semantics yet, so capabilities is the
+    # whole enrichment.
+    profile = profile_for(d)
+    if profile is not None:
+        out["capabilities"] = dict(profile["capabilities"])
     return out
 
 
@@ -449,6 +478,30 @@ def _get_devices_by_type_handler(args, indigo_module):
         if getattr(d, "deviceTypeId", "") == device_type
     ]
     return _paginate_devices(matched, limit, offset)
+
+
+def _list_uncataloged_devices_handler(args, indigo_module):
+    """Return paginated plugin devices missing a catalog profile.
+
+    Devices without a pluginId (built-ins, interfaces) are skipped —
+    the catalog only ever profiles plugin device types, so listing
+    them would just be noise in a contribution gap report.
+    """
+    _reject_unknown_args(args, ("limit", "offset"))
+    limit, offset = _normalize_pagination(args)
+    matched = [
+        d for d in indigo_module.devices
+        if isinstance(getattr(d, "pluginId", ""), str)
+        and getattr(d, "pluginId", "")
+        and profile_for(d) is None
+    ]
+    out = _paginate_devices(matched, limit, offset)
+    # Snapshot provenance makes an "everything is uncataloged" result
+    # diagnosable: an empty catalog_snapshot ({} here) means the
+    # vendored snapshot failed to load, not that the catalog has no
+    # profiles for this install.
+    out["catalog_snapshot"] = snapshot_meta()
+    return out
 
 
 def _get_devices_by_state_handler(args, indigo_module):
