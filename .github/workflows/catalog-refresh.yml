@@ -1,0 +1,95 @@
+# Regenerates the vendored device-catalog snapshot when the catalog
+# repo merges to main (repository_dispatch: catalog-updated, sent by
+# the workflow documented in docs/catalog-dispatch-workflow.yml), or
+# on demand via workflow_dispatch.
+#
+# If the regenerated snapshot differs from what's committed, a
+# chore/catalog-refresh branch is (re)created with the new snapshot
+# plus a patch bump of PluginVersion, and a PR is opened via gh.
+# Note: PRs created with the default GITHUB_TOKEN do not trigger
+# other workflows (version-check etc.) — close/reopen the PR or push
+# an empty commit if CI needs a kick.
+
+name: Catalog Refresh
+
+on:
+  repository_dispatch:
+    types: [catalog-updated]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin repo
+        uses: actions/checkout@v4
+
+      - name: Clone device catalog @ main
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/simons-plugins/indigo-device-catalog.git \
+            /tmp/indigo-device-catalog
+
+      - name: Regenerate snapshot
+        run: |
+          python3 scripts/generate_catalog_snapshot.py /tmp/indigo-device-catalog
+
+      - name: Detect changes
+        id: diff
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Snapshot unchanged — nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          fi
+
+      - name: Bump PluginVersion (patch)
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          python3 - <<'EOF'
+          import re
+          from pathlib import Path
+
+          plist = Path("Indigo MCP Lite.indigoPlugin/Contents/Info.plist")
+          text = plist.read_text()
+          pattern = re.compile(
+              r"(<key>PluginVersion</key>\s*<string>)(\d+)\.(\d+)\.(\d+)(</string>)"
+          )
+          match = pattern.search(text)
+          if not match:
+              raise SystemExit("could not find PluginVersion in Info.plist")
+          year, minor, patch = match.group(2), match.group(3), int(match.group(4))
+          new_version = f"{year}.{minor}.{patch + 1}"
+          text = pattern.sub(rf"\g<1>{new_version}\g<5>", text, count=1)
+          plist.write_text(text)
+          print(f"bumped PluginVersion to {new_version}")
+          EOF
+
+      - name: Create branch, commit, and open PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=chore/catalog-refresh
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add "Indigo MCP Lite.indigoPlugin/Contents/Server Plugin/catalog_snapshot.py" \
+                  "Indigo MCP Lite.indigoPlugin/Contents/Info.plist"
+          COMMIT=$(git -C /tmp/indigo-device-catalog rev-parse --short HEAD)
+          git commit -m "chore: refresh device-catalog snapshot (catalog @ ${COMMIT})"
+          git push --force origin "$BRANCH"
+          # Only open a PR if one isn't already open for this branch —
+          # a force-push to the existing branch updates the open PR.
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create \
+              --head "$BRANCH" \
+              --title "chore: refresh device-catalog snapshot" \
+              --body "Automated snapshot refresh from indigo-device-catalog@\`${COMMIT}\` (repository_dispatch: catalog-updated). Regenerated \`catalog_snapshot.py\` and patch-bumped PluginVersion."
+          fi

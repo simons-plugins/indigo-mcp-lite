@@ -313,3 +313,14 @@ def test_wire_dispatch_irrigation_stop(mock_indigo):
     result = _wire_call(mock_indigo, "sprinkler_stop", {"device_id": 3})
     assert result.get("isError") is not True, result
     mock_indigo.sprinkler.stop.assert_called_once_with(3)
+
+
+def test_wire_dispatch_list_uncataloged_devices(mock_indigo):
+    """Catalog-enrichment wave: registration + ``lambda **args:``
+    shape for the gap-report tool survive the real JSON-RPC path."""
+    mock_indigo.devices = []
+    result = _wire_call(mock_indigo, "list_uncataloged_devices", {})
+    assert result.get("isError") is not True, result
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["total_count"] == 0
+    assert inner["results"] == []

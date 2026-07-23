@@ -14,6 +14,7 @@ All tools register with ``handler.register_tool`` using the
 every real wire call. Phase 3 caught this; preserve it here.
 """
 
+from catalog import profile_for
 from color_palette import lookup_named_color
 from tools.lookup import _coerce_int, _reject_unknown_args, _require_int_id
 from tools.value_helpers import (
@@ -215,6 +216,39 @@ def _set_brightness_handler(args, indigo_module):
     return {"status": "ok"}
 
 
+def _check_capability(indigo_module, device_id, flag, action_label):
+    """Refuse a colour/white command the catalog says can't work.
+
+    Advisory pre-check against the vendored device-catalog snapshot:
+    only refuses when a profile exists AND explicitly carries
+    ``flag: False`` — an uncataloged device, an unreadable device, or
+    a profile without the flag all proceed exactly as before (never
+    block on missing data). The refusal names what the device DOES
+    support so an LLM caller can self-correct.
+    """
+    try:
+        dev = indigo_module.devices[device_id]
+    except Exception:
+        # Unknown id / IOM hiccup: let the SDK call raise its own
+        # (equally friendly) error rather than second-guessing here.
+        return
+    profile = profile_for(dev)
+    if profile is None:
+        return
+    caps = profile.get("capabilities") or {}
+    if caps.get(flag) is False:
+        supported = sorted(k for k, v in caps.items() if v is True)
+        supported_note = (
+            f"it does support: {', '.join(supported)}" if supported
+            else "it has no capability flags set"
+        )
+        raise ValueError(
+            f"device {device_id} does not support {action_label} — the "
+            f"device catalog lists {flag}=false for this device type "
+            f"({supported_note})"
+        )
+
+
 def _require_rgb_channels(args, *, percent):
     """Pull and normalise red/green/blue channels from args.
 
@@ -235,6 +269,7 @@ def _set_rgb_color_handler(args, indigo_module):
     """Set RGB colour from 0-255 byte channels."""
     device_id = _require_int_id(args, "device_id")
     r, g, b = _require_rgb_channels(args, percent=False)
+    _check_capability(indigo_module, device_id, "supportsRGB", "RGB colour")
     indigo_module.dimmer.setColorLevels(
         device_id, redLevel=r, greenLevel=g, blueLevel=b
     )
@@ -245,6 +280,7 @@ def _set_rgb_percent_handler(args, indigo_module):
     """Set RGB colour from 0-100 percent channels."""
     device_id = _require_int_id(args, "device_id")
     r, g, b = _require_rgb_channels(args, percent=True)
+    _check_capability(indigo_module, device_id, "supportsRGB", "RGB colour")
     indigo_module.dimmer.setColorLevels(
         device_id, redLevel=r, greenLevel=g, blueLevel=b
     )
@@ -285,6 +321,7 @@ def _set_hex_color_handler(args, indigo_module):
     """Set RGB colour from a hex string (#RRGGBB / RRGGBB / #RGB)."""
     device_id = _require_int_id(args, "device_id")
     rgb_bytes = parse_hex_color(_require_str(args, "color"))
+    _check_capability(indigo_module, device_id, "supportsRGB", "RGB colour")
     _set_color_from_bytes(indigo_module, device_id, rgb_bytes)
     return {"status": "ok"}
 
@@ -293,6 +330,7 @@ def _set_named_color_handler(args, indigo_module):
     """Set RGB colour from a CSS named colour (red, aliceblue, …)."""
     device_id = _require_int_id(args, "device_id")
     rgb_bytes = lookup_named_color(_require_str(args, "name"))
+    _check_capability(indigo_module, device_id, "supportsRGB", "RGB colour")
     _set_color_from_bytes(indigo_module, device_id, rgb_bytes)
     return {"status": "ok"}
 
@@ -440,6 +478,23 @@ def _set_white_levels_handler(args, indigo_module):
     if not kwargs:
         raise ValueError(
             "must supply at least one of: white, white2, temperature"
+        )
+    # Per-argument capability pre-checks: each supplied key has its
+    # own catalog flag, so "white ok but temperature unsupported"
+    # refuses with the exact flag that failed.
+    if "whiteLevel" in kwargs:
+        _check_capability(
+            indigo_module, device_id, "supportsWhite", "white level"
+        )
+    if "whiteLevel2" in kwargs:
+        _check_capability(
+            indigo_module, device_id, "supportsTwoWhiteLevels",
+            "a second white level"
+        )
+    if "whiteTemperature" in kwargs:
+        _check_capability(
+            indigo_module, device_id, "supportsWhiteTemperature",
+            "white colour temperature"
         )
     indigo_module.dimmer.setColorLevels(device_id, **kwargs)
     return {"status": "ok"}
