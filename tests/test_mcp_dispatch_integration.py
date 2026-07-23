@@ -324,3 +324,36 @@ def test_wire_dispatch_list_uncataloged_devices(mock_indigo):
     inner = json.loads(result["content"][0]["text"])
     assert inner["total_count"] == 0
     assert inner["results"] == []
+    assert "catalog_snapshot" in inner
+
+
+def test_wire_dispatch_capability_refusal_is_friendly_tool_error(
+        mock_indigo, monkeypatch):
+    """A catalog capability refusal must arrive on the wire as a clean
+    isError tool result (friendly ValueError text naming the failing
+    flag and what the device does support), never a transport-level
+    failure — and the SDK call must not have happened."""
+    from unittest.mock import MagicMock
+
+    import catalog_snapshot
+
+    monkeypatch.setattr(catalog_snapshot, "PROFILES", {
+        ("com.test.plugin", "ledStrip"): {
+            "base_class": "indigo.DimmerDevice",
+            "capabilities": {"supportsRGB": False, "supportsOnState": True},
+        },
+    })
+    dev = MagicMock()
+    dev.pluginId = "com.test.plugin"
+    dev.deviceTypeId = "ledStrip"
+    mock_indigo.devices.__getitem__.side_effect = {7: dev}.__getitem__
+
+    result = _wire_call(
+        mock_indigo, "device_set_rgb_color",
+        {"device_id": 7, "red": 255, "green": 0, "blue": 0},
+    )
+    assert result.get("isError") is True, result
+    text = result["content"][0]["text"]
+    assert "supportsRGB" in text
+    assert "supportsOnState" in text  # names what the device DOES support
+    mock_indigo.dimmer.setColorLevels.assert_not_called()

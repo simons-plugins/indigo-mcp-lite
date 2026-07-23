@@ -7,7 +7,7 @@ list_action_groups, get_devices_by_type, get_devices_by_state, etc.)
 share the same wire shape.
 """
 
-from catalog import profile_for
+from catalog import profile_for, snapshot_meta
 from tools.state_filter import matches as _state_matches
 
 
@@ -495,7 +495,13 @@ def _list_uncataloged_devices_handler(args, indigo_module):
         and getattr(d, "pluginId", "")
         and profile_for(d) is None
     ]
-    return _paginate_devices(matched, limit, offset)
+    out = _paginate_devices(matched, limit, offset)
+    # Snapshot provenance makes an "everything is uncataloged" result
+    # diagnosable: an empty catalog_snapshot ({} here) means the
+    # vendored snapshot failed to load, not that the catalog has no
+    # profiles for this install.
+    out["catalog_snapshot"] = snapshot_meta()
+    return out
 
 
 def _get_devices_by_state_handler(args, indigo_module):

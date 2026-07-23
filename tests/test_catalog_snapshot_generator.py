@@ -150,8 +150,28 @@ def test_main_writes_output_with_explicit_meta(small_catalog, tmp_path):
     main([
         str(small_catalog), "--commit", "deadbeef",
         "--date", "2026-02-02", "--output", str(out),
+        "--min-profiles", "1",
     ])
     text = out.read_text()
     assert "'deadbeef'" in text
     assert "'2026-02-02'" in text
     assert "AUTO-GENERATED" in text
+
+
+def test_main_refuses_below_sanity_floor(small_catalog, tmp_path):
+    """Default floor is 100 profiles: a truncated/moved catalog must
+    fail loudly instead of auto-PRing a near-empty snapshot."""
+    from generate_catalog_snapshot import main
+
+    out = tmp_path / "out.py"
+    with pytest.raises(ValueError, match="sanity floor"):
+        main([str(small_catalog), "--output", str(out)])
+    assert not out.exists()
+
+
+def test_min_profiles_floor_is_overridable(small_catalog, tmp_path):
+    from generate_catalog_snapshot import main
+
+    out = tmp_path / "out.py"
+    main([str(small_catalog), "--output", str(out), "--min-profiles", "3"])
+    assert out.exists()

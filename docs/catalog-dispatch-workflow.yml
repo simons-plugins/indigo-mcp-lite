@@ -18,6 +18,12 @@
 #      simons-plugins/indigo-device-catalog
 #      (Settings → Secrets and variables → Actions).
 #
+#   4. Also add a CATALOG_PR_TOKEN secret in simons-plugins/indigo-mcp-lite
+#      (fine-grained PAT, Contents + Pull requests: read & write on that
+#      repo) — the receiver workflow uses it so the auto-refresh PR
+#      actually triggers the required version-check CI (PRs pushed with
+#      the default GITHUB_TOKEN don't trigger workflows).
+#
 # Flow once installed: catalog merge to main touching catalog/ or schema/
 #   → repository_dispatch (type: catalog-updated) to indigo-mcp-lite
 #   → .github/workflows/catalog-refresh.yml there regenerates the vendored

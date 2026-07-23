@@ -137,6 +137,30 @@ def test_set_temperature_refused_without_white_temperature(
     mock_indigo.dimmer.setColorLevels.assert_not_called()
 
 
+def test_mixed_white_call_refusal_names_the_failing_flag(
+        mock_indigo, monkeypatch):
+    """Per-argument checks: white is supported but temperature isn't —
+    a combined white+temperature call must refuse naming the
+    temperature flag specifically, and nothing is sent to the SDK."""
+    from tools.control import _set_white_levels_handler
+
+    profiles = {
+        ("com.test.plugin", "ledStrip"): {
+            "base_class": "indigo.DimmerDevice",
+            "capabilities": {
+                "supportsWhite": True,
+                "supportsWhiteTemperature": False,
+            },
+        },
+    }
+    _wire(mock_indigo, monkeypatch, profiles)
+    with pytest.raises(ValueError, match="supportsWhiteTemperature"):
+        _set_white_levels_handler(
+            {"device_id": 7, "white": 50, "temperature": 2700}, mock_indigo
+        )
+    mock_indigo.dimmer.setColorLevels.assert_not_called()
+
+
 # ----- pass-throughs: capability present, or no data ----------------------
 
 
@@ -202,8 +226,13 @@ def test_check_proceeds_when_device_lookup_fails(mock_indigo, monkeypatch):
         catalog_snapshot, "PROFILES", _NO_COLOR_PROFILES
     )
     mock_indigo.devices.__getitem__.side_effect = KeyError(7)
+    logger = MagicMock()
     result = _set_rgb_color_handler(
-        {"device_id": 7, "red": 255, "green": 0, "blue": 0}, mock_indigo
+        {"device_id": 7, "red": 255, "green": 0, "blue": 0},
+        mock_indigo, logger=logger,
     )
     assert result["status"] == "ok"
     mock_indigo.dimmer.setColorLevels.assert_called_once()
+    # The swallowed lookup failure leaves a debug trace, not silence.
+    logger.debug.assert_called_once()
+    assert "7" in str(logger.debug.call_args)

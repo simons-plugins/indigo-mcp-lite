@@ -56,6 +56,13 @@ def test_lists_only_plugin_devices_without_profile(mock_indigo, monkeypatch):
     # Standard list envelope.
     assert result["offset"] == 0
     assert result["has_more"] is False
+    # Snapshot provenance rides along so "everything uncataloged" is
+    # diagnosable (empty dict would mean the snapshot failed to load).
+    # snapshot_meta() reads the real vendored file, not the
+    # monkeypatched PROFILES, so assert shape rather than values.
+    assert set(result["catalog_snapshot"]) == {
+        "catalog_commit", "catalog_date", "profile_count",
+    }
 
 
 def test_pagination(mock_indigo, monkeypatch):

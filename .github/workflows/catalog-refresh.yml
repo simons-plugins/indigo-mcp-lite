@@ -6,9 +6,16 @@
 # If the regenerated snapshot differs from what's committed, a
 # chore/catalog-refresh branch is (re)created with the new snapshot
 # plus a patch bump of PluginVersion, and a PR is opened via gh.
-# Note: PRs created with the default GITHUB_TOKEN do not trigger
-# other workflows (version-check etc.) — close/reopen the PR or push
-# an empty commit if CI needs a kick.
+#
+# Token: pushes and the PR use secrets.CATALOG_PR_TOKEN when present,
+# falling back to the default github.token. The PAT matters because
+# branches pushed / PRs created with the default GITHUB_TOKEN do NOT
+# trigger other workflows — the required version-check CI would never
+# run and the PR would sit green-by-absence. Simon: create a
+# fine-grained PAT (Contents + Pull requests: read & write on this
+# repo) and add it as the CATALOG_PR_TOKEN Actions secret here,
+# alongside the LITE_DISPATCH_TOKEN secret on the catalog repo (see
+# docs/catalog-dispatch-workflow.yml).
 
 name: Catalog Refresh
 
@@ -27,6 +34,10 @@ jobs:
     steps:
       - name: Checkout plugin repo
         uses: actions/checkout@v4
+        with:
+          # Persist the PAT (when configured) as the push credential so
+          # the branch push triggers pull_request CI on the refresh PR.
+          token: ${{ secrets.CATALOG_PR_TOKEN || github.token }}
 
       - name: Clone device catalog @ main
         run: |
@@ -74,7 +85,7 @@ jobs:
       - name: Create branch, commit, and open PR
         if: steps.diff.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CATALOG_PR_TOKEN || github.token }}
         run: |
           BRANCH=chore/catalog-refresh
           git config user.name "github-actions[bot]"

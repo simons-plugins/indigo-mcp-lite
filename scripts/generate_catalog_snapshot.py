@@ -168,9 +168,23 @@ def main(argv=None):
         "--output", default=str(OUTPUT_PATH),
         help="output path (default: Server Plugin/catalog_snapshot.py)",
     )
+    parser.add_argument(
+        "--min-profiles", type=int, default=100,
+        help="sanity floor: fail if the catalog yields fewer profiles "
+             "than this (default: 100). Guards the auto-refresh PR "
+             "against a truncated/moved catalog silently emptying the "
+             "vendored snapshot. Override for test fixtures.",
+    )
     args = parser.parse_args(argv)
 
     profiles = build_profiles(args.catalog_path)
+    if len(profiles) < args.min_profiles:
+        raise ValueError(
+            f"catalog yielded only {len(profiles)} profiles — below the "
+            f"sanity floor of {args.min_profiles}. Refusing to write a "
+            "near-empty snapshot; if this shrinkage is intentional, "
+            "rerun with --min-profiles"
+        )
     commit, date = args.commit, args.date
     if commit is None or date is None:
         git_commit, git_date = _git_meta(args.catalog_path)
