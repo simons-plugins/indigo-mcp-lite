@@ -87,9 +87,11 @@ def register(handler, *, indigo_module, **_):
             "duration": {
                 "type": "integer", "minimum": 0,
                 "description": (
-                    "Seconds until the entity flips BACK to its prior "
-                    "state — e.g. disable with duration=1209600 disarms "
-                    "for two weeks then self-rearms."
+                    "Seconds until Indigo fires the COMPLEMENTARY "
+                    "action — the opposite of `enabled`, regardless of "
+                    "the entity's prior state — e.g. disable with "
+                    "duration=1209600 disarms for two weeks, then "
+                    "Indigo re-enables it."
                 ),
             },
         },
@@ -114,7 +116,9 @@ def register(handler, *, indigo_module, **_):
         name="trigger_enable",
         description=(
             "Enable or disable an Indigo trigger by id. Optional "
-            "duration auto-reverts after N seconds (holiday mode)."
+            "duration fires the OPPOSITE command after N seconds — "
+            "e.g. disable with duration auto re-enables (holiday "
+            "mode)."
         ),
         input_schema=enable_schema,
         handler=lambda **args: _trigger_enable_handler(args, indigo_module),
@@ -155,8 +159,9 @@ def register(handler, *, indigo_module, **_):
         name="schedule_enable",
         description=(
             "Enable or disable an Indigo schedule by id. Optional "
-            "duration auto-reverts after N seconds — e.g. disable "
-            "with duration for a self-rearming holiday mode."
+            "duration fires the OPPOSITE command after N seconds — "
+            "e.g. disable with duration for a self-rearming holiday "
+            "mode."
         ),
         input_schema=enable_schema,
         handler=lambda **args: _schedule_enable_handler(args, indigo_module),
