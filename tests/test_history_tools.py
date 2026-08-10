@@ -34,8 +34,15 @@ def sqlite_db(tmp_path):
         "onOffState BOOLEAN, brightness INTEGER, sensorValue REAL, "
         "operationState TEXT)"
     )
-    now = time.time()
-    states = ["Ready", "Run", "Run", "Finished", "Ready"]
+    # Anchor mid-bucket for the largest bucket size (30d → 10800s) so all
+    # five rows always share one bucket — wall-clock `now` straddles a
+    # bucket boundary ~22% of the time, which made the latest-per-bucket
+    # test flaky. Nudged forward a bucket when the anchor would push the
+    # newest rows outside the 1h raw window.
+    now = (int(time.time()) // 10800) * 10800 + 5400
+    if now < time.time() - 1200:
+        now += 10800
+    states = ["Ready", "Run", "Run", "Finished", "Idle"]
     rows = [
         (i, _ts(now - 600 * i), i % 2 == 0, 10 * i, 20.5 + i, states[i])
         for i in range(5)
@@ -118,14 +125,15 @@ def test_query_history_text_raw_returns_strings(sqlite_db):
     result = _db(sqlite_db).query_history(42, "operationState", "1h")
     assert result["type"] == "text"
     assert [p["v"] for p in result["points"]] == [
-        "Ready", "Finished", "Run", "Run", "Ready"]
+        "Idle", "Finished", "Run", "Run", "Ready"]
     assert result["min"] is None and result["max"] is None
     assert result["current"] == "Ready"
 
 
 def test_query_history_text_bucketed_latest_per_bucket(sqlite_db):
-    # 30d → 3h buckets: all five rows (spread over 40 min) share one
-    # bucket, and the latest row (offset 0, "Ready") must win.
+    # 30d → 3h buckets: the fixture anchors all five rows into ONE bucket,
+    # and the latest row ("Ready") must win over the earliest ("Idle") —
+    # a MIN-vs-MAX regression flips this to "Idle".
     result = _db(sqlite_db).query_history(42, "operationState", "30d")
     assert result["type"] == "text"
     assert len(result["points"]) == 1
@@ -225,6 +233,46 @@ def test_pg_window_start_is_local_wall_time():
     assert abs((start - expected).total_seconds()) < 30
 
 
+def test_pg_custom_timezone_reaches_sql_and_window():
+    # Asia/Tokyo: UTC+9 year-round, no DST — unlike Europe/London this
+    # assertion can never go season-blind (London == UTC all winter, so
+    # a regression to UTC would pass a London-based test half the year).
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    db = HistoryDB(db_type="postgresql", logger=MagicMock(),
+                   pg_timezone="Asia/Tokyo")
+    seen, patcher = _capture_pg_sql(
+        db,
+        "onOffState\tboolean\n",
+        "1753100000\tt\n",
+    )
+    with patcher:
+        db.query_history(42, "onoffstate", "1h")
+    assert "AT TIME ZONE 'Asia/Tokyo'" in seen[-1]
+    start_str = seen[-1].split("ts >= '")[1].split("'")[0]
+    start = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+    expected = datetime.now(
+        ZoneInfo("Asia/Tokyo")).replace(tzinfo=None) - timedelta(hours=1)
+    assert abs((start - expected).total_seconds()) < 30
+
+
+def test_pg_text_raw_path_keeps_strings():
+    # 1h + text: the only _pg_epoch() call site the bucketed tests miss.
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    seen, patcher = _capture_pg_sql(
+        db,
+        "operationState\ttext\n",
+        "1753100000\tRun\n1753100600\tReady\n",
+    )
+    with patcher:
+        result = db.query_history(42, "operationstate", "1h")
+    assert "AVG(" not in seen[-1]
+    assert "AT TIME ZONE 'Europe/London'" in seen[-1]
+    assert [p["v"] for p in result["points"]] == ["Run", "Ready"]
+    assert result["current"] == "Ready"
+
+
 def test_pg_timezone_pref_flows_through_and_validates():
     with patch.object(HistoryDB, "test_connection", return_value=True):
         db = HistoryDB.from_prefs(
@@ -240,6 +288,10 @@ def test_pg_timezone_pref_flows_through_and_validates():
     assert "Narnia/Lantern" in warnings
 
     db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    assert db.pg_timezone == "Europe/London"
+
+    db = HistoryDB(db_type="postgresql", logger=MagicMock(),
+                   pg_timezone="   ")
     assert db.pg_timezone == "Europe/London"
 
 

@@ -231,7 +231,7 @@ If `mcp-remote` isn't yet cached locally, `npx -y mcp-remote ...` has to fetch t
 | Tool | Description |
 |------|-------------|
 | `list_sql_logger_columns` | List the SQL Logger history columns (name + type) recorded for one device — the valid `column` values for query_sql_logger. Errors if the device has no history table. |
-| `query_sql_logger` | Query Indigo SQL Logger history for one device + column over a time range. Returns time-bucketed points plus min/max/current. Differs from query_event_log (narrated events); SQL Logger is a per-device-column time series. Use find_devices / list_devices for device IDs and list_sql_logger_columns for valid column names. |
+| `query_sql_logger` | Query Indigo SQL Logger history for one device + column over a time range. Returns time-bucketed points plus min/max/current. Text columns return the latest string value per bucket and null min/max (no arithmetic on text). Differs from query_event_log (narrated events); SQL Logger is a per-device-column time series. Use find_devices / list_devices for device IDs and list_sql_logger_columns for valid column names. |
 
 ### System tools (5)
 

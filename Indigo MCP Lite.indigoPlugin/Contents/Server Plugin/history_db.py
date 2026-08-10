@@ -14,6 +14,10 @@ Differences from the HI original, by design:
 - The PostgreSQL path sets ``PGOPTIONS=-c default_transaction_read_only=on``
   so the server itself refuses writes, mirroring SQLite's
   ``PRAGMA query_only = ON``.
+- The PG path reads the naive-local ``ts`` via ``AT TIME ZONE`` with a
+  configurable zone (issue #48), and text columns return the latest
+  value per bucket instead of ``AVG`` (issue #49). HI's copy still has
+  both bugs — backport before re-aligning the query paths.
 
 Stdlib only: SQLite via ``sqlite3``; PostgreSQL by shelling out to the
 ``psql`` CLI (Postgres.app path probed first) — no psycopg2.
@@ -110,6 +114,7 @@ class HistoryDB:
                 target = (
                     f"postgresql @ {db.pg_config['host']}"
                     f"/{db.pg_config['database']}"
+                    f" (ts read as {db.pg_timezone})"
                 )
             elif db_type == "sqlite":
                 sqlite_path = (prefs.get("sqlitePath", "") or "").strip()
