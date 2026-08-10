@@ -30,7 +30,9 @@ def register(handler, *, history_db_provider, **_):
         description=(
             "Query Indigo SQL Logger history for one device + column "
             "over a time range. Returns time-bucketed points plus "
-            "min/max/current. Differs from query_event_log (narrated "
+            "min/max/current. Text columns return the latest string "
+            "value per bucket and null min/max (no arithmetic on text). "
+            "Differs from query_event_log (narrated "
             "events); SQL Logger is a per-device-column time series. "
             "Use find_devices / list_devices for device IDs and "
             "list_sql_logger_columns for valid column names."
