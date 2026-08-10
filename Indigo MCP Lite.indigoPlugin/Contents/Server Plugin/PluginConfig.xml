@@ -54,4 +54,12 @@
            visibleBindingId="dbType" visibleBindingValue="postgresql">
         <Label>Database name:</Label>
     </Field>
+    <Field id="pgTimezone" type="textfield" defaultValue="Europe/London"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Server timezone:</Label>
+    </Field>
+    <Field id="pgTimezoneHelp" type="label" fontSize="small" fontColor="darkgray"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>IANA zone name (e.g. Europe/London). The SQL Logger stores timestamps in the server's local wall-clock time; this tells history queries how to read them.</Label>
+    </Field>
 </PluginConfig>

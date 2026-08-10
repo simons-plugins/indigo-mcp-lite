@@ -31,15 +31,17 @@ def sqlite_db(tmp_path):
     conn.execute(
         "CREATE TABLE device_history_42 ("
         "id INTEGER PRIMARY KEY, ts TIMESTAMP, "
-        "onOffState BOOLEAN, brightness INTEGER, sensorValue REAL)"
+        "onOffState BOOLEAN, brightness INTEGER, sensorValue REAL, "
+        "operationState TEXT)"
     )
     now = time.time()
+    states = ["Ready", "Run", "Run", "Finished", "Ready"]
     rows = [
-        (i, _ts(now - 600 * i), i % 2 == 0, 10 * i, 20.5 + i)
+        (i, _ts(now - 600 * i), i % 2 == 0, 10 * i, 20.5 + i, states[i])
         for i in range(5)
     ]
     conn.executemany(
-        "INSERT INTO device_history_42 VALUES (?, ?, ?, ?, ?)", rows
+        "INSERT INTO device_history_42 VALUES (?, ?, ?, ?, ?, ?)", rows
     )
     conn.commit()
     conn.close()
@@ -67,7 +69,7 @@ def _provider(db):
 def test_get_columns_excludes_id_ts(sqlite_db):
     cols = _db(sqlite_db).get_columns(42)
     names = {c["name"] for c in cols}
-    assert names == {"onOffState", "brightness", "sensorValue"}
+    assert names == {"onOffState", "brightness", "sensorValue", "operationState"}
 
 
 def test_query_history_case_folds_column(sqlite_db):
@@ -107,6 +109,138 @@ def test_sqlite_is_read_only(sqlite_db):
 
 def test_get_device_tables(sqlite_db):
     assert _db(sqlite_db).get_device_tables() == [42]
+
+
+# ----- text columns: latest-per-bucket, never AVG (issue #49) -------------
+
+
+def test_query_history_text_raw_returns_strings(sqlite_db):
+    result = _db(sqlite_db).query_history(42, "operationState", "1h")
+    assert result["type"] == "text"
+    assert [p["v"] for p in result["points"]] == [
+        "Ready", "Finished", "Run", "Run", "Ready"]
+    assert result["min"] is None and result["max"] is None
+    assert result["current"] == "Ready"
+
+
+def test_query_history_text_bucketed_latest_per_bucket(sqlite_db):
+    # 30d → 3h buckets: all five rows (spread over 40 min) share one
+    # bucket, and the latest row (offset 0, "Ready") must win.
+    result = _db(sqlite_db).query_history(42, "operationState", "30d")
+    assert result["type"] == "text"
+    assert len(result["points"]) == 1
+    assert result["points"][0]["v"] == "Ready"
+    assert result["current"] == "Ready"
+
+
+def _capture_pg_sql(db, *responses):
+    """Run a query_history against canned psql stdout, returning the SQL
+    strings handed to psql (the value after each -c)."""
+    seen = []
+    canned = list(responses)
+
+    def fake_run(cmd, capture_output, text, timeout, env):
+        seen.append(cmd[cmd.index("-c") + 1])
+        return type("R", (), {"returncode": 0,
+                              "stdout": canned.pop(0), "stderr": ""})()
+
+    return seen, patch("history_db.subprocess.run", side_effect=fake_run)
+
+
+def test_pg_text_column_uses_distinct_on_not_avg():
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    seen, patcher = _capture_pg_sql(
+        db,
+        "operationState\ttext\n",              # get_columns
+        "1753100000\tRun\n1753100300\tReady\n",  # bucketed text rows
+    )
+    with patcher:
+        result = db.query_history(42, "operationstate", "24h")
+    query_sql = seen[-1]
+    assert "AVG(" not in query_sql
+    assert "DISTINCT ON (bucket)" in query_sql
+    assert 'ORDER BY bucket, ts DESC' in query_sql
+    assert [p["v"] for p in result["points"]] == ["Run", "Ready"]
+    assert result["min"] is None and result["max"] is None
+    assert result["current"] == "Ready"
+
+
+def test_pg_numeric_still_uses_avg():
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    seen, patcher = _capture_pg_sql(
+        db,
+        "programProgress\tinteger\n",
+        "1753100000\t40\n1753100300\t60\n",
+    )
+    with patcher:
+        result = db.query_history(42, "programprogress", "24h")
+    assert "AVG(" in seen[-1]
+    assert [p["v"] for p in result["points"]] == [40.0, 60.0]
+
+
+# ----- naive-local ts: AT TIME ZONE + local window (issue #48) ------------
+
+
+def test_pg_epoch_extraction_interprets_ts_as_local():
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    seen, patcher = _capture_pg_sql(
+        db,
+        "onOffState\tboolean\n",
+        "1753100000\tt\n",
+    )
+    with patcher:
+        db.query_history(42, "onoffstate", "1h")
+    assert "EXTRACT(EPOCH FROM (ts AT TIME ZONE 'Europe/London'))" in seen[-1]
+    assert "EXTRACT(EPOCH FROM ts)" not in seen[-1]
+
+
+def test_pg_bucketed_epoch_extraction_interprets_ts_as_local():
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    seen, patcher = _capture_pg_sql(
+        db,
+        "sensorValue\tdouble precision\n",
+        "1753100000\t20.5\n",
+    )
+    with patcher:
+        db.query_history(42, "sensorvalue", "24h")
+    assert "EXTRACT(EPOCH FROM (ts AT TIME ZONE 'Europe/London'))" in seen[-1]
+
+
+def test_pg_window_start_is_local_wall_time():
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    seen, patcher = _capture_pg_sql(
+        db,
+        "onOffState\tboolean\n",
+        "1753100000\tt\n",
+    )
+    with patcher:
+        db.query_history(42, "onoffstate", "1h")
+    # WHERE ts >= '<start>' must be ~1h before *local* now, not UTC now.
+    start_str = seen[-1].split("ts >= '")[1].split("'")[0]
+    start = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+    expected = datetime.now(ZoneInfo("Europe/London")).replace(tzinfo=None) - timedelta(hours=1)
+    assert abs((start - expected).total_seconds()) < 30
+
+
+def test_pg_timezone_pref_flows_through_and_validates():
+    with patch.object(HistoryDB, "test_connection", return_value=True):
+        db = HistoryDB.from_prefs(
+            {"dbType": "postgresql", "pgTimezone": "America/New_York"},
+            MagicMock())
+    assert db.pg_timezone == "America/New_York"
+
+    logger = MagicMock()
+    db = HistoryDB(db_type="postgresql", logger=logger,
+                   pg_timezone="Narnia/Lantern")
+    assert db.pg_timezone == "Europe/London"
+    warnings = " ".join(str(c) for c in logger.warning.call_args_list)
+    assert "Narnia/Lantern" in warnings
+
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    assert db.pg_timezone == "Europe/London"
 
 
 # ----- PG env hardening ---------------------------------------------------

@@ -23,6 +23,12 @@ import os
 import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+
+#: Fallback zone for interpreting the SQL Logger's naive-local ``ts``
+#: column when the pref is absent or names an unknown zone (issue #48).
+DEFAULT_PG_TIMEZONE = "Europe/London"
 
 
 # Time bucket sizes for downsampling (in seconds)
@@ -47,7 +53,8 @@ class HistoryDB:
     """Read-only access to Indigo SQL Logger database."""
 
     def __init__(self, db_type, logger, sqlite_path=None,
-                 pg_host=None, pg_port=None, pg_user=None, pg_password=None, pg_database=None):
+                 pg_host=None, pg_port=None, pg_user=None, pg_password=None, pg_database=None,
+                 pg_timezone=None):
         self.db_type = db_type
         self.logger = logger
         self.sqlite_path = sqlite_path
@@ -58,6 +65,25 @@ class HistoryDB:
             "password": pg_password or "",
             "database": pg_database or "indigo_history",
         }
+        self.pg_timezone = self._validate_timezone(pg_timezone)
+
+    def _validate_timezone(self, name):
+        """Resolve the pref'd zone name against the IANA database.
+
+        The name is interpolated into SQL (``AT TIME ZONE '<name>'``), so
+        it must be a real zone, not a client-supplied string — an unknown
+        name falls back to ``DEFAULT_PG_TIMEZONE`` with a warning rather
+        than erroring every later query (issue #48)."""
+        name = (name or "").strip() or DEFAULT_PG_TIMEZONE
+        try:
+            ZoneInfo(name)
+        except Exception:
+            self.logger.warning(
+                f"SQL Logger timezone {name!r} is not a known IANA zone; "
+                f"falling back to {DEFAULT_PG_TIMEZONE}"
+            )
+            return DEFAULT_PG_TIMEZONE
+        return name
 
     @classmethod
     def from_prefs(cls, prefs, logger):
@@ -79,6 +105,7 @@ class HistoryDB:
                     pg_user=prefs.get("pgUser", "postgres"),
                     pg_password=prefs.get("pgPassword", ""),
                     pg_database=prefs.get("pgDatabase", "indigo_history"),
+                    pg_timezone=prefs.get("pgTimezone", DEFAULT_PG_TIMEZONE),
                 )
                 target = (
                     f"postgresql @ {db.pg_config['host']}"
@@ -310,7 +337,13 @@ class HistoryDB:
         Query device history for a specific column over a time range.
         Returns dict with points, min, max, current values.
 
-        Timestamps in the SQL Logger database are stored in GMT.
+        The Postgres SQL Logger writes ``ts`` as a NAIVE timestamp in
+        LOCAL wall-clock time (``timestamp without time zone`` — verified
+        live, issue #48), so the PG path interprets it via
+        ``AT TIME ZONE self.pg_timezone`` and computes the window start
+        in that zone's wall time. The SQLite path keeps its historical
+        UTC interpretation — unverified against a live SQLite install,
+        so deliberately not "fixed" blind.
 
         The requested ``column`` MUST match one of the table's actual
         columns (case-insensitively); anything else raises ValueError
@@ -322,8 +355,12 @@ class HistoryDB:
         bucket_seconds = RANGE_BUCKETS.get(time_range)
         delta = RANGE_DELTAS.get(time_range, timedelta(hours=24))
 
-        # Calculate start time in GMT (SQL Logger stores GMT timestamps)
-        start_time = datetime.now(timezone.utc) - delta
+        # Window start must be in the same clock as the stored ts values:
+        # local wall time for PG (naive-local column), UTC for SQLite.
+        if self.db_type == "postgresql":
+            start_time = datetime.now(ZoneInfo(self.pg_timezone)) - delta
+        else:
+            start_time = datetime.now(timezone.utc) - delta
         start_ts = start_time.strftime("%Y-%m-%d %H:%M:%S")
 
         columns_info = self.get_columns(device_id)
@@ -346,7 +383,11 @@ class HistoryDB:
         column = match["name"]  # exact case from DB — the only string used in SQL
 
         try:
-            if col_type == "bool" or bucket_seconds is None:
+            if col_type == "text":
+                # Text data: latest value per bucket — AVG(text) is a
+                # Postgres error and a silent 0.0 on SQLite (issue #49)
+                points = self._query_text(table_name, column, start_ts, bucket_seconds)
+            elif col_type == "bool" or bucket_seconds is None:
                 # Boolean data or short range: return raw rows
                 points = self._query_raw(table_name, column, start_ts)
             else:
@@ -363,6 +404,15 @@ class HistoryDB:
                 }
 
             values = [p["v"] for p in points if p["v"] is not None]
+            if col_type == "text":
+                # min/max of strings is alphabetical noise — omit them.
+                return {
+                    "points": points,
+                    "min": None,
+                    "max": None,
+                    "current": values[-1] if values else None,
+                    "type": col_type,
+                }
             return {
                 "points": points,
                 "min": min(values) if values else None,
@@ -373,6 +423,18 @@ class HistoryDB:
         except Exception as e:
             self.logger.error(f"Error querying history for device {device_id}, column {column}: {e}")
             raise
+
+    def _pg_epoch(self):
+        """The epoch-extraction expression for the naive-local ``ts``.
+
+        ``AT TIME ZONE`` first interprets the naive value in the
+        configured zone (yielding the true instant), so the epoch is
+        DST-correct year-round — bare ``EXTRACT(EPOCH FROM ts)`` treated
+        it as UTC and ran +1h during BST (issue #48). The zone name is
+        IANA-validated in ``_validate_timezone``; quotes are doubled as
+        a second layer."""
+        zone = self.pg_timezone.replace("'", "''")
+        return f"EXTRACT(EPOCH FROM (ts AT TIME ZONE '{zone}'))"
 
     def _query_raw(self, table_name, column, start_ts):
         """Return raw data points (no aggregation)."""
@@ -386,7 +448,7 @@ class HistoryDB:
             _, rows = self._execute(sql, (start_ts,))
         else:
             sql = (
-                f'SELECT EXTRACT(EPOCH FROM ts)::bigint as epoch, "{column}" '
+                f'SELECT {self._pg_epoch()}::bigint as epoch, "{column}" '
                 f'FROM "{table_name}" '
                 f'WHERE ts >= %s AND "{column}" IS NOT NULL '
                 f'ORDER BY ts'
@@ -443,7 +505,7 @@ class HistoryDB:
             _, rows = self._execute(sql, (start_ts,))
         else:
             sql = (
-                f'SELECT (EXTRACT(EPOCH FROM ts)::bigint / {bucket_seconds}) * {bucket_seconds} as bucket, '
+                f'SELECT ({self._pg_epoch()}::bigint / {bucket_seconds}) * {bucket_seconds} as bucket, '
                 f'AVG("{column}") as avg_val '
                 f'FROM "{table_name}" '
                 f'WHERE ts >= %s AND "{column}" IS NOT NULL '
@@ -467,6 +529,63 @@ class HistoryDB:
             epoch = int(epoch_raw)
             value = round(float(value_raw), 2)
             points.append({"t": epoch, "v": value})
+        return points
+
+    def _query_text(self, table_name, column, start_ts, bucket_seconds):
+        """Return text data points: raw when unbucketed, else the LATEST
+        value per bucket. Never aggregates — ``AVG(text)`` errors on
+        Postgres and silently returns 0.0 on SQLite (issue #49)."""
+        if bucket_seconds is None:
+            if self.db_type == "sqlite":
+                sql = (
+                    f'SELECT strftime("%s", ts) as epoch, "{column}" '
+                    f'FROM "{table_name}" '
+                    f'WHERE ts >= ? AND "{column}" IS NOT NULL '
+                    f'ORDER BY ts'
+                )
+                _, rows = self._execute(sql, (start_ts,))
+            else:
+                sql = (
+                    f'SELECT {self._pg_epoch()}::bigint as epoch, "{column}" '
+                    f'FROM "{table_name}" '
+                    f'WHERE ts >= %s AND "{column}" IS NOT NULL '
+                    f'ORDER BY ts'
+                )
+                _, rows = self._execute(sql, (start_ts,))
+        elif self.db_type == "sqlite":
+            # Bare-column-with-MAX: SQLite documents that with a lone
+            # min()/max() aggregate, unaggregated columns take their
+            # values from the min/max row — i.e. the latest per bucket.
+            sql = (
+                f'SELECT (CAST(strftime("%s", ts) AS INTEGER) / {bucket_seconds}) * {bucket_seconds} as bucket, '
+                f'"{column}", MAX(ts) '
+                f'FROM "{table_name}" '
+                f'WHERE ts >= ? AND "{column}" IS NOT NULL '
+                f'GROUP BY bucket '
+                f'ORDER BY bucket'
+            )
+            _, rows = self._execute(sql, (start_ts,))
+        else:
+            sql = (
+                f'SELECT DISTINCT ON (bucket) '
+                f'({self._pg_epoch()}::bigint / {bucket_seconds}) * {bucket_seconds} as bucket, '
+                f'"{column}" '
+                f'FROM "{table_name}" '
+                f'WHERE ts >= %s AND "{column}" IS NOT NULL '
+                f'ORDER BY bucket, ts DESC'
+            )
+            _, rows = self._execute(sql, (start_ts,))
+
+        points = []
+        for row in rows:
+            if len(row) < 2:
+                continue
+            epoch_raw, value_raw = row[0], row[1]
+            if epoch_raw is None or epoch_raw == "":
+                continue
+            if value_raw is None or value_raw == "":
+                continue
+            points.append({"t": int(epoch_raw), "v": str(value_raw)})
         return points
 
     def close(self):
