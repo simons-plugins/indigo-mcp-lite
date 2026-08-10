@@ -263,7 +263,9 @@ class HistoryDB:
             raise Exception(f"psql error: {result.stderr.strip()}")
 
         rows = []
-        for line in result.stdout.strip().split("\n"):
+        # rstrip("\n"), not strip(): a trailing "epoch\t" row (empty text
+        # value in the last field) must keep its empty field (issue #49).
+        for line in result.stdout.rstrip("\n").split("\n"):
             if line:
                 rows.append(tuple(line.split("\t")))
         return [], rows  # columns not easily parsed from tuples-only mode
@@ -588,7 +590,9 @@ class HistoryDB:
             epoch_raw, value_raw = row[0], row[1]
             if epoch_raw is None or epoch_raw == "":
                 continue
-            if value_raw is None or value_raw == "":
+            # Empty string is a REAL text value ("state cleared") — the SQL
+            # already excludes NULL, so only None is skipped here.
+            if value_raw is None:
                 continue
             points.append({"t": int(epoch_raw), "v": str(value_raw)})
         return points

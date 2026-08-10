@@ -273,6 +273,22 @@ def test_pg_text_raw_path_keeps_strings():
     assert result["current"] == "Ready"
 
 
+def test_pg_text_empty_string_is_a_real_value():
+    # '' means "state cleared" — the WHERE clause excludes NULL, so an
+    # empty psql field in the text path is a genuine value, and psql's
+    # trailing "epoch\t" row must survive stdout parsing.
+    db = HistoryDB(db_type="postgresql", logger=MagicMock())
+    seen, patcher = _capture_pg_sql(
+        db,
+        "operationState\ttext\n",
+        "1753100000\tRun\n1753100300\t\n",
+    )
+    with patcher:
+        result = db.query_history(42, "operationstate", "24h")
+    assert [p["v"] for p in result["points"]] == ["Run", ""]
+    assert result["current"] == ""
+
+
 def test_pg_timezone_pref_flows_through_and_validates():
     with patch.object(HistoryDB, "test_connection", return_value=True):
         db = HistoryDB.from_prefs(
