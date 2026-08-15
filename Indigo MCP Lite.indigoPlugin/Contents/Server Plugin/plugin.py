@@ -164,7 +164,10 @@ class Plugin(indigo.PluginBase):
         if isinstance(body_raw, (bytes, bytearray)):
             try:
                 body = body_raw.decode("utf-8", errors="replace")
-            except Exception:
+            except Exception as exc:
+                self.logger.warning(
+                    f"MCP request body decode failed, treating as empty: {exc}"
+                )
                 body = ""
         else:
             body = body_raw or ""
