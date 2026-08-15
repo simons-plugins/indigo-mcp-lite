@@ -114,8 +114,17 @@ class MCPHandler:
         # Normalise headers to lowercase — clients vary on case.
         headers_lc = {k.lower(): v for k, v in (headers or {}).items()}
 
+        # IWS rejects an empty content string ("incorrect value returned
+        # from plugin" → HTTP 500), so the 405 must carry a body. Clients
+        # probing GET for an SSE stream need the clean 405 per the
+        # Streamable HTTP spec.
         if (http_method or "").upper() != "POST":
-            return _http_response(405, {"Allow": "POST"}, "")
+            return _http_response(
+                405,
+                {"Allow": "POST", "Content-Type": "application/json; charset=utf-8"},
+                json.dumps({"error": "method_not_allowed",
+                            "detail": "MCP endpoint accepts POST only"}),
+            )
 
         # MCP HTTP transport sets Accept to application/json (and
         # sometimes text/event-stream). Accept wildcard too — some

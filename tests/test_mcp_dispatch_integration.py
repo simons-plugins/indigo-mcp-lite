@@ -357,3 +357,19 @@ def test_wire_dispatch_capability_refusal_is_friendly_tool_error(
     assert "supportsRGB" in text
     assert "supportsOnState" in text  # names what the device DOES support
     mock_indigo.dimmer.setColorLevels.assert_not_called()
+
+
+def test_get_returns_405_with_body(mock_indigo):
+    # IWS turns an empty content string into a 500 ("incorrect value
+    # returned from plugin"), and SSE-probing MCP clients need the clean
+    # 405 — so the method-not-allowed response must carry a body.
+    from mcp_handler import MCPHandler
+
+    handler = MCPHandler(server_name="test", server_version="0")
+    response = handler.handle_request(http_method="GET", headers={}, body="")
+
+    assert response["status"] == 405
+    assert response["headers"]["Allow"] == "POST"
+    assert response["content"], "405 content must be non-empty for IWS"
+    assert response["headers"]["Content-Type"].startswith("application/json")
+    assert json.loads(response["content"])["error"] == "method_not_allowed"
