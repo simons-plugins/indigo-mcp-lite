@@ -75,6 +75,15 @@ In your Claude Code project's `.mcp.json` (with the dot — Claude Code reads th
 
 For Claude Desktop, the equivalent file is `~/Library/Application Support/Claude/claude_desktop_config.json`.
 
+> **Check your npx path first.** The examples use Homebrew's
+> `/opt/homebrew/bin/npx`, but Node installed via the nodejs.org installer
+> lives in `/usr/local/bin` — even on Apple Silicon. Run `which npx` in a
+> terminal and use that path for `command`, and make sure the directory it
+> printed is the **first** entry in `env.PATH` (npx's `#!/usr/bin/env node`
+> shebang re-resolves `node` via that PATH, so `command` alone isn't
+> enough). A wrong `command` path fails silently — the server just shows
+> as disconnected with no request ever leaving your machine.
+
 ### Pattern B — Side-by-side with mlamoure
 
 Use a distinct key so the tool prefixes don't collide. Tools appear under `mcp__indigo_mcp_lite__*`.
