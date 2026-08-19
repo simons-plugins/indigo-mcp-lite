@@ -101,14 +101,21 @@ def register(handler, *, indigo_module, **_):
         name="list_triggers",
         description=(
             "List Indigo triggers (id, name, type, enabled) with "
-            "pagination. Triggers are event-driven automations."
+            "pagination. Triggers are event-driven automations. "
+            "Metadata only — for what a trigger watches and does, "
+            "call get_automation_contents(entity_type='trigger')."
         ),
         input_schema=pagination_schema,
         handler=lambda **args: _paginate(indigo_module.triggers, args),
     )
     handler.register_tool(
         name="get_trigger_by_id",
-        description="Return a single Indigo trigger by id.",
+        description=(
+            "Return a single Indigo trigger by id — METADATA only "
+            "(name, folder, enabled, type). It does NOT return what "
+            "the trigger watches or the actions it runs; "
+            "get_automation_contents(entity_type='trigger') does."
+        ),
         input_schema=id_schema,
         handler=lambda **args: _get_trigger_handler(args, indigo_module),
     )
@@ -144,14 +151,26 @@ def register(handler, *, indigo_module, **_):
         name="list_schedules",
         description=(
             "List Indigo schedules (id, name, enabled, next_execution) "
-            "with pagination. Schedules are time-driven automations."
+            "with pagination. Schedules are time-driven automations. "
+            "next_execution is the next TIMESTAMP, not the firing "
+            "rule — it cannot tell an absolute 06:00 schedule from "
+            "one tracking sunrise. For the rule, call "
+            "get_automation_contents(entity_type='schedule')."
         ),
         input_schema=pagination_schema,
         handler=lambda **args: _paginate(indigo_module.schedules, args),
     )
     handler.register_tool(
         name="get_schedule_by_id",
-        description="Return a single Indigo schedule by id.",
+        description=(
+            "Return a single Indigo schedule by id — METADATA only, "
+            "plus next_execution. next_execution is the next "
+            "TIMESTAMP, not the rule: it cannot show that a schedule "
+            "named for 19:00 is actually set to 20:00. For WHEN it "
+            "fires (absolute / sunrise / sunset + offset / countdown, "
+            "and the day rule) and WHAT it runs, call "
+            "get_automation_contents(entity_type='schedule')."
+        ),
         input_schema=id_schema,
         handler=lambda **args: _get_schedule_handler(args, indigo_module),
     )

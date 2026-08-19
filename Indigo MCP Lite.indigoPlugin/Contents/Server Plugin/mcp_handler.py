@@ -43,10 +43,17 @@ class MCPHandler:
         logger: Optional[logging.Logger] = None,
         server_name: str = "indigo-mcp-lite",
         server_version: str = "0.0.0",
+        instructions: Optional[str] = None,
     ):
         self.logger = logger or logging.getLogger("Plugin")
         self.server_name = server_name
         self.server_version = server_version
+        # Optional MCP ``instructions`` (spec: InitializeResult) — a
+        # short orientation the client injects into the model's
+        # context. Kept as injected content rather than literal text
+        # here so this handler stays the generic core both lite and
+        # home-intelligence share; each supplies its own.
+        self.instructions = instructions
 
         # Tool / resource registries. Populated by the plugin during
         # startup via register_tool / register_resource.
@@ -283,7 +290,7 @@ class MCPHandler:
             f"protocol={requested_version} session={session_id[:8]}"
         )
 
-        return {
+        result = {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
@@ -301,6 +308,12 @@ class MCPHandler:
             },
             "_mcp_session_id": session_id,
         }
+        if self.instructions:
+            # Omitted entirely when unset — the field is optional and
+            # an empty string would read as "this server has nothing
+            # to say" rather than "not provided".
+            result["result"]["instructions"] = self.instructions
+        return result
 
     # ------------------------------------------------------------------
     # tools/*

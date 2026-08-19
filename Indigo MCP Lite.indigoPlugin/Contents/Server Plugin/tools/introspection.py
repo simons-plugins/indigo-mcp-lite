@@ -34,7 +34,14 @@ def register(handler, *, indigo_module, **_):
             "schedules, action groups, control pages, devices, "
             "variables). Check this BEFORE variable_delete or "
             "device_enable(false) — deleting something with dependents "
-            "breaks the automations that use it."
+            "breaks the automations that use it. INCOMPLETE for "
+            "devices: this wraps Indigo's own dependency check, which "
+            "does not see a device referenced from inside a plugin "
+            "action's parameters, so it can report zero dependents "
+            "for a device several action groups genuinely drive. "
+            "Cross-check with find_automation_references, and read "
+            "the `props` on plugin steps via get_automation_contents, "
+            "before concluding nothing uses it."
         ),
         input_schema={
             "type": "object",
