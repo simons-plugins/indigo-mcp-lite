@@ -17,6 +17,7 @@ from tools.automation_contents import (
 )
 
 from test_indidb_reader import FIXTURE, SKIP_FIXTURE
+from test_indidb_reader_semantics import FIXTURE as SEMANTICS_FIXTURE
 
 
 class _Named:
@@ -43,6 +44,19 @@ def reader(tmp_path, mock_indigo):
     path.write_text(FIXTURE, encoding="utf-8")
     mock_indigo.server.getDbFilePath.return_value = str(path)
     _wire_names(mock_indigo)
+    return IndiDbReader(indigo_module=mock_indigo)
+
+
+@pytest.fixture
+def semantics_reader(tmp_path, mock_indigo):
+    """Reader over the fixture carrying sun conditions, plugin props,
+    and schedule timing — the three shapes ``get_automation_contents``
+    must pass through to callers."""
+    path = tmp_path / "Semantics.indiDb"
+    path.write_text(SEMANTICS_FIXTURE, encoding="utf-8")
+    mock_indigo.server.getDbFilePath.return_value = str(path)
+    mock_indigo.devices.__getitem__.side_effect = KeyError
+    mock_indigo.actionGroups.__getitem__.side_effect = KeyError
     return IndiDbReader(indigo_module=mock_indigo)
 
 
@@ -354,3 +368,36 @@ def test_get_automation_contents_dispatches_through_mcp_handler(
     assert inner["name"] == "Morning.Scene"
     assert inner["steps"][0]["action_label"] == "set_brightness"
     assert inner["steps"][-1]["action_group"]["name"] == "Chained"
+
+
+def test_get_contents_reports_when_a_schedule_fires(semantics_reader):
+    out = _get_contents_handler(
+        {"entity_type": "schedule", "id": 601}, semantics_reader
+    )
+    assert out["schedule"]["time_type"] == "sunset"
+    assert out["schedule"]["sun_offset_seconds"] == -1800
+
+
+def test_get_contents_keeps_plugin_props_through_annotation(semantics_reader):
+    out = _get_contents_handler(
+        {"entity_type": "schedule", "id": 600}, semantics_reader
+    )
+    assert out["steps"][0]["props"]["whiteTemperature"] == "4000"
+
+
+def test_get_contents_keeps_sun_conditions_through_annotation(
+        semantics_reader):
+    out = _get_contents_handler(
+        {"entity_type": "trigger", "id": 700}, semantics_reader
+    )
+    assert [c.get("state") for c in out["conditions"]["conditions"]] == [
+        "daylight", "dark", None,
+    ]
+
+
+def test_get_contents_omits_schedule_block_for_non_schedules(
+        semantics_reader):
+    out = _get_contents_handler(
+        {"entity_type": "trigger", "id": 700}, semantics_reader
+    )
+    assert "schedule" not in out

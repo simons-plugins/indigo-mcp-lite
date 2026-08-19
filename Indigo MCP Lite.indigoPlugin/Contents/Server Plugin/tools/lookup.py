@@ -134,7 +134,15 @@ def register(handler, *, indigo_module):
     )
     handler.register_tool(
         name="get_device_by_id",
-        description="Return a single Indigo device by id.",
+        description=(
+            "Return a single Indigo device by id: metadata, subclass "
+            "fields, runtime `states`, and `plugin_props` — the "
+            "device's plugin/server CONFIGURATION, keyed by plugin id "
+            "(what sensors feed an occupancy zone, which action "
+            "groups a meta relay fires, the server's "
+            "defaultDimmerLevel). States say what the device IS; "
+            "plugin_props say what it DOES."
+        ),
         input_schema={
             "type": "object",
             "required": ["id"],
@@ -378,7 +386,7 @@ _DETAIL_ATTRS = (
 
 
 def _serialize_device_detail(d):
-    """Full single-device shape: slim fields + states + subclass attrs.
+    """Full single-device shape: slim fields + states + config + subclass attrs.
 
     Only used by get_device_by_id — the list tools keep the slim shape
     so a 500-row page doesn't balloon the prompt. Values go through
@@ -415,6 +423,23 @@ def _serialize_device_detail(d):
             str(k): _json_safe(v)
             for k, v in states.items()
             if "." not in str(k) or str(k).split(".", 1)[0] not in keys
+        }
+    # Plugin/server *configuration*, as opposed to runtime state:
+    # ``globalProps`` is the live-IOM view of the database's MetaProps
+    # — a dict of dicts keyed by plugin id, readable by anyone, plus
+    # the server's own block under ``com.indigodomo.indigoserver``.
+    # For plugin devices whose behaviour IS their configuration (a
+    # meta relay's on/off action groups, an occupancy zone's sensor
+    # list and delays, the server's per-device defaultDimmerLevel) the
+    # states alone say nothing. Included unconditionally rather than
+    # behind a flag: an agent that doesn't know to ask is exactly the
+    # caller this is for. Median payload on the live server is ~200
+    # chars; the worst case (zigbee vendor metadata) is comparable to
+    # a large states block.
+    props = getattr(d, "globalProps", None)
+    if props is not None and hasattr(props, "items"):
+        out["plugin_props"] = {
+            str(k): _json_safe(v) for k, v in props.items()
         }
     # Community-catalog enrichment: capability flags for the matched
     # (pluginId, deviceTypeId). The key is simply absent when the
