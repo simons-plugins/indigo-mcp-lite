@@ -12,6 +12,48 @@ import indigo  # noqa: F401  (provided by Indigo runtime)
 from mcp_handler import MCPHandler
 
 
+# MCP ``instructions`` (InitializeResult) — the one place the server
+# gets to orient a client's model before any tool is called. Tool
+# descriptions are read one at a time and only when a tool is already
+# being considered; this is read up front, so it carries the routing
+# rules that no single description can: which question each family of
+# tools answers, and — more importantly — the three places a
+# plausible-looking answer is actually incomplete.
+SERVER_INSTRUCTIONS = """\
+Indigo home automation (indigodomo.com). Tools fall into four groups:
+
+- LOOKUP — what exists: devices, variables, action groups, triggers,
+  schedules, folders, plugins. find_devices searches by name/room/type.
+- CONTENTS — what an automation DOES and WHEN: get_automation_contents,
+  find_automation_references, list_automation_scripts. These decode the
+  Indigo database file; the lookup tools cannot see any of it.
+- CONTROL — change state: turn on/off, dim, colour, setpoints, execute,
+  enable/disable.
+- SYSTEM/HISTORY — event log, plugin status, SQL Logger queries.
+
+Three answers that look complete but are not:
+
+1. A schedule's `next_execution` is the next TIMESTAMP, not the rule.
+   It cannot distinguish an absolute 06:00 schedule from one tracking
+   sunrise, so it cannot show a misconfigured time. For when a schedule
+   actually fires, call get_automation_contents(entity_type="schedule")
+   and read its `schedule` block.
+2. get_trigger_by_id / get_schedule_by_id / get_action_group_by_id
+   return METADATA only — name, folder, enabled. They never show the
+   action steps or conditions. get_automation_contents does.
+3. get_dependencies wraps Indigo's own dependency check, which does NOT
+   see devices referenced from inside a plugin action's parameters. It
+   can report zero dependents for a device that several action groups
+   genuinely drive. Before concluding nothing uses something, also read
+   get_automation_contents `props` on the plugin steps involved.
+
+A plugin action step's target device is sometimes only inside its
+`props` (e.g. `dimmer_device_id`), never in `device_id`. Likewise a
+device's behaviour often lives in its configuration, not its states —
+get_device_by_id returns `plugin_props` for that.
+"""
+
+
 class Plugin(indigo.PluginBase):
     def __init__(self, plugin_id, plugin_display_name, plugin_version, plugin_prefs):
         super().__init__(plugin_id, plugin_display_name, plugin_version, plugin_prefs)
@@ -20,6 +62,7 @@ class Plugin(indigo.PluginBase):
             logger=self.logger,
             server_name="indigo-mcp-lite",
             server_version=plugin_version,
+            instructions=SERVER_INSTRUCTIONS,
         )
         # Built in startup()/_build_history_db(); None = history tools
         # report "not configured".

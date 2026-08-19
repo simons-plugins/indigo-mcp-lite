@@ -160,21 +160,21 @@ If `mcp-remote` isn't yet cached locally, `npx -y mcp-remote ...` has to fetch t
 
 | Tool | Description |
 |------|-------------|
-| `get_action_group_by_id` | Return a single Indigo action group by id. |
-| `get_dependencies` | List everything that references an entity (triggers, schedules, action groups, control pages, devices, variables). Check this BEFORE variable_delete or device_enable(false) — deleting something with dependents breaks the automations that use it. |
+| `get_action_group_by_id` | Return a single Indigo action group by id — METADATA only (name, description, folder). It does NOT return the action steps; get_automation_contents(entity_type='action_group') does, and is the only way to tell two similarly named groups apart. |
+| `get_dependencies` | List everything that references an entity (triggers, schedules, action groups, control pages, devices, variables). Check this BEFORE variable_delete or device_enable(false) — deleting something with dependents breaks the automations that use it. INCOMPLETE for devices: this wraps Indigo's own dependency check, which does not see a device referenced from inside a plugin action's parameters, so it can report zero dependents for a device several action groups genuinely drive. Cross-check with find_automation_references, and read the `props` on plugin steps via get_automation_contents, before concluding nothing uses it. |
 | `get_device_by_id` | Return a single Indigo device by id: metadata, subclass fields, runtime `states`, and `plugin_props` — the device's plugin/server CONFIGURATION, keyed by plugin id (what sensors feed an occupancy zone, which action groups a meta relay fires, the server's defaultDimmerLevel). States say what the device IS; plugin_props say what it DOES. |
 | `get_device_group` | Resolve a grouped (multi-endpoint) device to its group: member device ids plus the serialised root device. Some properties (battery_level especially) exist only on the root — use this when a child endpoint shows null battery. |
 | `get_devices_by_state` | List Indigo devices matching a state spec. Spec is a JSON object whose keys are state names; values are either literals (==) or string-prefixed comparators (>=, <=, >, <), e.g. {"onState": true, "batteryLevel": "<20"}. |
 | `get_devices_by_type` | List Indigo devices filtered by deviceTypeId. |
-| `get_schedule_by_id` | Return a single Indigo schedule by id. |
-| `get_trigger_by_id` | Return a single Indigo trigger by id. |
+| `get_schedule_by_id` | Return a single Indigo schedule by id — METADATA only, plus next_execution. next_execution is the next TIMESTAMP, not the rule: it cannot show that a schedule named for 19:00 is actually set to 20:00. For WHEN it fires (absolute / sunrise / sunset + offset / countdown, and the day rule) and WHAT it runs, call get_automation_contents(entity_type='schedule'). |
+| `get_trigger_by_id` | Return a single Indigo trigger by id — METADATA only (name, folder, enabled, type). It does NOT return what the trigger watches or the actions it runs; get_automation_contents(entity_type='trigger') does. |
 | `get_variable_by_id` | Return a single Indigo variable by id. |
 | `get_zwave_device_details` | Return full Z-Wave metadata for one device: node address, battery level, firmware version, error state, and the raw Z-Wave interface properties (listening/battery flags, manufacturer info) from globalProps. |
-| `list_action_groups` | List Indigo action groups with optional pagination. |
+| `list_action_groups` | List Indigo action groups with optional pagination. Names and ids only — for what a group actually does, call get_automation_contents(entity_type='action_group'). |
 | `list_device_folders` | List Indigo device folders (id + name). |
 | `list_devices` | List Indigo devices with optional pagination and filters. |
-| `list_schedules` | List Indigo schedules (id, name, enabled, next_execution) with pagination. Schedules are time-driven automations. |
-| `list_triggers` | List Indigo triggers (id, name, type, enabled) with pagination. Triggers are event-driven automations. |
+| `list_schedules` | List Indigo schedules (id, name, enabled, next_execution) with pagination. Schedules are time-driven automations. next_execution is the next TIMESTAMP, not the firing rule — it cannot tell an absolute 06:00 schedule from one tracking sunrise. For the rule, call get_automation_contents(entity_type='schedule'). |
+| `list_triggers` | List Indigo triggers (id, name, type, enabled) with pagination. Triggers are event-driven automations. Metadata only — for what a trigger watches and does, call get_automation_contents(entity_type='trigger'). |
 | `list_uncataloged_devices` | List plugin-owned Indigo devices that have no profile in the vendored community device catalog — the gap report for catalog contributions. Built-in/interface devices (no pluginId) are excluded. |
 | `list_variable_folders` | List Indigo variable folders (id + name). |
 | `list_variables` | List Indigo variables with optional pagination. |

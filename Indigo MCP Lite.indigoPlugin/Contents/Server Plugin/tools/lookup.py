@@ -110,7 +110,11 @@ def register(handler, *, indigo_module):
     )
     handler.register_tool(
         name="list_action_groups",
-        description="List Indigo action groups with optional pagination.",
+        description=(
+            "List Indigo action groups with optional pagination. "
+            "Names and ids only — for what a group actually does, "
+            "call get_automation_contents(entity_type='action_group')."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -162,7 +166,14 @@ def register(handler, *, indigo_module):
     )
     handler.register_tool(
         name="get_action_group_by_id",
-        description="Return a single Indigo action group by id.",
+        description=(
+            "Return a single Indigo action group by id — METADATA "
+            "only (name, description, folder). It does NOT return the "
+            "action steps; "
+            "get_automation_contents(entity_type='action_group') "
+            "does, and is the only way to tell two similarly named "
+            "groups apart."
+        ),
         input_schema={
             "type": "object",
             "required": ["id"],
