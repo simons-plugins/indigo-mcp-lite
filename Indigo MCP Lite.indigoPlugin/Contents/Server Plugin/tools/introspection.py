@@ -39,9 +39,9 @@ def register(handler, *, indigo_module, **_):
             "does not see a device referenced from inside a plugin "
             "action's parameters, so it can report zero dependents "
             "for a device several action groups genuinely drive. "
-            "Cross-check with find_automation_references, and read "
-            "the `props` on plugin steps via get_automation_contents, "
-            "before concluding nothing uses it."
+            "find_automation_references DOES see those (it reports "
+            "them as acts_on_via_props) — cross-check there before "
+            "concluding nothing uses a device."
         ),
         input_schema={
             "type": "object",

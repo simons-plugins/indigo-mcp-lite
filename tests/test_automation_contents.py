@@ -234,6 +234,205 @@ def test_find_references_rejects_unknown_args(reader):
 
 
 # ---------------------------------------------------------------------
+# find_automation_references — props-aware matching (issue #59)
+# ---------------------------------------------------------------------
+
+# Plugin steps that name their target inside their own parameters
+# instead of a sibling <DeviceID>. Shapes copied from the live server:
+# zigbee2mqtt's string `dimmer_device_id`, a comma-separated sensor
+# list, and id-shaped values that are NOT device references.
+PROPS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
+<Database type="dict">
+  <TDTriggerList type="vector" />
+  <TriggerList type="vector" />
+  <ActionGroupList type="vector">
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">999</Class>
+          <MetaProps type="dict">
+            <com.autologplugin.indigoplugin.zigbee2mqtt type="dict">
+              <dimmer_device_id type="string">51886070</dimmer_device_id>
+              <deepLinkPageId type="integer">8888888</deepLinkPageId>
+              <whiteLevel type="string">100</whiteLevel>
+            </com.autologplugin.indigoplugin.zigbee2mqtt>
+          </MetaProps>
+          <PluginID type="string">com.autologplugin.indigoplugin.zigbee2mqtt</PluginID>
+          <TypeIdPlugin type="string">setWhiteLevelTemperature</TypeIdPlugin>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">700</ID>
+      <Name type="string">Props Only</Name>
+    </ActionGroup>
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">1</Class>
+          <DeviceAction type="integer">4</DeviceAction>
+          <DeviceActionValue type="integer">0</DeviceActionValue>
+          <DeviceID type="integer">111</DeviceID>
+        </Action>
+        <Action type="dict">
+          <Class type="integer">999</Class>
+          <MetaProps type="dict">
+            <com.flyingdiver.indigoplugin.shellymqtt type="dict">
+              <device-id type="integer">111</device-id>
+            </com.flyingdiver.indigoplugin.shellymqtt>
+          </MetaProps>
+          <PluginID type="string">com.flyingdiver.indigoplugin.shellymqtt</PluginID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">701</ID>
+      <Name type="string">Both Ways</Name>
+    </ActionGroup>
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">999</Class>
+          <MetaProps type="dict">
+            <com.example.occupancy type="dict">
+              <sensorDevices type="string">1465867145,735515977,222</sensorDevices>
+            </com.example.occupancy>
+          </MetaProps>
+          <PluginID type="string">com.example.occupancy</PluginID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">702</ID>
+      <Name type="string">Multi Sensor</Name>
+    </ActionGroup>
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">999</Class>
+          <MetaProps type="dict">
+            <com.example.nested type="dict">
+              <zones type="dict">
+                <primary type="integer">60123456</primary>
+              </zones>
+              <extras type="vector">
+                <item type="string">nope</item>
+                <item type="integer">70123456</item>
+              </extras>
+              <variable type="integer">555</variable>
+            </com.example.nested>
+          </MetaProps>
+          <PluginID type="string">com.example.nested</PluginID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">703</ID>
+      <Name type="string">Nested Props</Name>
+    </ActionGroup>
+  </ActionGroupList>
+</Database>
+"""
+
+# Everything the props fixture references that IS a live object. The
+# absentees are load-bearing: 8888888 is a control page, 222 and
+# 1465867145 are ids of nothing, and 555 exists only as a variable.
+_PROPS_DEVICES = {
+    111: "Kitchen Light",
+    51886070: "Kitchen CCT Spots",
+    735515977: "Hall Motion",
+    60123456: "Nested Dimmer",
+    70123456: "Vector Dimmer",
+}
+_PROPS_VARIABLES = {555: "holiday_mode"}
+
+
+@pytest.fixture
+def props_reader(tmp_path, mock_indigo):
+    path = tmp_path / "Props.indiDb"
+    path.write_text(PROPS_FIXTURE, encoding="utf-8")
+    mock_indigo.server.getDbFilePath.return_value = str(path)
+
+    def _device(i):
+        return _Named(_PROPS_DEVICES[i])
+
+    def _variable(i):
+        return _Named(_PROPS_VARIABLES[i])
+
+    mock_indigo.devices.__getitem__.side_effect = _device
+    mock_indigo.variables.__getitem__.side_effect = _variable
+    mock_indigo.actionGroups.__getitem__.side_effect = KeyError
+    return IndiDbReader(indigo_module=mock_indigo)
+
+
+def test_find_references_props_only_device_is_found(props_reader):
+    # The whole point of #59: this device has no sibling <DeviceID>
+    # anywhere, so the pre-#59 index returned zero references for a
+    # device an action group genuinely drives.
+    out = _find_references_handler({"device_id": 51886070}, props_reader)
+    assert out["total_count"] == 1
+    ref = out["references"][0]
+    assert (ref["automation_type"], ref["id"]) == ("action_group", 700)
+    assert ref["name"] == "Props Only"
+    assert ref["roles"] == ["acts_on_via_props"]
+    assert ref["matched_props"] == ["dimmer_device_id"]
+
+
+def test_find_references_both_roles_reported_once(props_reader):
+    out = _find_references_handler({"device_id": 111}, props_reader)
+    assert out["total_count"] == 1        # one entry, not one per step
+    ref = out["references"][0]
+    assert ref["roles"] == ["acts_on", "acts_on_via_props"]
+    assert ref["matched_props"] == ["device-id"]
+
+
+def test_find_references_comma_separated_prop_matches_each_id(props_reader):
+    out = _find_references_handler({"device_id": 735515977}, props_reader)
+    assert out["total_count"] == 1
+    ref = out["references"][0]
+    assert (ref["automation_type"], ref["id"]) == ("action_group", 702)
+    assert ref["roles"] == ["acts_on_via_props"]
+    assert ref["matched_props"] == ["sensorDevices"]
+
+
+def test_find_references_id_shaped_non_device_prop_ignored(props_reader):
+    # 8888888 is a control page id sitting in `deepLinkPageId`. It is
+    # id-shaped but not a device, so it must not resolve to one.
+    out = _find_references_handler({"device_id": 8888888}, props_reader)
+    assert out["references"] == []
+    assert out["name"] is None
+
+
+def test_find_references_variable_prop_matches_only_variable_query(
+    props_reader,
+):
+    # The same prop value under both queries: 555 is a variable, so a
+    # variable_id query finds it and a device_id query must not.
+    as_variable = _find_references_handler(
+        {"variable_id": 555}, props_reader
+    )
+    assert as_variable["total_count"] == 1
+    ref = as_variable["references"][0]
+    assert (ref["automation_type"], ref["id"]) == ("action_group", 703)
+    assert ref["roles"] == ["acts_on_via_props"]
+    assert ref["matched_props"] == ["variable"]
+
+    as_device = _find_references_handler({"device_id": 555}, props_reader)
+    assert as_device["references"] == []
+
+
+def test_find_references_walks_nested_dict_and_vector_props(props_reader):
+    nested = _find_references_handler({"device_id": 60123456}, props_reader)
+    assert nested["references"][0]["matched_props"] == ["zones.primary"]
+
+    vector = _find_references_handler({"device_id": 70123456}, props_reader)
+    assert vector["references"][0]["matched_props"] == ["extras[1]"]
+
+
+def test_find_references_unresolvable_id_skips_props_inference(
+    props_reader,
+):
+    # 222 sits in the comma-separated sensor list but resolves to no
+    # live device, so it could equally be a level or a delay. Better
+    # no answer than an invented one.
+    out = _find_references_handler({"device_id": 222}, props_reader)
+    assert out["references"] == []
+    assert out["name"] is None
+
+
+# ---------------------------------------------------------------------
 # list_automation_scripts
 # ---------------------------------------------------------------------
 

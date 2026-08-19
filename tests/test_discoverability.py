@@ -78,6 +78,9 @@ def test_plugin_ships_instructions_naming_every_tool_family():
     assert "next_execution" in text
     assert "get_dependencies" in text
     assert "props" in text
+    # ...and routes the props case to the tool that actually resolves
+    # it, rather than leaving the client to read raw props itself.
+    assert "acts_on_via_props" in text
 
 
 def _descriptions(mock_indigo):

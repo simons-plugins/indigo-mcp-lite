@@ -7,8 +7,8 @@ steps, condition trees, and embedded scripts:
 
 - ``get_automation_contents``      — one automation, fully decoded
 - ``find_automation_references``   — reverse index: which automations
-  touch a given device/variable, role-tagged (acts_on / condition /
-  watches)
+  touch a given device/variable, role-tagged (acts_on /
+  acts_on_via_props / condition / watches)
 - ``list_automation_scripts``      — every embedded script in the DB
   with its owner (audit surface)
 
@@ -100,12 +100,16 @@ def register(handler, *, indigo_module, indidb_reader=None, logger=None, **_):
             "reported via the action group, not the schedule — "
             "follow execute-action-group results (via "
             "get_automation_contents) to trace indirect chains. "
-            "One known blind spot: a plugin action step that names "
-            "its target device only inside its own props (e.g. "
-            "`dimmer_device_id`) is NOT indexed, so a device that is "
-            "only ever driven that way can come back with zero "
-            "references — check get_automation_contents props before "
-            "concluding nothing touches it. "
+            "acts_on_via_props is that same relationship INFERRED "
+            "rather than declared: a plugin action step naming its "
+            "target only inside its own parameters (`device-id`, "
+            "`dimmer_device_id`, or a comma-separated list) instead "
+            "of a device field. `matched_props` names the parameters "
+            "that matched, so the inference is auditable. Indigo's "
+            "own dependency check (get_dependencies) does NOT see "
+            "these, so it can report zero dependents for a device "
+            "that several action groups genuinely drive — this tool "
+            "is the one that sees them. "
             "Pass exactly one of device_id or variable_id. Use before "
             "renaming/removing anything, or to answer 'what turns "
             "this on?'."
@@ -261,6 +265,57 @@ def _step_references(step, key, entity_id):
     return False
 
 
+def _prop_value_matches(value, entity_id):
+    """True if one decoded prop value names ``entity_id``.
+
+    Props are plugin-defined, so an id arrives as an integer, as a
+    bare string, or as one member of a comma-separated list
+    (``sensorDevices`` style). Booleans are excluded even though
+    ``isinstance(True, int)`` is True, and floats are never treated as
+    ids — a ``real`` prop is a level or a setpoint, not a reference.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == entity_id
+    if isinstance(value, str):
+        target = str(entity_id)
+        return any(part.strip() == target for part in value.split(","))
+    return False
+
+
+def _iter_prop_matches(value, entity_id, path=""):
+    """Yield the prop paths under ``value`` that name ``entity_id``.
+
+    Paths are dotted, with ``[i]`` for vector members, so a match
+    inside a nested dict stays auditable — the caller can see exactly
+    which parameter produced the inference. A non-container value at
+    the root (empty ``path``) never matches: only a named parameter
+    counts as a reference.
+    """
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            yield from _iter_prop_matches(child, entity_id, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _iter_prop_matches(
+                child, entity_id, f"{path}[{index}]"
+            )
+    elif path and _prop_value_matches(value, entity_id):
+        yield path
+
+
+def _step_prop_references(step, entity_id):
+    """Prop paths in a step (and any nested group) naming entity_id."""
+    matches = list(_iter_prop_matches(step.get("props"), entity_id))
+    nested = step.get("action_group")
+    if nested:  # never populated in raw reader records, but cheap guard
+        for child in nested.get("steps", ()):
+            matches.extend(_step_prop_references(child, entity_id))
+    return matches
+
+
 def _condition_references(node, key, entity_id):
     if node is None:
         return False
@@ -280,14 +335,35 @@ def _find_references_handler(args, reader):
         )
     key = supplied[0]
     entity_id = _require_int_id(args, key)
+    collection = "devices" if key == "device_id" else "variables"
+    name = reader.resolve_name(collection, entity_id)
+    # Props matching is INFERRED from raw parameter values rather than
+    # read from a declared field, so it is gated on the id resolving
+    # to a live object of the requested kind. Indigo ids are globally
+    # unique across every object type (live census: 2031 ids, zero
+    # collisions), so a prop value equal to a real device id IS that
+    # device whatever the key is called — which is what makes
+    # value-matching safe without a per-plugin key allowlist. An id
+    # that resolves to nothing has no such guarantee: it could collide
+    # with an ordinary numeric parameter (a level, a delay), and
+    # inventing references for it is worse than reporting none.
+    match_props = name is not None
     data = reader.automations()
     references = []
     for kind in ("schedule", "trigger", "action_group"):
         for record in data[kind].values():
             roles = []
+            matched_props = set()
             if any(_step_references(s, key, entity_id)
                    for s in record["steps"]):
                 roles.append("acts_on")
+            if match_props:
+                for step in record["steps"]:
+                    matched_props.update(
+                        _step_prop_references(step, entity_id)
+                    )
+            if matched_props:
+                roles.append("acts_on_via_props")
             if _condition_references(record.get("conditions"),
                                      key, entity_id):
                 roles.append("condition")
@@ -295,16 +371,18 @@ def _find_references_handler(args, reader):
                     record.get("watch", {}).get(key) == entity_id:
                 roles.append("watches")
             if roles:
-                references.append({
+                reference = {
                     "automation_type": kind,
                     "id": record["id"],
                     "name": record["name"],
                     "roles": roles,
-                })
-    collection = "devices" if key == "device_id" else "variables"
+                }
+                if matched_props:
+                    reference["matched_props"] = sorted(matched_props)
+                references.append(reference)
     return _with_skip_count({
         key: entity_id,
-        "name": reader.resolve_name(collection, entity_id),
+        "name": name,
         "references": references,
         "total_count": len(references),
     }, data)
