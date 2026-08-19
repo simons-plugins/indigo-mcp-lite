@@ -170,7 +170,7 @@ def test_handlers_surface_db_unavailable_as_value_error(mock_indigo):
     with pytest.raises(ValueError, match="database path unavailable"):
         _get_contents_handler({"entity_type": "trigger", "id": 1}, reader)
     with pytest.raises(ValueError, match="database path unavailable"):
-        _find_references_handler({"device_id": 1}, reader)
+        _find_references_handler({"device_id": 1}, reader, mock_indigo)
     with pytest.raises(ValueError, match="database path unavailable"):
         _list_scripts_handler({}, reader)
 
@@ -179,8 +179,8 @@ def test_handlers_surface_db_unavailable_as_value_error(mock_indigo):
 # find_automation_references
 # ---------------------------------------------------------------------
 
-def test_find_references_device_roles(reader):
-    out = _find_references_handler({"device_id": 111}, reader)
+def test_find_references_device_roles(reader, mock_indigo):
+    out = _find_references_handler({"device_id": 111}, reader, mock_indigo)
     assert out["device_id"] == 111
     assert out["name"] == "Kitchen Light"
     by_id = {(r["automation_type"], r["id"]): r["roles"]
@@ -193,18 +193,18 @@ def test_find_references_device_roles(reader):
     assert "skipped_automations" not in out
 
 
-def test_find_references_acts_on_via_plugin_step_device(reader):
+def test_find_references_acts_on_via_plugin_step_device(reader, mock_indigo):
     # Device 444 appears ONLY as the Class-999 plugin step's DeviceID
     # in trigger 400 — plugin actions must count as acts_on.
-    out = _find_references_handler({"device_id": 444}, reader)
+    out = _find_references_handler({"device_id": 444}, reader, mock_indigo)
     assert out["total_count"] == 1
     ref = out["references"][0]
     assert (ref["automation_type"], ref["id"]) == ("trigger", 400)
     assert ref["roles"] == ["acts_on"]
 
 
-def test_find_references_variable_roles(reader):
-    out = _find_references_handler({"variable_id": 555}, reader)
+def test_find_references_variable_roles(reader, mock_indigo):
+    out = _find_references_handler({"variable_id": 555}, reader, mock_indigo)
     by_id = {(r["automation_type"], r["id"]): r["roles"]
              for r in out["references"]}
     assert by_id[("schedule", 300)] == ["condition"]
@@ -213,24 +213,24 @@ def test_find_references_variable_roles(reader):
     assert out["total_count"] == 3
 
 
-def test_find_references_no_hits_empty(reader):
-    out = _find_references_handler({"device_id": 987654}, reader)
+def test_find_references_no_hits_empty(reader, mock_indigo):
+    out = _find_references_handler({"device_id": 987654}, reader, mock_indigo)
     assert out["references"] == []
     assert out["total_count"] == 0
 
 
-def test_find_references_requires_exactly_one_id(reader):
+def test_find_references_requires_exactly_one_id(reader, mock_indigo):
     with pytest.raises(ValueError, match="exactly one"):
-        _find_references_handler({}, reader)
+        _find_references_handler({}, reader, mock_indigo)
     with pytest.raises(ValueError, match="exactly one"):
         _find_references_handler(
-            {"device_id": 1, "variable_id": 2}, reader
+            {"device_id": 1, "variable_id": 2}, reader, mock_indigo
         )
 
 
-def test_find_references_rejects_unknown_args(reader):
+def test_find_references_rejects_unknown_args(reader, mock_indigo):
     with pytest.raises(ValueError, match="unknown argument"):
-        _find_references_handler({"device_id": 1, "role": "acts_on"}, reader)
+        _find_references_handler({"device_id": 1, "role": "acts_on"}, reader, mock_indigo)
 
 
 # ---------------------------------------------------------------------
@@ -243,8 +243,44 @@ def test_find_references_rejects_unknown_args(reader):
 # list, and id-shaped values that are NOT device references.
 PROPS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
 <Database type="dict">
-  <TDTriggerList type="vector" />
-  <TriggerList type="vector" />
+  <TDTriggerList type="vector">
+    <TDTrigger type="dict">
+      <ActionGroup type="dict">
+        <ActionSteps type="vector">
+          <Action type="dict">
+            <Class type="integer">999</Class>
+            <MetaProps type="dict">
+              <com.flyingdiver.indigoplugin.shellymqtt type="dict">
+                <device-id type="integer">80123456</device-id>
+              </com.flyingdiver.indigoplugin.shellymqtt>
+            </MetaProps>
+            <PluginID type="string">com.flyingdiver.indigoplugin.shellymqtt</PluginID>
+          </Action>
+        </ActionSteps>
+      </ActionGroup>
+      <ID type="integer">800</ID>
+      <Name type="string">Props Schedule</Name>
+    </TDTrigger>
+  </TDTriggerList>
+  <TriggerList type="vector">
+    <Trigger type="dict">
+      <ActionGroup type="dict">
+        <ActionSteps type="vector">
+          <Action type="dict">
+            <Class type="integer">999</Class>
+            <MetaProps type="dict">
+              <com.example.denon type="dict">
+                <device type="string">81123456</device>
+              </com.example.denon>
+            </MetaProps>
+            <PluginID type="string">com.example.denon</PluginID>
+          </Action>
+        </ActionSteps>
+      </ActionGroup>
+      <ID type="integer">801</ID>
+      <Name type="string">Props Trigger</Name>
+    </Trigger>
+  </TriggerList>
   <ActionGroupList type="vector">
     <ActionGroup type="dict">
       <ActionSteps type="vector">
@@ -322,6 +358,39 @@ PROPS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
       <ID type="integer">703</ID>
       <Name type="string">Nested Props</Name>
     </ActionGroup>
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">999</Class>
+          <MetaProps type="dict">
+            <com.example.lookalikes type="dict">
+              <isOn type="bool">true</isOn>
+              <brightness type="real">111.0</brightness>
+              <sensorList type="string">1465867145, 90123456 ,222</sensorList>
+            </com.example.lookalikes>
+          </MetaProps>
+          <PluginID type="string">com.example.lookalikes</PluginID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">704</ID>
+      <Name type="string">Numeric Lookalikes</Name>
+    </ActionGroup>
+    <ActionGroup type="dict">
+      <ActionSteps type="vector">
+        <Action type="dict">
+          <Class type="integer">999</Class>
+          <MetaProps type="dict">
+            <com.example.twokeys type="dict">
+              <zTarget type="integer">85123456</zTarget>
+              <aTarget type="integer">85123456</aTarget>
+            </com.example.twokeys>
+          </MetaProps>
+          <PluginID type="string">com.example.twokeys</PluginID>
+        </Action>
+      </ActionSteps>
+      <ID type="integer">705</ID>
+      <Name type="string">Two Keys</Name>
+    </ActionGroup>
   </ActionGroupList>
 </Database>
 """
@@ -330,7 +399,12 @@ PROPS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
 # absentees are load-bearing: 8888888 is a control page, 222 and
 # 1465867145 are ids of nothing, and 555 exists only as a variable.
 _PROPS_DEVICES = {
+    1: "Low Id Device",
     111: "Kitchen Light",
+    80123456: "Schedule Target",
+    81123456: "Trigger Target",
+    85123456: "Two Keys Target",
+    90123456: "Spaced List Device",
     51886070: "Kitchen CCT Spots",
     735515977: "Hall Motion",
     60123456: "Nested Dimmer",
@@ -357,11 +431,11 @@ def props_reader(tmp_path, mock_indigo):
     return IndiDbReader(indigo_module=mock_indigo)
 
 
-def test_find_references_props_only_device_is_found(props_reader):
+def test_find_references_props_only_device_is_found(props_reader, mock_indigo):
     # The whole point of #59: this device has no sibling <DeviceID>
     # anywhere, so the pre-#59 index returned zero references for a
     # device an action group genuinely drives.
-    out = _find_references_handler({"device_id": 51886070}, props_reader)
+    out = _find_references_handler({"device_id": 51886070}, props_reader, mock_indigo)
     assert out["total_count"] == 1
     ref = out["references"][0]
     assert (ref["automation_type"], ref["id"]) == ("action_group", 700)
@@ -370,16 +444,18 @@ def test_find_references_props_only_device_is_found(props_reader):
     assert ref["matched_props"] == ["dimmer_device_id"]
 
 
-def test_find_references_both_roles_reported_once(props_reader):
-    out = _find_references_handler({"device_id": 111}, props_reader)
+def test_find_references_both_roles_reported_once(props_reader, mock_indigo):
+    out = _find_references_handler({"device_id": 111}, props_reader, mock_indigo)
     assert out["total_count"] == 1        # one entry, not one per step
     ref = out["references"][0]
     assert ref["roles"] == ["acts_on", "acts_on_via_props"]
     assert ref["matched_props"] == ["device-id"]
 
 
-def test_find_references_comma_separated_prop_matches_each_id(props_reader):
-    out = _find_references_handler({"device_id": 735515977}, props_reader)
+def test_find_references_comma_separated_prop_matches_each_id(
+    props_reader, mock_indigo,
+):
+    out = _find_references_handler({"device_id": 735515977}, props_reader, mock_indigo)
     assert out["total_count"] == 1
     ref = out["references"][0]
     assert (ref["automation_type"], ref["id"]) == ("action_group", 702)
@@ -387,21 +463,21 @@ def test_find_references_comma_separated_prop_matches_each_id(props_reader):
     assert ref["matched_props"] == ["sensorDevices"]
 
 
-def test_find_references_id_shaped_non_device_prop_ignored(props_reader):
+def test_find_references_id_shaped_non_device_prop_ignored(props_reader, mock_indigo):
     # 8888888 is a control page id sitting in `deepLinkPageId`. It is
     # id-shaped but not a device, so it must not resolve to one.
-    out = _find_references_handler({"device_id": 8888888}, props_reader)
+    out = _find_references_handler({"device_id": 8888888}, props_reader, mock_indigo)
     assert out["references"] == []
     assert out["name"] is None
 
 
 def test_find_references_variable_prop_matches_only_variable_query(
-    props_reader,
+    props_reader, mock_indigo,
 ):
     # The same prop value under both queries: 555 is a variable, so a
     # variable_id query finds it and a device_id query must not.
     as_variable = _find_references_handler(
-        {"variable_id": 555}, props_reader
+        {"variable_id": 555}, props_reader, mock_indigo
     )
     assert as_variable["total_count"] == 1
     ref = as_variable["references"][0]
@@ -409,27 +485,125 @@ def test_find_references_variable_prop_matches_only_variable_query(
     assert ref["roles"] == ["acts_on_via_props"]
     assert ref["matched_props"] == ["variable"]
 
-    as_device = _find_references_handler({"device_id": 555}, props_reader)
+    as_device = _find_references_handler({"device_id": 555}, props_reader, mock_indigo)
     assert as_device["references"] == []
 
 
-def test_find_references_walks_nested_dict_and_vector_props(props_reader):
-    nested = _find_references_handler({"device_id": 60123456}, props_reader)
+def test_find_references_walks_nested_dict_and_vector_props(props_reader, mock_indigo):
+    nested = _find_references_handler({"device_id": 60123456}, props_reader, mock_indigo)
     assert nested["references"][0]["matched_props"] == ["zones.primary"]
 
-    vector = _find_references_handler({"device_id": 70123456}, props_reader)
+    vector = _find_references_handler({"device_id": 70123456}, props_reader, mock_indigo)
     assert vector["references"][0]["matched_props"] == ["extras[1]"]
 
 
 def test_find_references_unresolvable_id_skips_props_inference(
-    props_reader,
+    props_reader, mock_indigo,
 ):
     # 222 sits in the comma-separated sensor list but resolves to no
     # live device, so it could equally be a level or a delay. Better
     # no answer than an invented one.
-    out = _find_references_handler({"device_id": 222}, props_reader)
+    out = _find_references_handler(
+        {"device_id": 222}, props_reader, mock_indigo
+    )
     assert out["references"] == []
     assert out["name"] is None
+
+
+def test_find_references_props_matched_on_schedules_and_triggers(
+    props_reader, mock_indigo,
+):
+    # Triggers and schedules carry their own inline plugin steps, so
+    # props matching must not be an action-group-only capability.
+    sched = _find_references_handler(
+        {"device_id": 80123456}, props_reader, mock_indigo
+    )
+    assert [(r["automation_type"], r["id"], r["roles"])
+            for r in sched["references"]] == [
+        ("schedule", 800, ["acts_on_via_props"])]
+
+    trig = _find_references_handler(
+        {"device_id": 81123456}, props_reader, mock_indigo
+    )
+    assert [(r["automation_type"], r["id"], r["roles"])
+            for r in trig["references"]] == [
+        ("trigger", 801, ["acts_on_via_props"])]
+
+
+def test_find_references_boolean_prop_never_matches(
+    props_reader, mock_indigo,
+):
+    # `isinstance(True, int)` is True in Python, so a bool prop would
+    # match device id 1 if the bool guard were ever dropped.
+    out = _find_references_handler({"device_id": 1}, props_reader, mock_indigo)
+    assert out["name"] == "Low Id Device"   # the id DOES resolve...
+    assert out["references"] == []          # ...so this is a real zero
+    assert "props_inference" not in out
+
+
+def test_find_references_float_prop_never_matches(
+    props_reader, mock_indigo,
+):
+    # `brightness: 111.0` sits in action group 704 and equals device
+    # 111 numerically. A real is a level or a setpoint, never an id.
+    out = _find_references_handler(
+        {"device_id": 111}, props_reader, mock_indigo
+    )
+    assert [r["id"] for r in out["references"]] == [701]
+
+
+def test_find_references_comma_list_tolerates_whitespace(
+    props_reader, mock_indigo,
+):
+    # Live props carry `"1465867145, 90123456 ,222"` — the ids are not
+    # reliably flush against the separators.
+    out = _find_references_handler(
+        {"device_id": 90123456}, props_reader, mock_indigo
+    )
+    assert [r["id"] for r in out["references"]] == [704]
+    assert out["references"][0]["matched_props"] == ["sensorList"]
+
+
+def test_find_references_matched_props_is_sorted_and_deduped(
+    props_reader, mock_indigo,
+):
+    # Two keys in one step name the same device, declared z-before-a
+    # in the fixture: one reference, both keys, alphabetical.
+    out = _find_references_handler(
+        {"device_id": 85123456}, props_reader, mock_indigo
+    )
+    assert out["total_count"] == 1
+    assert out["references"][0]["matched_props"] == ["aTarget", "zTarget"]
+
+
+def test_find_references_absent_id_says_inference_was_skipped(
+    props_reader, mock_indigo,
+):
+    # A zero here means "not checked", not "checked and clear", and
+    # the response has to say which.
+    out = _find_references_handler(
+        {"device_id": 222}, props_reader, mock_indigo
+    )
+    assert out["references"] == []
+    assert "skipped" in out["props_inference"]
+
+
+def test_find_references_failed_lookup_is_not_a_confident_zero(
+    props_reader, mock_indigo,
+):
+    # The regression this guards: resolve_name degrades to None for a
+    # FAILED lookup exactly as it does for a missing object. Gating
+    # props inference on that alone would turn a transient IOM problem
+    # into a silent "nothing drives this device" — on the tool people
+    # ask before deleting things. Device 51886070 is driven solely via
+    # props, so this is the case that would break.
+    mock_indigo.devices.__getitem__.side_effect = RuntimeError("IOM busy")
+    out = _find_references_handler(
+        {"device_id": 51886070}, props_reader, mock_indigo
+    )
+    assert out["references"] == []
+    assert "NOT CHECKED" in out["props_inference"]
+    assert "get_automation_contents" in out["props_inference"]
 
 
 # ---------------------------------------------------------------------
@@ -501,7 +675,7 @@ def test_skipped_automations_surfaced_in_all_three_tools(
     )
     assert contents["skipped_automations"] == 1
 
-    refs = _find_references_handler({"device_id": 111}, reader)
+    refs = _find_references_handler({"device_id": 111}, reader, mock_indigo)
     assert refs["skipped_automations"] == 1
     assert refs["total_count"] == 1  # the good group still resolves
 

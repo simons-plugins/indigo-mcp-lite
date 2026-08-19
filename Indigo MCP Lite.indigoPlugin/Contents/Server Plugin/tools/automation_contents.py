@@ -37,6 +37,23 @@ _KIND_LABELS = {
     "action_group": "action group",
 }
 
+# Why an acts_on_via_props pass did not run. Present in the response
+# only when it was skipped, so a zero-reference answer can never be
+# mistaken for a checked-and-clear one.
+_PROPS_INFERENCE_NOTES = {
+    "absent": (
+        "skipped: no live object with this id, so a matching prop "
+        "value could equally be an ordinary parameter (a level, a "
+        "delay). Declared references above are unaffected."
+    ),
+    "unavailable": (
+        "NOT CHECKED: the live-object lookup failed, so plugin action "
+        "parameters were never searched and this result may be "
+        "incomplete. Retry, or read `props` on plugin steps via "
+        "get_automation_contents before concluding nothing uses this."
+    ),
+}
+
 
 def register(handler, *, indigo_module, indidb_reader=None, logger=None, **_):
     """Register the automation-contents tools onto the given MCPHandler.
@@ -92,27 +109,30 @@ def register(handler, *, indigo_module, indidb_reader=None, logger=None, **_):
         name="find_automation_references",
         description=(
             "Reverse index over all schedules/triggers/action groups: "
-            "which automations reference a device or variable, and in "
-            "what role — acts_on (in an action step), condition (in "
-            "the condition tree), watches (a trigger fires on it). "
-            "acts_on covers DIRECT references only: a schedule that "
-            "runs an action group which acts on the device is "
-            "reported via the action group, not the schedule — "
-            "follow execute-action-group results (via "
-            "get_automation_contents) to trace indirect chains. "
-            "acts_on_via_props is that same relationship INFERRED "
-            "rather than declared: a plugin action step naming its "
-            "target only inside its own parameters (`device-id`, "
-            "`dimmer_device_id`, or a comma-separated list) instead "
-            "of a device field. `matched_props` names the parameters "
-            "that matched, so the inference is auditable. Indigo's "
-            "own dependency check (get_dependencies) does NOT see "
-            "these, so it can report zero dependents for a device "
-            "that several action groups genuinely drive — this tool "
-            "is the one that sees them. "
-            "Pass exactly one of device_id or variable_id. Use before "
-            "renaming/removing anything, or to answer 'what turns "
-            "this on?'."
+            "which automations reference a device or variable. ONE "
+            "call is the whole answer — `references` lists EVERY "
+            "automation that touches it and `roles` says how, so do "
+            "not filter to a single role or call another tool to "
+            "complete the picture. Roles: acts_on (a declared action "
+            "step), acts_on_via_props (a plugin action step naming it "
+            "only inside its own parameters — `device-id`, "
+            "`dimmer_device_id`, a comma-separated list — with "
+            "`matched_props` naming the parameters that matched, so "
+            "the inference is auditable), condition (in the condition "
+            "tree), watches (a trigger fires on it). Both acts_on "
+            "roles cover DIRECT references only: a schedule that runs "
+            "an action group which acts on the device is reported via "
+            "the action group, not the schedule — follow "
+            "execute-action-group results (via get_automation_contents) "
+            "to trace indirect chains. Indigo's own dependency check "
+            "(get_dependencies) does NOT see the props case, so it "
+            "can report zero dependents for a device that several "
+            "action groups genuinely drive; this tool does see them. "
+            "If a `props_inference` field is present, that pass did "
+            "NOT run — a zero result is then not a clear answer, and "
+            "the field says what to do about it. Pass exactly one of "
+            "device_id or variable_id. Use before renaming/removing "
+            "anything, or to answer 'what turns this on?'."
         ),
         input_schema={
             "type": "object",
@@ -121,7 +141,9 @@ def register(handler, *, indigo_module, indidb_reader=None, logger=None, **_):
                 "variable_id": {"type": "integer"},
             },
         },
-        handler=lambda **args: _find_references_handler(args, indidb_reader),
+        handler=lambda **args: _find_references_handler(
+            args, indidb_reader, indigo_module
+        ),
     )
     handler.register_tool(
         name="list_automation_scripts",
@@ -316,6 +338,58 @@ def _step_prop_references(step, entity_id):
     return matches
 
 
+def _entity_presence(indigo_module, collection_attr, entity_id):
+    """Whether ``entity_id`` names a live object: present / absent /
+    unavailable.
+
+    ``IndiDbReader.resolve_name`` deliberately collapses both failures
+    into ``None`` — right for a display label, wrong here. Props
+    matching is gated on this answer, so "there is no such device" and
+    "the lookup itself failed" must not look alike: the first is a
+    real answer, the second means the props pass never ran and the
+    result may be incomplete.
+    """
+    collection = getattr(indigo_module, collection_attr, None)
+    if collection is None:
+        return "unavailable"
+    try:
+        collection[entity_id]
+    except (KeyError, IndexError, ValueError, TypeError):
+        return "absent"
+    except Exception:
+        return "unavailable"
+    return "present"
+
+
+def _reference_entry(record, kind, key, entity_id, match_props):
+    """One ``references`` entry for ``record``, or None if it doesn't
+    reference the entity at all."""
+    roles = []
+    matched_props = set()
+    if any(_step_references(s, key, entity_id) for s in record["steps"]):
+        roles.append("acts_on")
+    if match_props:
+        for step in record["steps"]:
+            matched_props.update(_step_prop_references(step, entity_id))
+    if matched_props:
+        roles.append("acts_on_via_props")
+    if _condition_references(record.get("conditions"), key, entity_id):
+        roles.append("condition")
+    if kind == "trigger" and record.get("watch", {}).get(key) == entity_id:
+        roles.append("watches")
+    if not roles:
+        return None
+    entry = {
+        "automation_type": kind,
+        "id": record["id"],
+        "name": record["name"],
+        "roles": roles,
+    }
+    if matched_props:
+        entry["matched_props"] = sorted(matched_props)
+    return entry
+
+
 def _condition_references(node, key, entity_id):
     if node is None:
         return False
@@ -326,7 +400,7 @@ def _condition_references(node, key, entity_id):
     return node.get(key) == entity_id
 
 
-def _find_references_handler(args, reader):
+def _find_references_handler(args, reader, indigo_module):
     _reject_unknown_args(args, ("device_id", "variable_id"))
     supplied = [k for k in ("device_id", "variable_id") if k in args]
     if len(supplied) != 1:
@@ -336,56 +410,35 @@ def _find_references_handler(args, reader):
     key = supplied[0]
     entity_id = _require_int_id(args, key)
     collection = "devices" if key == "device_id" else "variables"
-    name = reader.resolve_name(collection, entity_id)
     # Props matching is INFERRED from raw parameter values rather than
-    # read from a declared field, so it is gated on the id resolving
-    # to a live object of the requested kind. Indigo ids are globally
-    # unique across every object type (live census: 2031 ids, zero
-    # collisions), so a prop value equal to a real device id IS that
-    # device whatever the key is called — which is what makes
-    # value-matching safe without a per-plugin key allowlist. An id
-    # that resolves to nothing has no such guarantee: it could collide
+    # read from a declared field, so it is gated on the id naming a
+    # live object of the requested kind. Indigo ids are globally
+    # unique across every object type, so a prop value equal to a real
+    # device id IS that device whatever the key is called — which is
+    # what makes value-matching safe without a per-plugin allowlist.
+    # An id that names nothing has no such guarantee: it could collide
     # with an ordinary numeric parameter (a level, a delay), and
     # inventing references for it is worse than reporting none.
-    match_props = name is not None
+    presence = _entity_presence(indigo_module, collection, entity_id)
     data = reader.automations()
     references = []
     for kind in ("schedule", "trigger", "action_group"):
         for record in data[kind].values():
-            roles = []
-            matched_props = set()
-            if any(_step_references(s, key, entity_id)
-                   for s in record["steps"]):
-                roles.append("acts_on")
-            if match_props:
-                for step in record["steps"]:
-                    matched_props.update(
-                        _step_prop_references(step, entity_id)
-                    )
-            if matched_props:
-                roles.append("acts_on_via_props")
-            if _condition_references(record.get("conditions"),
-                                     key, entity_id):
-                roles.append("condition")
-            if kind == "trigger" and \
-                    record.get("watch", {}).get(key) == entity_id:
-                roles.append("watches")
-            if roles:
-                reference = {
-                    "automation_type": kind,
-                    "id": record["id"],
-                    "name": record["name"],
-                    "roles": roles,
-                }
-                if matched_props:
-                    reference["matched_props"] = sorted(matched_props)
-                references.append(reference)
-    return _with_skip_count({
+            entry = _reference_entry(
+                record, kind, key, entity_id, presence == "present",
+            )
+            if entry is not None:
+                references.append(entry)
+    out = {
         key: entity_id,
-        "name": name,
+        "name": reader.resolve_name(collection, entity_id),
         "references": references,
         "total_count": len(references),
-    }, data)
+    }
+    # Never let a skipped inference pass read as a confident zero.
+    if presence != "present":
+        out["props_inference"] = _PROPS_INFERENCE_NOTES[presence]
+    return _with_skip_count(out, data)
 
 
 # ---------------------------------------------------------------------
