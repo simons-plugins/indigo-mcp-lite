@@ -44,8 +44,9 @@ Three answers that look complete but are not:
 3. get_dependencies wraps Indigo's own dependency check, which does NOT
    see devices referenced from inside a plugin action's parameters. It
    can report zero dependents for a device that several action groups
-   genuinely drive. Before concluding nothing uses something, also read
-   get_automation_contents `props` on the plugin steps involved.
+   genuinely drive. find_automation_references DOES see those and
+   reports them as `acts_on_via_props`; ask it before concluding
+   nothing uses a device.
 
 A plugin action step's target device is sometimes only inside its
 `props` (e.g. `dimmer_device_id`), never in `device_id`. Likewise a
