@@ -6,7 +6,7 @@ database file. This module streams that file (~9MB on jarvis) with
 ``xml.etree.ElementTree.iterparse`` and decodes the three automation
 element types into plain dicts:
 
-- ``TDTrigger``  → schedules (time/date triggers)
+- ``TDTrigger``  → schedules (time/date triggers, incl. firing rule)
 - ``Trigger``    → event triggers
 - ``ActionGroup``→ action groups
 
@@ -99,6 +99,34 @@ _COMPARATOR_LABELS = {
 # ConditionList Logic codes (per recon: 1=all, 0=any).
 _LOGIC_LABELS = {0: "any", 1: "all"}
 
+# Condition ``Type`` is a global condition-kind enum, not a per-family
+# one: a live-DB census found each code with exactly one child set
+# (0 bare, 1/2 bare, 3 variable, 5 time/date, 7 device state, 100
+# nested list). Codes 1 and 2 are the "is it dark/light outside"
+# conditions — they carry no fields at all, so the mapping was
+# confirmed by name agreement across the whole DB (19/19 Type 1 named
+# dark/night/evening, 7/7 Type 2 named daytime/daylight). Raw code
+# always ships alongside.
+_SUN_STATE_LABELS = {1: "dark", 2: "daylight"}
+
+# TDTrigger ``TimeType`` — indigo.kTimeType, cross-checked against the
+# live IOM's schedule.timeType for the same records.
+_TIME_TYPE_LABELS = {
+    0: "absolute", 1: "sunrise", 2: "sunset", 3: "countdown",
+}
+
+# TDTrigger ``DateType``. Only the two codes seen live are labelled:
+# 0 pairs with RepeatInterval (every N days), 1 with DayFlag (specific
+# weekdays). indigo.kDateType names two more; they stay numeric rather
+# than guessed.
+_DATE_TYPE_LABELS = {0: "days_interval", 1: "days_of_week"}
+
+# DayFlag bitmask, bit 0 = Sunday. Verified against nextExecution on
+# three schedules (Fri-only=32, Mon-only=2, Sat+Sun=65).
+_WEEKDAY_NAMES = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+
+_SECONDS_PER_DAY = 86400
+
 
 class _AnomalyCounter:
     """Counts + logs degraded-parse events (skipped automations,
@@ -147,6 +175,51 @@ def _bool(el, tag):
     return raw.strip().lower() == "true"
 
 
+def _typed_value(el):
+    """Decode one Indigo typed-XML element into a plain JSON value.
+
+    Every value in the DB carries a ``type`` attribute; containers
+    (``dict``/``vector``) recurse. An unparseable number degrades to
+    its raw text rather than vanishing — the same "preserve, never
+    guess" rule the code maps follow.
+    """
+    kind = el.get("type")
+    if kind == "dict":
+        return {child.tag: _typed_value(child) for child in el}
+    if kind == "vector":
+        return [_typed_value(child) for child in el]
+    raw = el.text or ""
+    if kind == "bool":
+        return raw.strip().lower() == "true"
+    if kind in ("integer", "real"):
+        try:
+            return int(raw) if kind == "integer" else float(raw)
+        except ValueError:
+            return raw
+    return raw
+
+
+def _plugin_action_props(action_el, plugin_id):
+    """A plugin step's own parameters, from ``MetaProps[PluginID]``.
+
+    MetaProps is keyed by plugin id and a live census found every
+    class-999 step with props holding exactly one key — its own
+    PluginID — so the step's parameters are always at that key. The
+    dict passes through verbatim: no per-plugin knowledge, and the
+    step's target device is sometimes only in here (zigbee2mqtt's
+    ``dimmer_device_id``) rather than in the sibling ``<DeviceID>``.
+    """
+    if not plugin_id:
+        return None
+    meta_el = action_el.find("MetaProps")
+    if meta_el is None:
+        return None
+    for child in meta_el:
+        if child.tag == plugin_id:
+            return _typed_value(child)
+    return None
+
+
 def _parse_action(action_el, anomalies):
     """Decode one ``Action`` element into a step dict, or None to skip.
 
@@ -168,6 +241,9 @@ def _parse_action(action_el, anomalies):
         device_id = _int(action_el, "DeviceID", anomalies)
         if device_id is not None:
             step["device_id"] = device_id
+        props = _plugin_action_props(action_el, step["plugin_id"])
+        if props is not None:
+            step["props"] = props
         return step
     if cls in (_CLASS_DEVICE, _CLASS_DEVICE_UNIVERSAL):
         code = _int(action_el, "DeviceAction", anomalies)
@@ -305,6 +381,12 @@ def _parse_condition_leaf(cond_el, anomalies):
             "operator_code": _int(cond_el, "TimeDateCompareOperator",
                                   anomalies),
         }
+    if type_code in _SUN_STATE_LABELS:
+        return {
+            "type": "sun",
+            "type_code": type_code,
+            "state": _SUN_STATE_LABELS[type_code],
+        }
     if not type_code:
         return None  # Type 0 placeholder — no condition
     return {"type": "unknown", "type_code": type_code}
@@ -374,6 +456,68 @@ def _parse_trigger_watch(trigger_el, anomalies):
     return watch
 
 
+def _clock(seconds):
+    """Seconds past midnight → ``HH:MM:SS``, or None if out of range.
+
+    Sun-relative schedules park a 4294967295 sentinel in ``Time``;
+    anything outside a single day is that sentinel or corruption and
+    must not be formatted into a plausible-looking clock time.
+    """
+    if seconds is None or not 0 <= seconds < _SECONDS_PER_DAY:
+        return None
+    return (f"{seconds // 3600:02d}:"
+            f"{seconds % 3600 // 60:02d}:"
+            f"{seconds % 60:02d}")
+
+
+def _parse_schedule_timing(el, anomalies):
+    """When a schedule fires — the rule, not just the next timestamp.
+
+    ``list_schedules``/``get_schedule_by_id`` report ``nextExecution``,
+    a single timestamp that cannot distinguish an absolute 06:00
+    schedule from one tracking sunrise. The rule lives in four
+    TDTrigger fields: TimeType (absolute/sunrise/sunset/countdown),
+    Time (seconds past midnight, absolute only), SunDelta (offset from
+    sunrise/sunset), Countdown (repeat interval), plus the day rule in
+    DateType + DayFlag/RepeatInterval.
+    """
+    time_type = _int(el, "TimeType", anomalies)
+    timing = {
+        "time_type": _TIME_TYPE_LABELS.get(time_type),
+        "time_type_code": time_type,
+    }
+    if time_type == 0:
+        seconds = _int(el, "Time", anomalies)
+        clock = _clock(seconds)
+        if clock is not None:
+            timing["time"] = clock
+            timing["time_seconds"] = seconds
+    elif time_type in (1, 2):
+        timing["sun_offset_seconds"] = _int(el, "SunDelta", anomalies) or 0
+    elif time_type == 3:
+        interval = _int(el, "Countdown", anomalies)
+        if interval is not None:
+            timing["interval_seconds"] = interval
+    randomize = _int(el, "RandomizeAmount", anomalies)
+    if randomize:
+        timing["randomize_seconds"] = randomize
+    date_type = _int(el, "DateType", anomalies)
+    timing["date_type"] = _DATE_TYPE_LABELS.get(date_type)
+    timing["date_type_code"] = date_type
+    if date_type == 1:
+        flags = _int(el, "DayFlag", anomalies)
+        if flags is not None:
+            timing["days_of_week"] = [
+                name for bit, name in enumerate(_WEEKDAY_NAMES)
+                if flags >> bit & 1
+            ]
+    elif date_type == 0:
+        days = _int(el, "RepeatInterval", anomalies)
+        if days is not None:
+            timing["repeat_interval_days"] = days
+    return timing
+
+
 def _parse_automation(tag, el, anomalies):
     """One top-level TDTrigger/Trigger/ActionGroup element → record.
 
@@ -407,6 +551,8 @@ def _parse_automation(tag, el, anomalies):
         record["conditions"] = None
     if tag == "Trigger":
         record["watch"] = _parse_trigger_watch(el, anomalies)
+    elif tag == "TDTrigger":
+        record["schedule"] = _parse_schedule_timing(el, anomalies)
     return record
 
 

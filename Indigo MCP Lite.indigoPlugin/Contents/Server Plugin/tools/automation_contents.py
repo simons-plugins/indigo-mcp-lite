@@ -12,6 +12,10 @@ steps, condition trees, and embedded scripts:
 - ``list_automation_scripts``      — every embedded script in the DB
   with its owner (audit surface)
 
+For schedules the decoded record also carries a ``schedule`` block —
+the firing *rule* (absolute/sunrise/sunset/countdown + day rule), not
+just the next timestamp the IOM reports.
+
 The reader is created at registration but does no I/O until the first
 tool call; parse results are cached on (path, mtime, size) inside the
 reader. All failure modes (path unavailable, unreadable file,
@@ -59,8 +63,17 @@ def register(handler, *, indigo_module, indidb_reader=None, logger=None, **_):
             "and its condition tree, read from the Indigo database "
             "file. entity_type is schedule, trigger, or action_group. "
             "Execute-action-group steps are expanded one level. "
-            "Complements get_trigger_by_id / get_schedule_by_id / "
-            "get_action_group_by_id, which only return metadata."
+            "Plugin-action steps carry their parameters in `props` — "
+            "and note a plugin step's target device is sometimes only "
+            "in there (e.g. `dimmer_device_id`), so a missing "
+            "device_id does NOT mean the step is device-less. For a "
+            "schedule, `schedule` gives WHEN it fires (absolute time / "
+            "sunrise / sunset + offset / countdown interval, plus the "
+            "day rule) — the rule itself, which the single "
+            "next_execution timestamp on get_schedule_by_id cannot "
+            "convey. Complements get_trigger_by_id / "
+            "get_schedule_by_id / get_action_group_by_id, which only "
+            "return metadata."
         ),
         input_schema={
             "type": "object",
@@ -87,6 +100,12 @@ def register(handler, *, indigo_module, indidb_reader=None, logger=None, **_):
             "reported via the action group, not the schedule — "
             "follow execute-action-group results (via "
             "get_automation_contents) to trace indirect chains. "
+            "One known blind spot: a plugin action step that names "
+            "its target device only inside its own props (e.g. "
+            "`dimmer_device_id`) is NOT indexed, so a device that is "
+            "only ever driven that way can come back with zero "
+            "references — check get_automation_contents props before "
+            "concluding nothing touches it. "
             "Pass exactly one of device_id or variable_id. Use before "
             "renaming/removing anything, or to answer 'what turns "
             "this on?'."
@@ -201,6 +220,8 @@ def _get_contents_handler(args, reader):
         out["enabled"] = record["enabled"]
     if "watch" in record:
         out["watch"] = _annotate_watch(record["watch"], reader)
+    if "schedule" in record:
+        out["schedule"] = record["schedule"]
     return _with_skip_count(out, data)
 
 
