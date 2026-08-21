@@ -380,6 +380,58 @@ def test_set_level_restart_failure_fails_the_call(mock_indigo, tmp_path):
     assert kitchen["device_period_map"]["144694384"]["8"] == 77
 
 
+def test_set_level_skips_restart_when_plugin_disabled(mock_indigo, tmp_path):
+    """plugin.restart()'s behaviour on a disabled plugin is
+    undocumented -- treat it as unsafe rather than assume it raises.
+    isEnabled() must be checked BEFORE restart is even attempted, and
+    the write that already landed must stay on disk."""
+    from tools.auto_lights import _set_level_handler
+
+    config_path = _write_config(mock_indigo, tmp_path, _sample_config())
+    plugin = _fake_plugin(enabled=False)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="disabled"):
+        _set_level_handler(
+            {"zone": "Kitchen", "period": 8, "device": 144694384, "level": 33},
+            mock_indigo,
+        )
+
+    plugin.restart.assert_not_called()
+    written = json.loads(config_path.read_text())
+    kitchen = next(z for z in written["zones"] if z["name"] == "Kitchen")
+    assert kitchen["device_period_map"]["144694384"]["8"] == 33
+
+
+def test_set_level_backup_write_failure_raises_and_touches_nothing(
+    mock_indigo, tmp_path, monkeypatch
+):
+    """A permissions/disk-full failure writing the backup must raise
+    the module's own friendly ValueError, not a raw OSError, and must
+    leave the live config untouched and never reach the restart."""
+    import tools.auto_lights as auto_lights_module
+
+    config_path = _write_config(mock_indigo, tmp_path, _sample_config())
+    original_bytes = config_path.read_bytes()
+    real_open = open
+
+    def fake_open(file, *args, **kwargs):
+        if ".pre-auto_lights_set_level-" in str(file):
+            raise OSError("disk full")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(auto_lights_module, "open", fake_open, raising=False)
+
+    with pytest.raises(ValueError, match="backup"):
+        auto_lights_module._set_level_handler(
+            {"zone": "Kitchen", "period": 3, "device": 1256902399, "level": 40},
+            mock_indigo,
+        )
+
+    assert config_path.read_bytes() == original_bytes
+    mock_indigo.server.getPlugin.assert_not_called()
+
+
 # ---------------------------------------------------------------------
 # auto_lights_set_level — mtime-moved refusal
 # ---------------------------------------------------------------------

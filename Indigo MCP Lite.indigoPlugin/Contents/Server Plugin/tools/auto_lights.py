@@ -32,6 +32,11 @@ the running plugin actually changed:
   name — they just silently do nothing. So both callers validate the
   zone against the config file themselves before calling, which is
   the only thing standing between "no such zone" and a quiet no-op.
+  One gap this validation cannot close: a half-initialised Auto
+  Lights (its own agent never finished starting) still reports
+  ``isEnabled() == True`` and silently no-ops enable_zone/disable_zone
+  — see ``_execute_autolights_action``'s docstring for the detail and
+  why ``reset_locks`` is not affected the same way.
 
 Deliberately no ``jsonschema`` dependency, matching this plugin's
 stdlib-only design (see workspace ADR-0003) and Auto Lights' own
@@ -51,11 +56,16 @@ from tools.lookup import _reject_unknown_args, _require_int_id
 
 AUTOLIGHTS_PLUGIN_ID = "com.vtmikel.autolights"
 
-# _init_config_and_agent (plugin.py) reloads the whole config on every
-# restart and logs "Configuration reloaded ... all locks and zone state
-# has been reset" — the restart set_level requires is not free. Surfaced
-# both in the tool description and in the success payload so a caller
-# (often a model relaying to a human) can say so.
+# plugin.restart() starts a fresh Auto Lights process, which silently
+# reloads the whole config and rebuilds the in-memory agent (zone
+# locks, timers, failure suppression) from scratch -- there is no log
+# line confirming this for a process restart (the "Configuration
+# reloaded ..." message in _init_config_and_agent is gated on a
+# same-process web-editor reload and does not fire here). So the
+# restart set_level requires is not free: it resets state for every
+# zone, not just the one this call touched. Surfaced both in the tool
+# description and in the success payload so a caller (often a model
+# relaying to a human) can say so.
 _RESTART_SIDE_EFFECTS = [
     "zone locks and in-memory zone state (timers, failure suppression) "
     "were reset by the required Auto Lights plugin restart",
@@ -161,8 +171,10 @@ def _require_str(args, key):
 def _validate_level(raw):
     """1-100 int, or bool. ``bool`` MUST be checked before the int
     range check — ``bool`` is a subclass of ``int`` in Python, so
-    ``level=True`` would otherwise read as brightness 1. This has
-    bitten the sibling repo twice."""
+    ``level=True`` would otherwise read as brightness 1. This exact
+    footgun (an unguarded ``isinstance(x, int)`` silently matching a
+    bool) recurs across the workspace; treat it as a standing risk,
+    not a one-off."""
     if raw is None:
         raise ValueError("level is required: an int 1-100, true, or false")
     if isinstance(raw, bool):
@@ -243,6 +255,22 @@ def _execute_autolights_action(indigo_module, action_id, props=None):
     the same principle ``auto_lights_set_level`` applies to its
     restart. Any other failure (plugin not installed, action itself
     raising) is likewise mapped to a friendly ``ValueError``.
+
+    KNOWN GAP, not fixed here on purpose: ``isEnabled()`` reflects
+    process state, not Auto Lights' own agent readiness. If its
+    ``_init_config_and_agent`` failed at startup, ``self._agent`` stays
+    ``None`` forever while Indigo still reports the plugin enabled.
+    Auto Lights' ``change_zones_enabled`` (which backs both
+    ``enable_zone`` and ``disable_zone``) returns immediately when
+    ``self._agent is None`` — a silent no-op this module cannot see,
+    since the config carries no zone-device id to probe and inventing
+    that lookup is out of scope for this tool. So
+    ``auto_lights_set_zone_enabled`` can report success having changed
+    nothing. ``auto_lights_reset_locks`` is NOT affected: its
+    ``reset_zone_lock``/``reset_all_locks`` callbacks call
+    ``self._agent.reset_locks(...)`` unguarded, so a ``None`` agent
+    raises an ``AttributeError`` that ``executeAction`` propagates back
+    here and this module surfaces correctly as a failed call.
     """
     try:
         plugin = indigo_module.server.getPlugin(AUTOLIGHTS_PLUGIN_ID)
@@ -254,6 +282,11 @@ def _execute_autolights_action(indigo_module, action_id, props=None):
         ) from exc
 
     if not plugin.isEnabled():
+        # This only catches "process disabled/stopped". A
+        # half-initialised Auto Lights (agent is None) still reports
+        # isEnabled() == True -- see the KNOWN GAP note above. That
+        # case silently no-ops enable_zone/disable_zone but does NOT
+        # affect reset_all_locks/reset_zone_locks, which raise instead.
         raise ValueError(
             f"Auto Lights plugin ({AUTOLIGHTS_PLUGIN_ID}) is installed "
             f"but not enabled/running; action {action_id!r} was NOT "
@@ -333,7 +366,9 @@ def _set_level_handler(args, indigo_module):
     touched at all, so a bad argument never costs a file read. Only
     once the value is known-good do we read the config, validate the
     zone/period/device actually exist, recheck the file hasn't moved
-    since we read it, back it up, write it, and restart the plugin —
+    since we read it (this narrows, but cannot eliminate, the
+    concurrent-write race — a save landing after the recheck is still
+    possible), back it up, write it, and restart the plugin —
     a failed restart fails the whole call even though the file write
     already landed, because the running plugin has not picked it up.
 
@@ -373,24 +408,62 @@ def _set_level_handler(args, indigo_module):
         raise ValueError(
             f"Auto Lights config file at {path!r} changed on disk since "
             "it was read for this call — most likely the web editor "
-            "saved while this call was in flight. Refusing to write and "
-            "risk clobbering that change; nothing was written. Re-read "
-            "and retry."
+            "saved while this call was in flight. Refusing to write "
+            "since the file no longer matches what was read; nothing "
+            "was written. This narrows but does not eliminate the "
+            "concurrent-write race (a save landing after this recheck "
+            "is still possible) — re-read and retry."
         )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup_path = f"{path}.pre-auto_lights_set_level-{timestamp}"
-    with open(backup_path, "wb") as fh:
-        fh.write(raw_bytes)
+    try:
+        with open(backup_path, "wb") as fh:
+            fh.write(raw_bytes)
+    except OSError as exc:
+        raise ValueError(
+            f"could not write the Auto Lights config backup to "
+            f"{backup_path!r} ({exc}); nothing was written to {path!r}."
+        ) from exc
 
     tmp_path = f"{path}.tmp-{timestamp}"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(config, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        raise ValueError(
+            f"could not write the updated Auto Lights config to "
+            f"{path!r} ({exc}); a backup was made at {backup_path!r} "
+            "but the live config was not modified."
+        ) from exc
 
     try:
         plugin = indigo_module.server.getPlugin(AUTOLIGHTS_PLUGIN_ID)
+    except Exception as exc:
+        raise ValueError(
+            f"Auto Lights config was written and backed up (backup: "
+            f"{backup_path!r}) but the Auto Lights plugin "
+            f"({AUTOLIGHTS_PLUGIN_ID}) is not installed or unavailable "
+            f"({exc}); the change is NOT live."
+        ) from exc
+
+    # plugin.restart()'s behaviour on a disabled plugin is undocumented
+    # -- treat it as unsafe rather than assume it raises, the same way
+    # _execute_autolights_action treats executeAction. Without this
+    # check a disabled Auto Lights would leave the write live-on-disk
+    # but not live-in-process while this call still reported success
+    # and claimed every zone lock had been reset.
+    if not plugin.isEnabled():
+        raise ValueError(
+            f"Auto Lights config was written and backed up (backup: "
+            f"{backup_path!r}) but the Auto Lights plugin is disabled; "
+            "restart was not attempted and the change is NOT live. "
+            "Enable the plugin, then restart it or retry this call."
+        )
+
+    try:
         plugin.restart(waitUntilDone=True)
     except Exception as exc:
         raise ValueError(
@@ -492,8 +565,9 @@ def register(handler, *, indigo_module, **_):
             "fails this call fails too, even though the file was "
             "written; the change is not yet live. Refuses to write (and "
             "changes nothing) if the config file was modified on disk "
-            "since it was read for this call, e.g. by the web editor. "
-            "WARNING: the required restart reloads Auto Lights' whole "
+            "since it was read for this call, e.g. by the web editor "
+            "-- this narrows but does not eliminate a concurrent-write "
+            "race. WARNING: the required restart reloads Auto Lights' whole "
             "config, which resets EVERY zone's lock and in-memory state "
             "(timers, failure suppression), not just this zone — see "
             "the response's `side_effects`."
