@@ -9,9 +9,9 @@ phases (e.g. Phase 6) thread additional collaborators like an
 indexer through without breaking the existing call sites.
 """
 
-from tools import (automation_contents, automations, control, find_devices,
-                   history, introspection, irrigation_speed, lookup, system,
-                   zwave)
+from tools import (auto_lights, automation_contents, automations, control,
+                   find_devices, history, introspection, irrigation_speed,
+                   lookup, system, zwave)
 
 
 def register_all(handler, *, indigo_module, indexer=None,
@@ -42,6 +42,10 @@ def register_all(handler, *, indigo_module, indexer=None,
     )
     irrigation_speed.register(handler, indigo_module=indigo_module)
     introspection.register(handler, indigo_module=indigo_module)
+    # Scoped config-write tools for the Auto Lights fork (issue #66).
+    # Reads/writes its own Preferences JSON file directly; no
+    # dependency on this plugin's indexer/history collaborators.
+    auto_lights.register(handler, indigo_module=indigo_module)
     if indexer is not None:
         find_devices.register(handler, indexer=indexer)
     # History tools always register; an absent provider yields the
