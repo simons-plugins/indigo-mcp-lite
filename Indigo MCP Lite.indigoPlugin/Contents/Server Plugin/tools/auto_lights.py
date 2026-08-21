@@ -51,6 +51,16 @@ from tools.lookup import _reject_unknown_args, _require_int_id
 
 AUTOLIGHTS_PLUGIN_ID = "com.vtmikel.autolights"
 
+# _init_config_and_agent (plugin.py) reloads the whole config on every
+# restart and logs "Configuration reloaded ... all locks and zone state
+# has been reset" — the restart set_level requires is not free. Surfaced
+# both in the tool description and in the success payload so a caller
+# (often a model relaying to a human) can say so.
+_RESTART_SIDE_EFFECTS = [
+    "zone locks and in-memory zone state (timers, failure suppression) "
+    "were reset by the required Auto Lights plugin restart",
+]
+
 _CONFIG_SUBPATH = os.path.join(
     "Preferences", "com.vtmikel.autolights", "config", "auto_lights_conf.json"
 )
@@ -220,19 +230,40 @@ def _validate_device(zone_obj, device_id):
 def _execute_autolights_action(indigo_module, action_id, props=None):
     """Invoke one of Auto Lights' own ``Actions.xml`` actions via
     ``executeAction`` — the documented cross-plugin call, same family
-    as ``restart_plugin``'s ``.restart()``. Any failure (plugin not
-    installed, not running, action itself raising) is mapped to a
-    friendly ``ValueError`` so the call fails rather than reporting a
-    success the plugin never actually performed."""
+    as ``restart_plugin``'s ``.restart()``.
+
+    ``executeAction`` is NOT documented to raise when the target
+    plugin is disabled/stopped — every canonical Indigo scripting
+    example that calls it (email, easydaq, timersandpesters,
+    airfoilpro, virtual-devices) guards the call with
+    ``if plugin.isEnabled():`` first rather than relying on an
+    exception, which is the strongest signal available that a call to
+    a stopped plugin can return quietly. So this checks ``isEnabled()``
+    itself and raises rather than let a quiet no-op read as success —
+    the same principle ``auto_lights_set_level`` applies to its
+    restart. Any other failure (plugin not installed, action itself
+    raising) is likewise mapped to a friendly ``ValueError``.
+    """
     try:
         plugin = indigo_module.server.getPlugin(AUTOLIGHTS_PLUGIN_ID)
-        plugin.executeAction(action_id, props=props or {}, waitUntilDone=True)
     except Exception as exc:
         raise ValueError(
-            f"Auto Lights action {action_id!r} failed ({exc}); is the "
-            f"Auto Lights plugin ({AUTOLIGHTS_PLUGIN_ID}) installed and "
-            "running?"
+            f"Auto Lights plugin ({AUTOLIGHTS_PLUGIN_ID}) is not "
+            f"installed or unavailable ({exc}); action {action_id!r} "
+            "was NOT performed."
         ) from exc
+
+    if not plugin.isEnabled():
+        raise ValueError(
+            f"Auto Lights plugin ({AUTOLIGHTS_PLUGIN_ID}) is installed "
+            f"but not enabled/running; action {action_id!r} was NOT "
+            "performed. Enable it in Indigo before changing zone state."
+        )
+
+    try:
+        plugin.executeAction(action_id, props=props or {}, waitUntilDone=True)
+    except Exception as exc:
+        raise ValueError(f"Auto Lights action {action_id!r} failed ({exc})") from exc
 
 
 # -- handlers --------------------------------------------------------------
@@ -305,6 +336,12 @@ def _set_level_handler(args, indigo_module):
     since we read it, back it up, write it, and restart the plugin —
     a failed restart fails the whole call even though the file write
     already landed, because the running plugin has not picked it up.
+
+    The restart is not free: Auto Lights reloads its whole config on
+    every restart, which resets every zone's lock and in-memory state
+    (timers, failure suppression) — not just the zone this call
+    touched. ``_RESTART_SIDE_EFFECTS`` names that in the response so a
+    caller relaying to a human can say so.
     """
     _reject_unknown_args(args, ("zone", "period", "device", "level"))
     zone_name = _require_str(args, "zone")
@@ -317,10 +354,17 @@ def _set_level_handler(args, indigo_module):
     _period_lookup(config, zone_obj, period_id)
     _validate_device(zone_obj, device_id)
 
+    # device_period_map is keyed DEVICE first, then period — confirmed
+    # against indigo-auto-lights zone.py's dev_period_brightness /
+    # has_dev_lighting_mapping_exclusion (both read
+    # device_period_map[str(dev_id)][str(period_id)]) and the live
+    # config on jarvis. Getting this backwards writes a real cell that
+    # Auto Lights never reads while still reporting success — the
+    # exact failure this tool exists to prevent.
     device_period_map = zone_obj.setdefault("device_period_map", {})
-    period_bucket = device_period_map.setdefault(str(period_id), {})
-    previous_level = period_bucket.get(str(device_id))
-    period_bucket[str(device_id)] = level
+    device_bucket = device_period_map.setdefault(str(device_id), {})
+    previous_level = device_bucket.get(str(period_id))
+    device_bucket[str(period_id)] = level
 
     stat_recheck = _stat(path)
     if (stat_recheck.st_mtime_ns, stat_recheck.st_size) != (
@@ -365,6 +409,7 @@ def _set_level_handler(args, indigo_module):
         "previous_level": previous_level,
         "config_path": path,
         "backup_path": backup_path,
+        "side_effects": list(_RESTART_SIDE_EFFECTS),
     }
 
 
@@ -447,7 +492,11 @@ def register(handler, *, indigo_module, **_):
             "fails this call fails too, even though the file was "
             "written; the change is not yet live. Refuses to write (and "
             "changes nothing) if the config file was modified on disk "
-            "since it was read for this call, e.g. by the web editor."
+            "since it was read for this call, e.g. by the web editor. "
+            "WARNING: the required restart reloads Auto Lights' whole "
+            "config, which resets EVERY zone's lock and in-memory state "
+            "(timers, failure suppression), not just this zone — see "
+            "the response's `side_effects`."
         ),
         input_schema={
             "type": "object",

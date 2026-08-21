@@ -7,9 +7,17 @@ and write must refuse (and leave the file untouched); ``level=True``
 must never be stored as ``1``; unknown zone/period/device must raise
 naming which one; and a missing/corrupt config must raise rather than
 return an empty-but-ok result.
+
+The fixture deliberately uses device ids and period ids from
+non-overlapping ranges (10-digit device ids, single-digit period ids,
+matching the real jarvis config) so that a transposed
+``device_period_map[period][device]`` vs. the real
+``device_period_map[device][period]`` can never accidentally read as
+correct — see ``test_set_level_writes_device_first_not_period_first``.
 """
 import json
 import os
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,24 +33,31 @@ def _sample_config():
         "zones": [
             {
                 "name": "Kitchen",
-                "lighting_period_ids": [1, 2],
+                "lighting_period_ids": [3, 8],
                 "device_settings": {
-                    "on_lights_dev_ids": [100, 101],
-                    "off_lights_dev_ids": [102],
+                    "on_lights_dev_ids": [1256902388, 144694384, 1256902399],
+                    "off_lights_dev_ids": [999999999],
                     "luminance_dev_ids": [200],
                     "presence_dev_ids": [300],
                 },
                 "minimum_luminance_settings": {"minimum_luminance": 30},
                 "behavior_settings": {"lock_duration": -1},
                 "advanced_settings": {"exclude_from_lock_dev_ids": []},
-                "device_period_map": {"1": {"100": True}},
+                # Real shape: device id first, period id second — see
+                # indigo-auto-lights zone.py dev_period_brightness /
+                # has_dev_lighting_mapping_exclusion, both of which read
+                # device_period_map[str(dev_id)][str(period_id)].
+                "device_period_map": {
+                    "1256902388": {"3": False, "8": 10},
+                    "144694384": {"3": 30, "8": 60},
+                },
                 "global_behavior_variables_map": {},
             },
             {
                 "name": "Hallway",
-                "lighting_period_ids": [1],
+                "lighting_period_ids": [3],
                 "device_settings": {
-                    "on_lights_dev_ids": [400],
+                    "on_lights_dev_ids": [400000001],
                     "off_lights_dev_ids": [],
                     "luminance_dev_ids": [],
                     "presence_dev_ids": [],
@@ -51,13 +66,13 @@ def _sample_config():
         ],
         "lighting_periods": [
             {
-                "id": 1, "name": "Evening", "mode": "On and Off",
+                "id": 3, "name": "Evening", "mode": "On and Off",
                 "from_time_hour": 18, "from_time_minute": 0,
                 "to_time_hour": 23, "to_time_minute": 0,
                 "lock_duration": -1, "limit_brightness": -1,
             },
             {
-                "id": 2, "name": "Night", "mode": "Off Only",
+                "id": 8, "name": "Night", "mode": "Off Only",
                 "from_time_hour": 23, "from_time_minute": 0,
                 "to_time_hour": 6, "to_time_minute": 0,
                 "lock_duration": -1, "limit_brightness": -1,
@@ -77,8 +92,9 @@ def _write_config(mock_indigo, tmp_path, config):
     return config_path
 
 
-def _fake_plugin():
+def _fake_plugin(enabled=True):
     p = MagicMock()
+    p.isEnabled = MagicMock(return_value=enabled)
     p.restart = MagicMock()
     p.executeAction = MagicMock()
     return p
@@ -96,9 +112,14 @@ def test_list_zones_happy_path(mock_indigo, tmp_path):
 
     assert result["total_count"] == 2
     by_name = {z["name"]: z for z in result["zones"]}
-    assert by_name["Kitchen"]["device_settings"]["on_lights_dev_ids"] == [100, 101]
-    assert [p["id"] for p in by_name["Kitchen"]["periods"]] == [1, 2]
-    assert by_name["Kitchen"]["device_period_map"] == {"1": {"100": True}}
+    assert by_name["Kitchen"]["device_settings"]["on_lights_dev_ids"] == [
+        1256902388, 144694384, 1256902399,
+    ]
+    assert [p["id"] for p in by_name["Kitchen"]["periods"]] == [3, 8]
+    assert by_name["Kitchen"]["device_period_map"] == {
+        "1256902388": {"3": False, "8": 10},
+        "144694384": {"3": 30, "8": 60},
+    }
     assert len(result["lighting_periods"]) == 2
 
 
@@ -163,7 +184,7 @@ def test_set_level_invalid_level_never_touches_indigo(mock_indigo):
     )
     with pytest.raises(ValueError, match="level"):
         _set_level_handler(
-            {"zone": "Kitchen", "period": 1, "device": 100, "level": None},
+            {"zone": "Kitchen", "period": 3, "device": 1256902388, "level": None},
             mock_indigo,
         )
     mock_indigo.server.getInstallFolderPath.assert_not_called()
@@ -175,7 +196,8 @@ def test_set_level_rejects_bad_levels_with_distinct_messages(mock_indigo, bad_le
 
     with pytest.raises(ValueError) as excinfo:
         _set_level_handler(
-            {"zone": "Kitchen", "period": 1, "device": 100, "level": bad_level},
+            {"zone": "Kitchen", "period": 3, "device": 1256902388,
+             "level": bad_level},
             mock_indigo,
         )
     message = str(excinfo.value)
@@ -192,42 +214,99 @@ def test_set_level_rejects_unknown_args(mock_indigo, tmp_path):
 
     with pytest.raises(ValueError, match="unknown argument"):
         _set_level_handler(
-            {"zone": "Kitchen", "period": 1, "device": 100, "level": 50,
+            {"zone": "Kitchen", "period": 3, "device": 1256902388, "level": 50,
              "bogus": 1},
             mock_indigo,
         )
 
 
 # ---------------------------------------------------------------------
-# auto_lights_set_level — happy path, backup, restart
+# auto_lights_set_level — happy path, backup, restart, correct nesting
 # ---------------------------------------------------------------------
 
-def test_set_level_writes_backs_up_and_restarts(mock_indigo, tmp_path):
+def test_set_level_writes_device_first_not_period_first(mock_indigo, tmp_path):
+    """The regression test: device_period_map is keyed
+    device_period_map[device][period], NOT [period][device]. Writes a
+    brand-new cell (device 1256902399 has no prior entry) so
+    previous_level is unambiguous, then reads the result back exactly
+    the way Auto Lights' dev_period_brightness does, and asserts the
+    period id never became a spurious top-level key."""
     from tools.auto_lights import _set_level_handler
 
     config_path = _write_config(mock_indigo, tmp_path, _sample_config())
     plugin = _fake_plugin()
     mock_indigo.server.getPlugin.return_value = plugin
 
+    zone, period_id, device_id, level = "Kitchen", 3, 1256902399, 55
     result = _set_level_handler(
-        {"zone": "Kitchen", "period": 1, "device": 101, "level": 42},
+        {"zone": zone, "period": period_id, "device": device_id, "level": level},
         mock_indigo,
     )
 
     assert result["status"] == "ok"
-    assert result["level"] == 42
+    assert result["level"] == 55
     assert result["previous_level"] is None
     plugin.restart.assert_called_once_with(waitUntilDone=True)
 
     written = json.loads(config_path.read_text())
     kitchen = next(z for z in written["zones"] if z["name"] == "Kitchen")
-    assert kitchen["device_period_map"]["1"]["101"] == 42
+    device_period_map = kitchen["device_period_map"]
+
+    # Read it exactly the way Auto Lights' dev_period_brightness does:
+    # device_period_map[str(dev_id)][str(period_id)].
+    assert device_period_map[str(device_id)][str(period_id)] == 55
+
+    # The regression this test exists to catch: a period-first write
+    # would have created a spurious top-level entry keyed by the
+    # period id instead.
+    assert str(period_id) not in device_period_map
+
+    # Sibling cells for this device and other devices must be untouched.
+    assert device_period_map[str(device_id)] == {"3": 55}
+    assert device_period_map["1256902388"] == {"3": False, "8": 10}
+    assert device_period_map["144694384"] == {"3": 30, "8": 60}
 
     backup_path = result["backup_path"]
     assert os.path.isfile(backup_path)
-    backed_up = json.loads(open(backup_path).read())
-    # Backup is the PRE-write content — device 101 wasn't set yet.
-    assert "101" not in backed_up["zones"][0]["device_period_map"].get("1", {})
+    backed_up = json.loads(open(backup_path, encoding="utf-8").read())
+    # Backup is the PRE-write content — this device wasn't mapped yet.
+    assert "1256902399" not in backed_up["zones"][0]["device_period_map"]
+
+
+def test_set_level_overwrites_existing_cell_for_correct_period(mock_indigo, tmp_path):
+    """Overwriting an existing device+period cell must only touch
+    that cell — the sibling period for the same device is untouched."""
+    from tools.auto_lights import _set_level_handler
+
+    config_path = _write_config(mock_indigo, tmp_path, _sample_config())
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _set_level_handler(
+        {"zone": "Kitchen", "period": 8, "device": 144694384, "level": 42},
+        mock_indigo,
+    )
+    assert result["previous_level"] == 60  # was 60 at period 8 for this device
+
+    written = json.loads(config_path.read_text())
+    kitchen = next(z for z in written["zones"] if z["name"] == "Kitchen")
+    assert kitchen["device_period_map"]["144694384"] == {"3": 30, "8": 42}
+
+
+def test_set_level_returns_side_effects_of_the_required_restart(mock_indigo, tmp_path):
+    """The restart set_level requires resets every zone's lock and
+    in-memory state, not just the zone being edited — the payload
+    must say so."""
+    from tools.auto_lights import _set_level_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _set_level_handler(
+        {"zone": "Kitchen", "period": 3, "device": 1256902399, "level": 20},
+        mock_indigo,
+    )
+    assert result["side_effects"]
+    assert any("lock" in effect for effect in result["side_effects"])
 
 
 def test_set_level_true_is_not_stored_as_1(mock_indigo, tmp_path):
@@ -238,8 +317,9 @@ def test_set_level_true_is_not_stored_as_1(mock_indigo, tmp_path):
     config_path = _write_config(mock_indigo, tmp_path, _sample_config())
     mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
+    device_id, period_id = 1256902399, 8
     result = _set_level_handler(
-        {"zone": "Kitchen", "period": 2, "device": 100, "level": True},
+        {"zone": "Kitchen", "period": period_id, "device": device_id, "level": True},
         mock_indigo,
     )
     assert result["level"] is True
@@ -247,10 +327,17 @@ def test_set_level_true_is_not_stored_as_1(mock_indigo, tmp_path):
     raw_text = config_path.read_text()
     written = json.loads(raw_text)
     kitchen = next(z for z in written["zones"] if z["name"] == "Kitchen")
-    assert kitchen["device_period_map"]["2"]["100"] is True
-    # Byte-level: JSON must say true, never 1.
-    assert '"100": true' in raw_text
-    assert '"100": 1' not in raw_text
+    cell = kitchen["device_period_map"][str(device_id)][str(period_id)]
+    assert cell is True  # not == 1 -- True == 1 in Python, "is" is the real check
+
+    # Byte-level: this device's cell must say true, never 1. Anchored
+    # to the specific device block so it can't accidentally match a
+    # numeric cell elsewhere in the file (e.g. "8": 10 contains "8": 1
+    # as a text prefix).
+    pattern = re.compile(
+        r'"' + str(device_id) + r'":\s*\{\s*"' + str(period_id) + r'":\s*true\s*\}'
+    )
+    assert pattern.search(raw_text), raw_text
 
 
 def test_set_level_false_is_stored_as_false(mock_indigo, tmp_path):
@@ -260,7 +347,7 @@ def test_set_level_false_is_stored_as_false(mock_indigo, tmp_path):
     mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _set_level_handler(
-        {"zone": "Kitchen", "period": 1, "device": 102, "level": False},
+        {"zone": "Kitchen", "period": 3, "device": 1256902399, "level": False},
         mock_indigo,
     )
     assert result["level"] is False
@@ -282,7 +369,7 @@ def test_set_level_restart_failure_fails_the_call(mock_indigo, tmp_path):
 
     with pytest.raises(ValueError, match="restart"):
         _set_level_handler(
-            {"zone": "Kitchen", "period": 1, "device": 101, "level": 77},
+            {"zone": "Kitchen", "period": 8, "device": 144694384, "level": 77},
             mock_indigo,
         )
 
@@ -290,7 +377,7 @@ def test_set_level_restart_failure_fails_the_call(mock_indigo, tmp_path):
     # the failure is that the call did NOT report success.
     written = json.loads(config_path.read_text())
     kitchen = next(z for z in written["zones"] if z["name"] == "Kitchen")
-    assert kitchen["device_period_map"]["1"]["101"] == 77
+    assert kitchen["device_period_map"]["144694384"]["8"] == 77
 
 
 # ---------------------------------------------------------------------
@@ -329,7 +416,7 @@ def test_set_level_refuses_when_mtime_moved_between_read_and_write(
 
     with pytest.raises(ValueError, match="changed on disk"):
         auto_lights_module._set_level_handler(
-            {"zone": "Kitchen", "period": 1, "device": 101, "level": 55},
+            {"zone": "Kitchen", "period": 8, "device": 144694384, "level": 55},
             mock_indigo,
         )
 
@@ -348,7 +435,7 @@ def test_set_level_unknown_zone_names_it(mock_indigo, tmp_path):
     _write_config(mock_indigo, tmp_path, _sample_config())
     with pytest.raises(ValueError, match="no Auto Lights zone named 'Attic'"):
         _set_level_handler(
-            {"zone": "Attic", "period": 1, "device": 100, "level": 50},
+            {"zone": "Attic", "period": 3, "device": 1256902388, "level": 50},
             mock_indigo,
         )
 
@@ -359,7 +446,7 @@ def test_set_level_unknown_period_names_it(mock_indigo, tmp_path):
     _write_config(mock_indigo, tmp_path, _sample_config())
     with pytest.raises(ValueError, match="period 99 is not linked to zone 'Kitchen'"):
         _set_level_handler(
-            {"zone": "Kitchen", "period": 99, "device": 100, "level": 50},
+            {"zone": "Kitchen", "period": 99, "device": 1256902388, "level": 50},
             mock_indigo,
         )
 
@@ -368,22 +455,24 @@ def test_set_level_unknown_device_names_it(mock_indigo, tmp_path):
     from tools.auto_lights import _set_level_handler
 
     _write_config(mock_indigo, tmp_path, _sample_config())
-    with pytest.raises(ValueError, match="device 999 is not one of zone 'Kitchen'"):
+    with pytest.raises(ValueError, match="device 555555555 is not one of zone 'Kitchen'"):
         _set_level_handler(
-            {"zone": "Kitchen", "period": 1, "device": 999, "level": 50},
+            {"zone": "Kitchen", "period": 3, "device": 555555555, "level": 50},
             mock_indigo,
         )
 
 
 def test_set_level_device_valid_for_other_zone_still_rejected(mock_indigo, tmp_path):
-    """Device 400 belongs to Hallway, not Kitchen — must not leak across
-    zones."""
+    """Device 400000001 belongs to Hallway, not Kitchen — must not
+    leak across zones."""
     from tools.auto_lights import _set_level_handler
 
     _write_config(mock_indigo, tmp_path, _sample_config())
-    with pytest.raises(ValueError, match="device 400 is not one of zone 'Kitchen'"):
+    with pytest.raises(
+        ValueError, match="device 400000001 is not one of zone 'Kitchen'"
+    ):
         _set_level_handler(
-            {"zone": "Kitchen", "period": 1, "device": 400, "level": 50},
+            {"zone": "Kitchen", "period": 3, "device": 400000001, "level": 50},
             mock_indigo,
         )
 
@@ -397,7 +486,7 @@ def test_set_level_no_write_on_unknown_zone(mock_indigo, tmp_path):
 
     with pytest.raises(ValueError):
         _set_level_handler(
-            {"zone": "Attic", "period": 1, "device": 100, "level": 50},
+            {"zone": "Attic", "period": 3, "device": 1256902388, "level": 50},
             mock_indigo,
         )
 
@@ -469,6 +558,22 @@ def test_set_zone_enabled_action_failure_fails_the_call(mock_indigo, tmp_path):
         _set_zone_enabled_handler({"zone": "Kitchen", "enabled": True}, mock_indigo)
 
 
+def test_set_zone_enabled_plugin_not_running_fails_and_skips_action(mock_indigo, tmp_path):
+    """executeAction is not documented to raise when the target plugin
+    is stopped (every canonical scripting example guards it with
+    isEnabled() first) — so this must check isEnabled() itself and
+    refuse rather than let a quiet no-op read as success."""
+    from tools.auto_lights import _set_zone_enabled_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    plugin = _fake_plugin(enabled=False)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="not enabled/running"):
+        _set_zone_enabled_handler({"zone": "Kitchen", "enabled": True}, mock_indigo)
+    plugin.executeAction.assert_not_called()
+
+
 # ---------------------------------------------------------------------
 # auto_lights_reset_locks
 # ---------------------------------------------------------------------
@@ -518,6 +623,17 @@ def test_reset_locks_action_failure_fails_the_call(mock_indigo, tmp_path):
 
     with pytest.raises(ValueError, match="reset_all_locks"):
         _reset_locks_handler({}, mock_indigo)
+
+
+def test_reset_locks_plugin_not_running_fails_and_skips_action(mock_indigo, tmp_path):
+    from tools.auto_lights import _reset_locks_handler
+
+    plugin = _fake_plugin(enabled=False)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="not enabled/running"):
+        _reset_locks_handler({}, mock_indigo)
+    plugin.executeAction.assert_not_called()
 
 
 def test_reset_locks_rejects_unknown_args(mock_indigo):
