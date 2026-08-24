@@ -1,0 +1,48 @@
+# Runs the pytest suite (tests/) and the README-drift check on every
+# PR and on every push to main.
+#
+# Before this workflow existed, the only CI here was version-check.yml
+# (PluginVersion bumped + well-formed), catalog-refresh.yml, and
+# create-release.yml — none of them ran a single test. A green
+# `gh pr checks` meant "the version was bumped", nothing about
+# correctness, so a red local suite could merge (and create-release
+# could tag/ship it) with no signal in the loop at all. See #77 and
+# the post-merge review of #73 (#76) for the incident that surfaced
+# this gap. Do not remove this workflow as "redundant" with
+# version-check — it is the only one that actually runs the tests.
+#
+# The plugin and its test suite are stdlib-only by design (ADR-0003 in
+# the workspace root) plus pytest itself, so there is no dependency
+# install step here beyond pytest.
+
+name: Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run test suite
+        run: python3 -m pytest
+
+      - name: Check README tool table is up to date
+        run: python3 scripts/generate_tool_doc.py --check
