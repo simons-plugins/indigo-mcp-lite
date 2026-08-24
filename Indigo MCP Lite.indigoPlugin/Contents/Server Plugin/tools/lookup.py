@@ -361,13 +361,42 @@ def _reject_unknown_args(args, allowed):
         )
 
 
+class _LookupFault(RuntimeError):
+    """Raised when ``collection[entity_id]`` itself fails, rather than
+    genuinely finding no such id.
+
+    Probed live against Indigo 2025.2 (issue #74): a missing id raises
+    ``KeyError`` — that's the only exception shape confirmed to mean
+    "no such id"; a bad key TYPE raises ``TypeError``/``OverflowError``
+    instead, never ``IndexError``/``ValueError``. Deliberately not a
+    ``ValueError``/``TypeError``: ``mcp_handler`` routes those to its
+    self-correct-and-retry bucket ("adjust your arguments"), but a
+    fault means nothing is wrong with the id, so this must reach the
+    back-off bucket instead — the same reasoning ``plugin_actions``'s
+    ``_ActionsXmlIOError`` already applies to a stale filesystem
+    handle.
+    """
+
+
 def _lookup_or_raise(collection, entity_id, entity_label):
-    """Subscript ``collection[entity_id]`` and translate Indigo's
-    KeyError / IndexError / ValueError into a friendly ValueError."""
+    """Subscript ``collection[entity_id]`` and translate a genuinely
+    missing id (``KeyError``) into a friendly ``ValueError``.
+
+    Anything else the subscript raises is a FAILED lookup, not an
+    absent entity — wrapped in ``_LookupFault`` (see its docstring)
+    rather than folded into the same "not found" message, so a
+    transient Indigo-side fault can't misreport as a confident "no
+    device with id N" and can't gate a write (``plugin_actions``'s
+    device_id existence check) on a false negative.
+    """
     try:
         return collection[entity_id]
-    except (KeyError, IndexError, ValueError):
-        raise ValueError(f"no {entity_label} with id {entity_id}")
+    except KeyError as exc:
+        raise ValueError(f"no {entity_label} with id {entity_id}") from exc
+    except Exception as exc:
+        raise _LookupFault(
+            f"lookup for {entity_label} id {entity_id} failed: {exc}"
+        ) from exc
 
 
 # Attributes worth surfacing on a single-device lookup beyond the slim
