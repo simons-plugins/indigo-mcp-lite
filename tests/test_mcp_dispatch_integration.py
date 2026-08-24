@@ -413,6 +413,85 @@ def test_wire_dispatch_plugin_execute_action(mock_indigo, tmp_path):
     assert inner["action_id"] == "noop"
 
 
+def _write_autolights_config(mock_indigo, tmp_path, config):
+    """Write a minimal Auto Lights config at the real Preferences path
+    under ``tmp_path`` and point ``getInstallFolderPath`` at it --
+    mirrors ``tests/test_auto_lights.py``'s ``_write_config`` helper.
+    Returns the config path. Never touches a real Auto Lights install."""
+    config_dir = tmp_path / "Preferences" / "com.vtmikel.autolights" / "config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "auto_lights_conf.json"
+    config_path.write_text(json.dumps(config))
+    mock_indigo.server.getInstallFolderPath.return_value = str(tmp_path)
+    return config_path
+
+
+_AUTOLIGHTS_WIRE_CONFIG = {
+    "zones": [
+        {
+            "name": "Kitchen",
+            "lighting_period_ids": [3],
+            "device_settings": {
+                "on_lights_dev_ids": [1256902388],
+                "off_lights_dev_ids": [],
+            },
+            "device_period_map": {},
+        },
+    ],
+    "lighting_periods": [{"id": 3, "name": "Evening"}],
+}
+
+
+def test_wire_dispatch_auto_lights_list_zones(mock_indigo, tmp_path):
+    """Issue #72 wire-dispatch regression guard for the read tool --
+    same rationale as the #71 wire tests above:
+    ``auto_lights_list_zones`` registers as ``lambda **args:``;
+    ``mcp_handler`` dispatches as ``handler(**tool_args)``. The tool
+    takes no arguments at all, so ``{}`` IS its real/full argument
+    set -- and still exercises the ``**`` unpacking: a mutated
+    ``lambda args:`` registration fails on ``handler()`` too (missing
+    the required positional ``args``), just with a different message
+    than the write tool's mutation below. Sanity-checked by flipping
+    the registration and confirming this test fails (see PR)."""
+    _write_autolights_config(mock_indigo, tmp_path, _AUTOLIGHTS_WIRE_CONFIG)
+
+    result = _wire_call(mock_indigo, "auto_lights_list_zones", {})
+    assert result.get("isError") is not True, result
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["total_count"] == 1
+    assert inner["zones"][0]["name"] == "Kitchen"
+
+
+def test_wire_dispatch_auto_lights_set_level(mock_indigo, tmp_path):
+    """Issue #72 wire-dispatch regression guard for the write tool --
+    the highest blast-radius of the four auto_lights_* tools
+    (``auto_lights_set_level`` writes a sibling plugin's config file
+    and restarts it). Uses a tmp config fixture, never a real Auto
+    Lights install, and ``plugin.restart``/``getPlugin`` are the
+    ``mock_indigo`` MagicMock doubles, so no real plugin restart is
+    attempted. Passes real zone/period/device/level arguments so the
+    ``**`` unpacking is genuinely exercised the way #72 requires."""
+    config_path = _write_autolights_config(
+        mock_indigo, tmp_path, _AUTOLIGHTS_WIRE_CONFIG
+    )
+    plugin = mock_indigo.server.getPlugin.return_value
+    plugin.isEnabled.return_value = True
+
+    result = _wire_call(
+        mock_indigo, "auto_lights_set_level",
+        {"zone": "Kitchen", "period": 3, "device": 1256902388, "level": 42},
+    )
+    assert result.get("isError") is not True, result
+    plugin.restart.assert_called_once_with(waitUntilDone=True)
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["status"] == "ok"
+    assert inner["level"] == 42
+
+    written = json.loads(config_path.read_text())
+    kitchen = next(z for z in written["zones"] if z["name"] == "Kitchen")
+    assert kitchen["device_period_map"]["1256902388"]["3"] == 42
+
+
 def test_wire_dispatch_capability_refusal_is_friendly_tool_error(
         mock_indigo, monkeypatch):
     """A catalog capability refusal must arrive on the wire as a clean
