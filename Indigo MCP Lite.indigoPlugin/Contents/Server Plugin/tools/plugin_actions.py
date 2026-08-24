@@ -85,22 +85,33 @@ module generalizes that mechanism to *every* action-bearing plugin:
   narrowly: since neither the action's declared fields NOR its
   ``deviceFilter`` are then knowable at all, this module only
   attempts the dispatch when the caller supplied no props and no
-  ``device_id`` (the one shape Indigo's own ``InvalidAction`` can
-  fully backstop, once ``waitUntilDone`` is forced true); otherwise it
-  refuses outright, naming what could not be checked. This preserves
-  the origin use case exactly -- that case always has a readable
-  Actions.xml with the action legitimately declaring zero fields, the
-  different (and confirmed-safe) path described above.
+  ``device_id`` -- the shape where Indigo's own ``InvalidAction`` can
+  at least backstop a bad action id (once ``waitUntilDone`` is forced
+  true). That backstop is narrower than it sounds, though: it catches
+  a wrong action id, NOT a valid action invoked without a device it
+  actually requires -- ``executeAction`` defaults ``deviceId`` to 0
+  regardless, and the target plugin's own callback can then fail
+  silently in ITS event log, invisible to this module, so a
+  ``completed_unverified`` result on this path is not a guarantee the
+  action actually ran. Otherwise (props or device_id supplied) this
+  module refuses outright, naming what could not be checked. This
+  preserves the origin use case exactly -- that case always has a
+  readable Actions.xml with the action legitimately declaring zero
+  fields, the different (and confirmed-safe) path described above.
 
-  ``device_id`` is validated for existence AND, when the action's
-  ``deviceFilter`` is *entirely* ``self``-scoped (every
-  comma-separated alternative is ``self`` or ``self.<typeId>`` -- a
-  filter mixing in a non-``self`` alternative is left unvalidated
-  rather than falsely rejecting a device that legitimately matches
-  the alternative this module can't check), that the device is
-  actually owned by the target plugin (and matches one of the
-  required ``deviceTypeId``s, unless a bare ``self`` alternative is
-  present, which accepts any type). Existence alone doesn't stop a
+  ``device_id`` is validated for existence AND, against any
+  ``self``/``self.<typeId>`` alternative in the action's
+  ``deviceFilter`` (comma-separated alternatives are ORed -- a match
+  on ANY self-scoped alternative confirms ownership, even inside a
+  filter that also mixes in a non-``self`` alternative this module
+  can't check), that the device is actually owned by the target
+  plugin (and matches one of the required ``deviceTypeId``s, unless a
+  bare ``self`` alternative is present, which accepts any type). Only
+  when EVERY alternative is self-scoped and NONE match is this a hard
+  rejection -- a mixed filter that doesn't match its self-scoped
+  alternative(s) is left unvalidated instead, rather than falsely
+  rejected: it may still match the non-``self`` alternative this
+  module can't check. Existence alone doesn't stop a
   device belonging to an unrelated plugin from being dispatched at
   the wrong target -- and unlike a bad action id, Indigo has NO
   backstop for a wrong device, so this check is a real guard, not
@@ -122,12 +133,20 @@ Deliberately NO allowlist/denylist of plugins or actions here --
 object-level write denial is issue #69's job, not this one's.
 """
 
+import logging
 import os
 import xml.etree.ElementTree as ET
 
 from tools.lookup import _lookup_or_raise, _reject_unknown_args, _require_int_id
 from tools.system import _require_plugin_id
 from tools.zwave import _json_safe
+
+# Default logger when register() isn't threaded one (e.g. a direct call
+# in tests) or is explicitly given None -- "Plugin" matches the name
+# Indigo itself logs under and the fallback automation_contents.py /
+# mcp_handler.py already use, so a message actually lands in Indigo's
+# Event Log rather than a logger nobody reads.
+_LOGGER = logging.getLogger("Plugin")
 
 # type="button"/"label"/"separator" fields are UI chrome, not props.
 _NON_PROP_FIELD_TYPES = ("label", "separator", "button")
@@ -155,6 +174,18 @@ class _ActionsXmlError(ValueError):
     mode. Catching bare ``ValueError`` there would let any future
     ``ValueError`` raised inside ``_parse_actions_xml`` (or anything
     it calls) silently acquire "proceed with the write" semantics.
+    """
+
+
+class _ActionsXmlIOError(RuntimeError):
+    """Raised ONLY by ``_actions_xml_exists`` when the existence check
+    itself fails for a reason other than "genuinely absent" -- a
+    stale NFS handle, permission denial. Deliberately NOT a
+    ``ValueError``: ``mcp_handler`` routes ``ValueError``/``TypeError``
+    to its self-correct-and-retry bucket, but no argument change fixes
+    a stale filesystem handle, so this must reach the back-off bucket
+    instead -- the same reasoning this module already applies to a
+    post-dispatch failure.
     """
 
 
@@ -186,13 +217,21 @@ def _actions_xml_exists(path):
 
     ``os.path.isfile`` returns False for BOTH "genuinely doesn't
     exist" and "couldn't even check" (permission denial, a stale
-    network handle, an unmounted volume -- this workspace runs
-    bundles off ``/Volumes/...``), which is the exact same lie PR #73
-    review round 3 deleted from the old filesystem-scan bundle
-    lookup, relocated here. Only ``FileNotFoundError``/
-    ``NotADirectoryError`` mean "absent"; any other ``OSError`` is
-    raised, naming the path and errno, rather than read as a
-    (false) positive claim that the plugin has no Actions.xml.
+    network handle going away mid-session -- this workspace runs
+    bundles off ``/Volumes/...``, where that happens), which is the
+    exact same lie PR #73 review round 3 deleted from the old
+    filesystem-scan bundle lookup, relocated here. Only
+    ``FileNotFoundError``/``NotADirectoryError`` mean "absent" -- that
+    covers a genuinely missing file AND an unmounted volume itself
+    (``os.stat`` on an unmounted ``/Volumes/...`` mount point returns
+    ENOENT, so it reads as "absent" too, not a fault); any other
+    ``OSError`` (permission denial, a stale handle) is a real I/O
+    fault, raised as ``_ActionsXmlIOError`` (never a plain
+    ``ValueError`` -- no argument change fixes a stale filesystem
+    handle, so this must reach ``mcp_handler``'s back-off bucket, not
+    its self-correct-and-retry one) naming the path and errno, rather
+    than read as a (false) positive claim that the plugin has no
+    Actions.xml.
     """
     try:
         os.stat(path)
@@ -200,7 +239,7 @@ def _actions_xml_exists(path):
     except (FileNotFoundError, NotADirectoryError):
         return False
     except OSError as exc:
-        raise ValueError(
+        raise _ActionsXmlIOError(
             f"could not check for Actions.xml at {path!r}: {exc} "
             f"(errno {exc.errno})"
         ) from exc
@@ -301,7 +340,7 @@ def _classify_list(list_el):
 
 def _parse_action_props(config_ui_el):
     """Split an ``<Action>``'s ``<ConfigUI><Field>`` children into
-    (props, notes, has_dynamic_fields, skipped_fields).
+    (props, notes, has_dynamic_fields, skipped_fields, skipped_options).
 
     ``label``/``separator``/``button`` fields are not props -- a
     label field's ``<Label>`` text is genuinely useful calling
@@ -323,13 +362,20 @@ def _parse_action_props(config_ui_el):
     its own ``skipped_actions`` counter, an id-less ``<Field>`` had no
     counter at all before this fix, making an action whose fields all
     lack ids indistinguishable from a genuinely bare ``<ConfigUI/>``).
+    An ``<Option>`` with no ``value`` attribute is excluded from a
+    static list's enumerated values entirely (the write handler's
+    allowlist must never treat it as the literal string ``"None"``)
+    but counted into ``skipped_options`` -- the same
+    discovery-says-legal/dispatch-refuses gap ``skipped_fields`` fixes
+    for fields, one level down, at the option level.
     """
     props = []
     notes = []
     has_dynamic = False
     skipped_fields = 0
+    skipped_options = 0
     if config_ui_el is None:
-        return props, notes, has_dynamic, skipped_fields
+        return props, notes, has_dynamic, skipped_fields, skipped_options
 
     for field_el in config_ui_el.findall("Field"):
         field_id, field_type, label, description, default, hidden = _parse_field(field_el)
@@ -357,6 +403,9 @@ def _parse_action_props(config_ui_el):
             if kind == "static":
                 if classified:
                     prop["values"] = classified
+                    skipped_options += sum(
+                        1 for opt in classified if opt["value"] is None
+                    )
             else:
                 source, tool = classified
                 prop["values"] = "dynamic"
@@ -366,7 +415,7 @@ def _parse_action_props(config_ui_el):
                 has_dynamic = True
         props.append(prop)
 
-    return props, notes, has_dynamic, skipped_fields
+    return props, notes, has_dynamic, skipped_fields, skipped_options
 
 
 def _parse_action_element(action_el):
@@ -380,7 +429,9 @@ def _parse_action_element(action_el):
 
     ui_path = action_el.get("uiPath")
     config_ui_el = action_el.find("ConfigUI")
-    props, notes, has_dynamic, skipped_fields = _parse_action_props(config_ui_el)
+    props, notes, has_dynamic, skipped_fields, skipped_options = _parse_action_props(
+        config_ui_el
+    )
 
     action = {
         "id": action_el.get("id"),
@@ -396,6 +447,21 @@ def _parse_action_element(action_el):
     }
     if skipped_fields:
         action["skipped_fields"] = skipped_fields
+    if skipped_options:
+        action["skipped_options"] = skipped_options
+    # Computed UNCONDITIONALLY (not just when props is empty) -- a
+    # ConfigUI can mix a <Template file="..."/> include with its own
+    # readable <Field> elements (post-merge review round 2: the old
+    # props-empty-only check meant that shape got no flag at all, so
+    # verified could read true off a field set the include might still
+    # extend, and a legitimate prop from the include was hard-refused
+    # as "unknown"). Present on the action whenever a Template exists,
+    # regardless of how many real fields sit alongside it.
+    uses_template = (
+        config_ui_el is not None and config_ui_el.find("Template") is not None
+    )
+    if uses_template:
+        action["uses_template"] = True
     if not props:
         # An absent/empty <ConfigUI> (or one with only label/
         # separator/button/id-less fields) is NOT "this action takes
@@ -406,15 +472,23 @@ def _parse_action_element(action_el):
         # hidden actions, 51 with zero ConfigUI fields (MQTT
         # Connector's fetchQueuedMessage reads
         # props.get("message_type") with a bare <ConfigUI/>).
-        uses_template = (
-            config_ui_el is not None and config_ui_el.find("Template") is not None
-        )
         action["props_undeclared"] = True
         if uses_template:
             action["props_undeclared_reason"] = (
                 "ConfigUI is a <Template> include -- its fields exist but "
                 "aren't readable without resolving the include, so props "
                 "may still be required"
+            )
+        elif skipped_fields:
+            # Every <Field> present lacked an id -- "declares no
+            # ConfigUI fields" would be FALSE here (fields genuinely
+            # exist, in the same object as skipped_fields saying so);
+            # a third, accurate variant, the same reasoning the
+            # <Template> branch above already gets.
+            action["props_undeclared_reason"] = (
+                f"ConfigUI declares {skipped_fields} field(s), but none "
+                "carry an id, so none can be referenced by a caller; "
+                "props may still be required"
             )
         else:
             action["props_undeclared_reason"] = (
@@ -494,7 +568,19 @@ def _try_validate_action(plugin, plugin_id, action_id):
         )
 
     path = _actions_xml_path(bundle_path)
-    if not _actions_xml_exists(path):
+    try:
+        exists = _actions_xml_exists(path)
+    except _ActionsXmlIOError as exc:
+        # A real I/O fault (not "genuinely absent") checking for
+        # Actions.xml -- unlike every other refusal in this function,
+        # this one is pre-dispatch but propagates as a hard failure
+        # (see _actions_xml_exists), so it needs the same dispatch
+        # guarantee every other pre-dispatch refusal in this module
+        # carries.
+        raise _ActionsXmlIOError(
+            f"{exc}; action {action_id!r} was NOT dispatched."
+        ) from exc
+    if not exists:
         return None, False, f"no Actions.xml at {path!r}"
 
     try:
@@ -555,7 +641,14 @@ def _list_plugin_actions_handler(args, indigo_module):
         )
 
     actions_xml_path = _actions_xml_path(bundle_path)
-    if not _actions_xml_exists(actions_xml_path):
+    try:
+        exists = _actions_xml_exists(actions_xml_path)
+    except _ActionsXmlIOError as exc:
+        # Every other refusal in this handler names plugin_id; the
+        # bare _actions_xml_exists message only names the path (post-
+        # merge review round 2, LOW).
+        raise _ActionsXmlIOError(f"plugin {plugin_id!r}: {exc}") from exc
+    if not exists:
         return {
             "results": [],
             "total_count": 0,
@@ -637,9 +730,12 @@ def _device_matches_self_filter(dev, plugin_id, device_filter):
     ``self.sprinkler``) would otherwise happily accept a Sonos
     ZonePlayer id and dispatch to the wrong plugin's device.
     Comma-separated filter lists are ORed (accept if any alternative
-    matches) -- only ever called for a filter where every alternative
-    IS self-scoped (see ``_is_self_scoped_filter``), so it never needs
-    to consider a non-``self`` alternative itself.
+    matches) -- called for ANY filter that contains at least one
+    self-scoped alternative, not just a wholly self-scoped one (see
+    the caller): a mixed filter's non-``self`` alternatives are simply
+    never matched by the loop below, so trying the self-scoped ones
+    first is always safe and can only turn a false "unvalidated" into
+    a true "validated", never the reverse.
     """
     alternatives = [f.strip() for f in device_filter.split(",") if f.strip()]
     dev_plugin_id = getattr(dev, "pluginId", None)
@@ -677,12 +773,25 @@ def _is_self_scoped_filter(device_filter):
 def _device_validation_gap_reason(device_filter):
     """Explain why device OWNERSHIP could not be validated, for the
     device_validated_reason payload field -- distinguishes "no
-    deviceFilter at all" from "wholly non-self" from "mixed", so the
-    message is accurate to which of those three is actually true
-    rather than a single generic sentence for all of them."""
-    if not device_filter:
+    deviceFilter attribute at all" from "deviceFilter="" (present but
+    empty)" from "wholly non-self" from "mixed", so the message is
+    accurate to which of those four is actually true rather than a
+    single generic sentence for all of them. The first two are worth
+    telling apart: ``device_required`` is true whenever the attribute
+    is merely PRESENT (see ``_parse_action_element``), so
+    ``deviceFilter=""`` is the one shape where "declares no
+    deviceFilter" would contradict device_required having just forced
+    the caller to supply a device_id at all."""
+    if device_filter is None:
         return (
             "action declares no deviceFilter, so only the device's "
+            "existence was checked, not ownership"
+        )
+    if device_filter == "":
+        return (
+            "action declares an empty deviceFilter (deviceFilter=\"\"), "
+            "which requires a device_id but specifies no filter criteria "
+            "to validate ownership against, so only the device's "
             "existence was checked, not ownership"
         )
     alternatives = [f.strip() for f in device_filter.split(",") if f.strip()]
@@ -698,7 +807,7 @@ def _device_validation_gap_reason(device_filter):
     )
 
 
-def _plugin_execute_action_handler(args, indigo_module):
+def _plugin_execute_action_handler(args, indigo_module, logger=None):
     """Dispatch one declared Actions.xml action on another plugin via
     ``executeAction``.
 
@@ -714,7 +823,18 @@ def _plugin_execute_action_handler(args, indigo_module):
     called. A failure AFTER that point (the dispatch call itself, or
     serialising its return value) is reported as WAS DISPATCHED, NOT
     as not-performed -- see the module docstring's closing paragraph.
+    ``logger`` (optional, threaded from ``register``) carries that
+    same disclosure for a control-flow exception (KeyboardInterrupt/
+    SystemExit), which must keep its own type and so can no longer
+    carry the disclosure in its message text -- see the
+    ``except BaseException`` blocks below. Falls back to the module
+    ``_LOGGER`` when omitted OR explicitly passed ``None`` (post-merge
+    review round 2: a bare ``if logger is not None:`` guard meant the
+    disclosure was silently dropped -- not the exception, not a log,
+    not a payload field -- anywhere nothing was threaded through,
+    which a test then pinned as acceptable rather than a gap to close).
     """
+    logger = logger or _LOGGER
     _reject_unknown_args(
         args, ("plugin_id", "action_id", "props", "device_id", "wait_until_done")
     )
@@ -812,18 +932,27 @@ def _plugin_execute_action_handler(args, indigo_module):
     if device_id is not None:
         dev = _lookup_or_raise(indigo_module.devices, device_id, "device")
         device_filter = action["device_filter"]
-        if device_filter and _is_self_scoped_filter(device_filter):
-            if _device_matches_self_filter(dev, plugin_id, device_filter):
-                device_validated = True
-            else:
-                raise ValueError(
-                    f"device {device_id} does not match action "
-                    f"{action_id!r}'s deviceFilter {device_filter!r}: it "
-                    f"belongs to plugin {getattr(dev, 'pluginId', None)!r} "
-                    f"(deviceTypeId {getattr(dev, 'deviceTypeId', None)!r}), "
-                    f"but this action requires "
-                    f"{_describe_device_filter_requirement(device_filter)}."
-                )
+        # Try the self-scoped alternatives FIRST, even for a mixed
+        # filter (e.g. "self.zone, indigo.relay") -- a match there is
+        # still a real, checkable confirmation regardless of what else
+        # the filter allows. Only a filter that is FULLY self-scoped
+        # (_is_self_scoped_filter) and still doesn't match is a hard
+        # rejection: every alternative was checkable and none matched.
+        # A mixed filter that doesn't match the self-scoped
+        # alternative(s) is left unvalidated, not rejected -- it may
+        # still match the non-self alternative this module can't
+        # check.
+        if device_filter and _device_matches_self_filter(dev, plugin_id, device_filter):
+            device_validated = True
+        elif device_filter and _is_self_scoped_filter(device_filter):
+            raise ValueError(
+                f"device {device_id} does not match action "
+                f"{action_id!r}'s deviceFilter {device_filter!r}: it "
+                f"belongs to plugin {getattr(dev, 'pluginId', None)!r} "
+                f"(deviceTypeId {getattr(dev, 'deviceTypeId', None)!r}), "
+                f"but this action requires "
+                f"{_describe_device_filter_requirement(device_filter)}."
+            )
         else:
             device_validated = False
             device_validated_reason = _device_validation_gap_reason(device_filter)
@@ -837,29 +966,102 @@ def _plugin_execute_action_handler(args, indigo_module):
     # action that props genuinely do cross the boundary intact for a
     # ConfigUI-less action -- this path is sound, not just permissive.
     declared_fields = {p["id"]: p for p in action["props"]} if action is not None else {}
+    uses_template = bool(action is not None and action.get("uses_template"))
+    props_unenforceable = []
     if declared_fields:
         unknown_props = set(raw_props) - set(declared_fields)
-        if unknown_props:
+        if unknown_props and not uses_template:
             raise ValueError(
                 f"unknown prop(s) {sorted(unknown_props)} for action "
                 f"{action_id!r}; declared fields: {sorted(declared_fields)}"
             )
+        # unknown_props can still be non-empty here ONLY when
+        # uses_template: the visible field set is known-incomplete (a
+        # <Template> include may declare more), so an "unknown" key may
+        # legitimately belong to it -- skipped below rather than
+        # refused, same reasoning as the no-declared-fields branch.
         for key, value in raw_props.items():
+            if key not in declared_fields:
+                continue
             allowed_values = declared_fields[key].get("values")
             if isinstance(allowed_values, list):  # static enum only
                 allowed = {
                     str(opt["value"]) for opt in allowed_values
                     if opt["value"] is not None
                 }
+                if not allowed and allowed_values:
+                    # Every <Option> in this static list lacked a
+                    # value attribute -- the enum is UNENFORCEABLE,
+                    # not "every value is invalid". Refusing here
+                    # would leave the model with allowed: [] and
+                    # nothing to retry toward (an unactionable refusal
+                    # loop); pass the value through unchecked instead,
+                    # same as a genuinely dynamic menu -- but record
+                    # it, since props_validated:true must not then
+                    # also imply this field's value was actually
+                    # checked.
+                    props_unenforceable.append(key)
+                    continue
                 if str(value) not in allowed:
+                    unread = len(allowed_values) - len(allowed)
+                    unread_note = ""
+                    if unread == 1:
+                        unread_note = (
+                            " (1 further declared option could not be "
+                            "read -- its <Option> carries no value "
+                            "attribute)"
+                        )
+                    elif unread > 1:
+                        unread_note = (
+                            f" ({unread} further declared options could "
+                            "not be read -- their <Option> elements carry "
+                            "no value attribute)"
+                        )
                     raise ValueError(
                         f"prop {key!r} = {value!r} is not a valid value for "
                         f"action {action_id!r}; allowed: {sorted(allowed)}"
+                        f"{unread_note}"
                     )
         hidden_ids = {fid for fid, f in declared_fields.items() if f.get("hidden")}
         props_not_supplied = sorted(set(declared_fields) - set(raw_props) - hidden_ids)
         props_validated = True
-        props_validated_reason = None
+        # The declared field set is "fully known" only when nothing
+        # about it is incomplete -- no unenforceable enum, no id-less
+        # fields this parser had to skip, no <Template> include that
+        # may declare more. Only then is props_not_supplied a
+        # trustworthy positive "nothing missing" claim (post-merge
+        # review round 2: props_not_supplied: [] alongside
+        # skipped_options > 0 was a self-contradiction -- "nothing
+        # missing" next to "some values couldn't even be checked"),
+        # and only then does this call count toward `verified` below.
+        incomplete_notes = []
+        if props_unenforceable:
+            incomplete_notes.append(
+                f"prop(s) {sorted(props_unenforceable)}: every <Option> on "
+                "that field lacked a value attribute, so its legal values "
+                "are unknown and the supplied value was passed through "
+                "unchecked"
+            )
+        if action.get("skipped_fields"):
+            incomplete_notes.append(
+                f"{action['skipped_fields']} declared field(s) have no id "
+                "and could not be referenced or validated at all"
+            )
+        if uses_template:
+            incomplete_notes.append(
+                "ConfigUI mixes a <Template> include with readable fields "
+                "-- the include's own fields are unknown, so an "
+                "unrecognised prop name may legitimately belong to it and "
+                "was passed through unchecked"
+            )
+        if incomplete_notes:
+            props_validated_reason = (
+                "props_validated is true only for the fields this module "
+                "could actually see -- the declared field set is "
+                "known-incomplete: " + "; ".join(incomplete_notes)
+            )
+        else:
+            props_validated_reason = None
     else:
         props_not_supplied = None
         props_validated = False
@@ -870,13 +1072,32 @@ def _plugin_execute_action_handler(args, indigo_module):
                 "unknown"
             )
         else:
+            # Prefer the action's own parse-time reason (set by
+            # _parse_action_element -- generic, <Template>-include, or
+            # all-fields-id-less) over a single hardcoded sentence: for
+            # a <Template file="..."/> ConfigUI, "declares no ConfigUI
+            # fields" is FALSE and dangerous -- fields genuinely exist
+            # and may be required, and this would tell the caller the
+            # opposite. The dispatch-specific caveat about silent
+            # discarding is appended regardless of which reason
+            # applies.
             props_validated_reason = (
-                "action declares no ConfigUI fields, so props could not be "
-                "checked against a known set and were passed through "
-                "unchecked -- an unrecognised prop name is silently "
-                "discarded by Indigo (no error raised), so this call can "
-                "report success even if a prop name was mistyped"
+                f"{action['props_undeclared_reason']} -- an unrecognised "
+                "prop name is silently discarded by Indigo (no error "
+                "raised), so this call can report success even if a "
+                "required field was omitted or a prop name was mistyped"
             )
+
+    # A single completeness gate the payload and `verified` both rely
+    # on -- props_validated alone said only "everything we COULD check,
+    # checked out", which is not the same claim as "we could check
+    # everything".
+    props_fully_known = (
+        props_validated
+        and not props_unenforceable
+        and not (action is not None and action.get("skipped_fields"))
+        and not uses_template
+    )
 
     # Confirmed live (2026-08-24): executeAction("bogusId",
     # waitUntilDone=False) returns None with NO exception at all --
@@ -899,38 +1120,80 @@ def _plugin_execute_action_handler(args, indigo_module):
 
     try:
         result = plugin.executeAction(action_id, **kwargs)
-    except BaseException as exc:
+    except Exception as exc:
         # executeAction WAS called -- a non-idempotent action (run a
         # sprinkler zone, send a push notification) may have already
-        # partially or fully completed. Catching BaseException (not
-        # just Exception) and re-raising is justified here and ONLY
-        # here: the guarantee this wraps is about an irreversible side
-        # effect already having happened, not about the error class --
-        # a KeyboardInterrupt/SystemExit reaching the caller here would
-        # otherwise bypass the WAS-DISPATCHED disclosure entirely.
-        # Raising anything other than ValueError/TypeError routes this
-        # to mcp_handler's back-off bucket (JSON-RPC internal error)
-        # rather than its self-correct-and-retry one -- retrying
-        # blindly is the wrong response to a fault after a write.
+        # partially or fully completed. Raising anything other than
+        # ValueError/TypeError routes this to mcp_handler's back-off
+        # bucket (JSON-RPC internal error) rather than its
+        # self-correct-and-retry one -- retrying blindly is the wrong
+        # response to a fault after a write. {type(exc).__name__} so a
+        # bare exception with no message doesn't render as
+        # "...before this error: ." with nothing after the colon.
         raise RuntimeError(
             f"plugin {plugin_id!r} action {action_id!r} WAS DISPATCHED to "
             f"executeAction and may have partially or fully completed "
-            f"before this error: {exc}. Do NOT blindly retry -- check the "
-            f"device/plugin state and the {plugin_id!r} plugin's own "
-            "event log first."
+            f"before this error: {type(exc).__name__}: {exc}. Do NOT "
+            f"blindly retry -- check the device/plugin state and the "
+            f"{plugin_id!r} plugin's own event log first."
         ) from exc
+    except BaseException:
+        # Same already-happened guarantee as above, but a control-flow
+        # exception (KeyboardInterrupt/SystemExit -- Indigo shutting
+        # the plugin host down mid-call) MUST keep its own type so the
+        # host can act on it: wrapping it into RuntimeError (a plain
+        # Exception subclass) would let mcp_handler's `except
+        # Exception` bucket catch and swallow it, report a JSON-RPC
+        # -32603 error, and let the request loop continue as though
+        # nothing happened -- Indigo could no longer shut the plugin
+        # down cleanly, and a Ctrl-C would be misreported to the model
+        # as a dispatch fault on this one action. The exception itself
+        # can no longer carry the WAS-DISPATCHED disclosure in its
+        # message text, so it goes to the logger instead, then the
+        # exception is re-raised completely unchanged.
+        try:
+            logger.warning(
+                "plugin %r action %r WAS DISPATCHED to executeAction and "
+                "may have partially or fully completed before a "
+                "control-flow exception interrupted this call; NOT "
+                "retried automatically -- check the device/plugin state "
+                "and the %r plugin's own event log first.",
+                plugin_id, action_id, plugin_id,
+            )
+        except BaseException:
+            # The disclosure must never displace the exception it
+            # discloses -- a broken logger (a full disk, a misconfigured
+            # handler) raising here would otherwise propagate INSTEAD
+            # of the original control-flow exception, and could even
+            # arrive as a TypeError/ValueError that mcp_handler then
+            # routes to its self-correct-and-retry bucket -- reporting
+            # a host shutdown to the model as an input error inviting a
+            # retry, which is worse than not logging at all.
+            pass
+        raise
 
     payload = {
         "plugin_id": plugin_id,
         "action_id": action_id,
         "device_id": device_id,
-        "wait_until_done": wait_until_done,
+        # The EFFECTIVE value actually passed to executeAction, not
+        # necessarily what the caller asked for -- when overridden
+        # (see wait_until_done_overridden below), the caller's
+        # original request goes in wait_until_done_requested instead.
+        # Reporting the ignored request here made the payload
+        # self-contradictory: wait_until_done:false alongside a
+        # result value the tool description says is unreachable when
+        # false.
+        "wait_until_done": effective_wait_until_done,
         "action_validated": action_validated,
         "props_validated": props_validated,
     }
-    if not action_validated:
-        payload["action_validated_reason"] = action_validated_reason
+    # Both wait_until_done_overridden facts in ONE block (post-merge
+    # review round 2, LOW: these were two separate `if
+    # wait_until_done_overridden:` blocks with unrelated payload keys
+    # sandwiched between them).
     if wait_until_done_overridden:
+        payload["wait_until_done_requested"] = wait_until_done
         payload["wait_until_done_overridden"] = True
         payload["wait_until_done_overridden_reason"] = (
             "action could not be validated, so waitUntilDone was forced "
@@ -938,50 +1201,137 @@ def _plugin_execute_action_handler(args, indigo_module):
             "action id when waitUntilDone is true (confirmed live); with "
             "false it returns None with no error at all"
         )
+    if not action_validated:
+        payload["action_validated_reason"] = action_validated_reason
+        # A third unknowable alongside the action's declared fields:
+        # with the action itself unvalidated, whether it REQUIRES a
+        # device at all is also unknown. executeAction defaults
+        # deviceId to 0 regardless, so a device-requiring action
+        # dispatched with none at all can reach this point -- the
+        # target plugin's own callback then fails silently in ITS
+        # event log, invisible here, so completed_unverified below may
+        # mean the action never really ran.
+        payload["device_requirement_unknown_reason"] = (
+            "action could not be validated, so whether it requires a "
+            "device at all is unknown; if it does, executeAction was "
+            "still called with none -- a completed_unverified result "
+            "here does not guarantee the action's callback actually ran "
+            "(check the target plugin's own event log)"
+        )
     if device_validated is not None:
         payload["device_validated"] = device_validated
         if not device_validated:
             payload["device_validated_reason"] = device_validated_reason
-    if props_validated:
+    # props_not_supplied is a POSITIVE "nothing missing" claim, so it
+    # is only included when the declared field set is fully known --
+    # gated on props_fully_known, not merely props_validated (post-
+    # merge review round 2: props_not_supplied: [] alongside
+    # skipped_options > 0 contradicted itself). props_validated_reason
+    # is included whenever it's set, independent of the props_validated
+    # boolean, since the field set can now be incomplete (and need
+    # explaining) even while props_validated is true.
+    if props_fully_known:
         payload["props_not_supplied"] = props_not_supplied
-    else:
+    if props_validated_reason is not None:
         payload["props_validated_reason"] = props_validated_reason
+    if props_unenforceable:
+        payload["props_unenforceable"] = sorted(props_unenforceable)
+        payload["props_unenforceable_reason"] = (
+            "every <Option> on these field(s) lacked a value attribute, "
+            "so their legal values are unknown; the supplied value(s) "
+            "were passed through unchecked rather than refused"
+        )
+    if action is not None and action.get("skipped_fields"):
+        payload["skipped_fields"] = action["skipped_fields"]
+    if action is not None and action.get("skipped_options"):
+        payload["skipped_options"] = action["skipped_options"]
+
+    # ONE verified computation covering props (fully known AND
+    # checked), device ownership, applied to every branch below --
+    # not just the "completed"/"completed_unverified" choice.
+    # Previously completed_unverified fired only on props_validated
+    # being false, never on device_validated being false (a wrong
+    # device has NO Indigo-side backstop at all, unlike props, which
+    # at least get a partial check) nor on the field set merely being
+    # INCOMPLETE despite props_validated:true (an unenforceable enum,
+    # id-less fields, or a mixed <Template> -- post-merge review round
+    # 2). And the dispatched/returned branches never carried any
+    # marker at all, though "dispatched" (no wait, no completion
+    # signal whatsoever) is the weakest claim of the three.
+    # device_validated is None (device_id not supplied, or its
+    # deviceFilter didn't require one) does not itself make the call
+    # unverified -- only an explicit False does.
+    verified = props_fully_known and device_validated is not False
+    payload["verified"] = verified
 
     if result is None:
         if not effective_wait_until_done:
             # Queued and not awaited at all -- no completion signal
             # whatsoever, not even a raised error could ever surface.
             payload["result"] = "dispatched"
-        elif props_validated:
+        elif verified:
             payload["result"] = "completed"
         else:
-            # Ran to completion (we waited), but either the action id
-            # or its props (or both) could not be confirmed beforehand
-            # -- distinct from "completed" so a model reading only the
-            # top-line result field can't mistake this for a fully
-            # verified call.
+            # Ran to completion (we waited), but the action's props
+            # and/or the target device's ownership could not be
+            # confirmed beforehand -- distinct from "completed" so a
+            # model reading only the top-line result field can't
+            # mistake this for a fully verified call.
             payload["result"] = "completed_unverified"
     else:
+        payload["result"] = "returned"
         try:
-            payload["result"] = "returned"
             payload["value"] = _json_safe(result)
-        except BaseException as exc:
+        except Exception as exc:
             # The action itself already succeeded (executeAction
             # returned a value); only serialising it failed. Same
             # already-happened guarantee as the executeAction except
-            # above, including catching BaseException -- a bug in our
-            # own serialization must never read as a failed write.
+            # below, including {type(exc).__name__} so a bare
+            # exception with no message (e.g. a raw KeyboardInterrupt)
+            # doesn't render as "...serialised: ." with nothing after
+            # the colon.
             raise RuntimeError(
                 f"plugin {plugin_id!r} action {action_id!r} executed "
                 "successfully (executeAction returned a value) but that "
-                f"return value could not be serialised: {exc}. The action "
-                "itself already ran -- do not retry it."
+                f"return value could not be serialised: "
+                f"{type(exc).__name__}: {exc}. The action itself already "
+                "ran -- do not retry it."
             ) from exc
+        except BaseException:
+            # Same already-happened guarantee, but a control-flow
+            # exception (KeyboardInterrupt/SystemExit) MUST keep its
+            # own type so the host can act on it -- wrapping it into
+            # RuntimeError would let mcp_handler's Exception bucket
+            # catch and swallow it, and the request loop would
+            # continue as though nothing happened. The exception can
+            # no longer carry the disclosure in its text, so it goes
+            # to the logger instead, then the exception is re-raised
+            # completely unchanged.
+            try:
+                logger.warning(
+                    "plugin %r action %r executed successfully "
+                    "(executeAction returned a value) but a control-flow "
+                    "exception interrupted serialising the return value; "
+                    "the action itself already ran -- do not retry it.",
+                    plugin_id, action_id,
+                )
+            except BaseException:
+                # See the dispatch-site except block above: the
+                # disclosure must never displace the exception it
+                # discloses.
+                pass
+            raise
     return payload
 
 
-def register(handler, *, indigo_module, **_):
-    """Register the plugin-actions tools onto the given MCPHandler."""
+def register(handler, *, indigo_module, logger=None, **_):
+    """Register the plugin-actions tools onto the given MCPHandler.
+
+    ``logger`` (optional) threads into ``plugin_execute_action`` so a
+    control-flow exception (KeyboardInterrupt/SystemExit) that must
+    keep its own type on re-raise can still have its WAS-DISPATCHED
+    disclosure recorded somewhere.
+    """
     handler.register_tool(
         name="list_plugin_actions",
         description=(
@@ -1023,10 +1373,13 @@ def register(handler, *, indigo_module, **_):
             "the sanctioned cross-plugin write surface (Indigo blocks "
             "writing another plugin's pluginProps directly). Use "
             "list_plugin_actions first to see the real action ids and "
-            "declared props for this plugin. Declared fields you don't "
-            "supply are fine (defaults/optional) but are listed back in "
-            "props_not_supplied -- check that field before treating the "
-            "call as fully configured. An unrecognized prop key (or an "
+            "declared props for this plugin. When the action's fields "
+            "could be checked (props_validated:true), declared fields "
+            "you don't supply are fine (defaults/optional) but are "
+            "listed back in props_not_supplied -- check that field "
+            "before treating the call as fully configured; the key is "
+            "absent when props_validated is false, since there was no "
+            "known field set to compare against. An unrecognized prop key (or an "
             "out-of-range value for a static enum field) is refused ONLY "
             "when the action declares fields to check against "
             "(props_validated:true); one with none declared has no "
@@ -1038,22 +1391,32 @@ def register(handler, *, indigo_module, **_):
             "props and NO device_id were given (waitUntilDone is then "
             "forced true so Indigo's own InvalidAction can catch a bad "
             "action id -- wait_until_done_overridden:true discloses "
-            "that); otherwise it's refused rather than sending "
-            "unchecked props/device_id. device_id is checked for "
-            "existence AND, when the action's deviceFilter is fully "
-            "self-scoped, that the device actually belongs to this "
-            "plugin (device_validated in the payload says which); a "
-            "wrong device has NO Indigo-side backstop, unlike a wrong "
-            "action id. wait_until_done (default true) is passed to "
-            "executeAction's waitUntilDone: true blocks until the action "
-            "finishes -- a None return then means result:\"completed\", "
-            "or result:\"completed_unverified\" if action_validated or "
-            "props_validated is false; false means Indigo queued the "
-            "action without waiting at all (result:\"dispatched\" on a "
-            "None return -- weaker, no completion signal whatsoever, not "
-            "even an error could ever surface). props is a plain object, "
-            "converted to indigo.Dict internally. A non-None return "
-            "reports result:\"returned\" with the value."
+            "that, with the caller's original request in "
+            "wait_until_done_requested); otherwise it's refused rather "
+            "than sending unchecked props/device_id -- and even the one "
+            "shape that IS attempted has an unknowable third gap: "
+            "whether the action requires a device at all "
+            "(device_requirement_unknown_reason), since executeAction "
+            "still gets called with none either way. device_id is "
+            "checked for existence AND, against any self-scoped "
+            "alternative in the action's deviceFilter, that the device "
+            "actually belongs to this plugin (device_validated in the "
+            "payload says which); a wrong device has NO Indigo-side "
+            "backstop, unlike a wrong action id. wait_until_done "
+            "(default true, and always reflects the value ACTUALLY "
+            "used -- not the caller's request when overridden) is "
+            "passed to executeAction's waitUntilDone: true blocks until "
+            "the action finishes -- a None return then means "
+            "result:\"completed\" when verified:true (both props AND "
+            "device ownership confirmed, or not applicable), or "
+            "result:\"completed_unverified\" when verified:false; false "
+            "means Indigo queued the action without waiting at all "
+            "(result:\"dispatched\" on a None return -- weaker still, no "
+            "completion signal whatsoever, not even an error could ever "
+            "surface; verified is reported on every branch, including "
+            "this one). props is a plain object, converted to "
+            "indigo.Dict internally. A non-None return reports "
+            "result:\"returned\" with the value."
         ),
         input_schema={
             "type": "object",
@@ -1066,5 +1429,7 @@ def register(handler, *, indigo_module, **_):
                 "wait_until_done": {"type": "boolean"},
             },
         },
-        handler=lambda **args: _plugin_execute_action_handler(args, indigo_module),
+        handler=lambda **args: _plugin_execute_action_handler(
+            args, indigo_module, logger=logger
+        ),
     )

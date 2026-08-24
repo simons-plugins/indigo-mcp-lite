@@ -48,8 +48,11 @@ def register_all(handler, *, indigo_module, indexer=None,
     auto_lights.register(handler, indigo_module=indigo_module)
     # Generic cross-plugin action discovery + dispatch (issue #71) —
     # the sanctioned write surface for every action-bearing plugin,
-    # not just Auto Lights. No indexer/history dependency.
-    plugin_actions.register(handler, indigo_module=indigo_module)
+    # not just Auto Lights. No indexer/history dependency. Logger
+    # threads through so a control-flow exception re-raised unchanged
+    # from plugin_execute_action can still log its WAS-DISPATCHED
+    # disclosure (post-merge review, item 1).
+    plugin_actions.register(handler, indigo_module=indigo_module, logger=logger)
     if indexer is not None:
         find_devices.register(handler, indexer=indexer)
     # History tools always register; an absent provider yields the
