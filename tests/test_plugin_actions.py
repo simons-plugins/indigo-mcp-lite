@@ -25,6 +25,7 @@ Fixture Actions.xml is modeled on the real
 plus a dedicated ``_FIELD_SHAPES_ACTIONS_XML`` for the real-world
 field/action shapes named above.
 """
+import os
 import plistlib
 from unittest.mock import MagicMock
 
@@ -380,6 +381,10 @@ def test_list_plugin_actions_happy_path(mock_indigo, tmp_path):
     assert ids == {"setStandbyMode", "startZoneWithDelay", "reportWeather",
                     "internalSync", "noop"}
     assert result["total_count"] == len(result["results"])
+    by_id = {a["id"]: a for a in result["results"]}
+    # No id-less fields anywhere in this fixture -- skipped_fields
+    # must not appear at all (absent, not zero).
+    assert "skipped_fields" not in by_id["setStandbyMode"]
 
 
 def test_list_plugin_actions_excludes_separator(mock_indigo, tmp_path):
@@ -671,6 +676,77 @@ def test_list_plugin_actions_unknown_plugin_id_names_it(mock_indigo, tmp_path):
         _list_plugin_actions_handler({"plugin_id": "com.unknown"}, mock_indigo)
 
 
+def test_list_plugin_actions_io_fault_checking_actions_xml_raises_with_errno(
+    mock_indigo, tmp_path, monkeypatch
+):
+    """review round 4, item 2: os.path.isfile swallows a real OSError
+    (permission denial, a stale network handle, an unmounted volume --
+    this workspace runs bundles off /Volumes/...) as False --
+    indistinguishable from "genuinely doesn't exist". A positive claim
+    ("plugin bundle declares no Actions.xml") derived from a check
+    that couldn't even look is the same lie round 3 deleted from the
+    filesystem-scan bundle lookup, relocated here. Must raise, naming
+    the errno, not report a soft empty result."""
+    import tools.plugin_actions as plugin_actions_module
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+    actions_xml_path = plugin_actions_module._actions_xml_path(plugin.pluginFolderPath)
+
+    real_stat = os.stat
+
+    def _fake_stat(path, *a, **k):
+        if path == actions_xml_path:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(plugin_actions_module.os, "stat", _fake_stat)
+
+    with pytest.raises(ValueError, match="errno 13"):
+        _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+
+
+def test_list_plugin_actions_genuinely_missing_actions_xml_still_soft_empty(
+    mock_indigo, tmp_path, monkeypatch
+):
+    """The inverse of the I/O-fault test above: FileNotFoundError
+    specifically still means the softer, legitimate "no Actions.xml"
+    empty result -- proves the new os.stat-based check didn't turn
+    EVERY path into a hard failure, only the ones that couldn't be
+    determined at all."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    assert result["no_actions_reason"] == "plugin bundle declares no Actions.xml"
+
+
+def test_list_plugin_actions_relative_plugin_folder_path_refused(mock_indigo, tmp_path):
+    """review round 4, item 7: an empty/relative pluginFolderPath must
+    not be silently os.path.join'd into a relative Actions.xml path
+    (resolved against the plugin host's cwd, in principle reading a
+    totally different bundle's Actions.xml) -- must be a named,
+    explicit refusal instead."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    plugin = _fake_plugin(plugin_folder_path="Contents/Server Plugin")
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="not an absolute path"):
+        _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+
+
+def test_list_plugin_actions_empty_plugin_folder_path_refused(mock_indigo, tmp_path):
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    plugin = _fake_plugin(plugin_folder_path="")
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="not an absolute path"):
+        _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+
+
 def test_list_plugin_actions_rejects_unknown_args(mock_indigo, tmp_path):
     from tools.plugin_actions import _list_plugin_actions_handler
 
@@ -769,6 +845,50 @@ def test_list_plugin_actions_id_less_field_excluded_from_props(mock_indigo, tmp_
     # field is dropped entirely.
     assert None not in {p["id"] for p in rich["props"]}
     assert len(rich["props"]) == 4
+
+
+def test_list_plugin_actions_id_less_field_counted_in_skipped_fields(mock_indigo, tmp_path):
+    """review round 4, 'should fix': an id-less <Field> was dropped
+    with NO counter at all, unlike an id-less <Action> (which has
+    skipped_actions) -- an action whose fields all lack ids would be
+    indistinguishable from a genuinely bare <ConfigUI/>."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    assert by_id["richAction"]["skipped_fields"] == 1
+
+
+def test_list_plugin_actions_template_include_gets_distinct_reason(mock_indigo, tmp_path):
+    """review round 4, 'should fix': a ConfigUI built from a
+    <Template file="..."> include yields zero <Field> children, so it
+    was mislabelled "declares no ConfigUI fields" -- a different fact
+    from a genuinely field-less action, since fields DO exist there,
+    they just aren't readable without resolving the include."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(
+        mock_indigo, tmp_path, PLUGIN_ID,
+        actions_xml=(
+            '<?xml version="1.0"?>\n<Actions>\n'
+            '    <Action id="templatedAction">\n'
+            "        <Name>Templated Action</Name>\n"
+            "        <CallbackMethod>templatedAction</CallbackMethod>\n"
+            "        <ConfigUI>\n"
+            '            <Template file="shared_fields.xml"/>\n'
+            "        </ConfigUI>\n"
+            "    </Action>\n</Actions>\n"
+        ),
+    )
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    action = result["results"][0]
+    assert action["props"] == []
+    assert action["props_undeclared"] is True
+    assert "<Template>" in action["props_undeclared_reason"]
+    assert "no ConfigUI fields" not in action["props_undeclared_reason"]
 
 
 def test_list_plugin_actions_id_less_action_routed_through_skipped_bookkeeping(
@@ -1000,6 +1120,47 @@ def test_execute_action_accepts_int_value_matching_string_option(mock_indigo, tm
     plugin.executeAction.assert_called_once()
 
 
+def test_execute_action_option_with_no_value_attribute_not_accepted_as_none(
+    mock_indigo, tmp_path
+):
+    """review round 4, 'should fix': an <Option> missing its value
+    attribute parses to {"value": None, ...}; the old allowlist
+    comprehension did str(None) == "None", so a caller passing the
+    literal string "None" was silently accepted as a valid declared
+    value. The valueless option itself must be excluded from the
+    allowlist entirely, and the literal string "None" must still be
+    rejected as out-of-range."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(
+        mock_indigo, tmp_path, PLUGIN_ID,
+        actions_xml=(
+            '<?xml version="1.0"?>\n<Actions>\n'
+            '    <Action id="pickOpt">\n'
+            "        <Name>Pick Opt</Name>\n"
+            "        <CallbackMethod>pickOpt</CallbackMethod>\n"
+            "        <ConfigUI>\n"
+            '            <Field type="menu" id="opt">\n'
+            "                <Label>Option:</Label>\n"
+            "                <List>\n"
+            '                    <Option>No Value Here</Option>\n'
+            '                    <Option value="1">One</Option>\n'
+            "                </List>\n"
+            "            </Field>\n"
+            "        </ConfigUI>\n"
+            "    </Action>\n</Actions>\n"
+        ),
+        forbid_execute=True,
+    )
+
+    with pytest.raises(ValueError, match="not a valid value"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "pickOpt", "props": {"opt": "None"}},
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
 def test_execute_action_dynamic_list_value_not_enforced(mock_indigo, tmp_path):
     """A dynamic menu's legal values are correctly unknowable -- must
     NOT be enforced the way a static enum's are."""
@@ -1035,7 +1196,9 @@ def test_execute_action_undeclared_props_pass_through_unchecked(mock_indigo, tmp
     empty one -- refusing this would make the whole hidden-action
     class uncallable. Actions.xml WAS readable and the action WAS
     found there, so action_validated is true even though
-    props_validated is false."""
+    props_validated is false -- and result is "completed_unverified"
+    (review round 4, item 4), not byte-identical to a fully-verified
+    "completed"."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
     plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
@@ -1048,13 +1211,16 @@ def test_execute_action_undeclared_props_pass_through_unchecked(mock_indigo, tmp
         },
         mock_indigo,
     )
-    assert result["result"] == "completed"
+    assert result["result"] == "completed_unverified"
     assert result["action_validated"] is True
     assert "action_validated_reason" not in result
     assert result["props_validated"] is False
     assert "props_validated_reason" in result
     assert "no ConfigUI fields" in result["props_validated_reason"]
-    assert result["props_not_supplied"] == []
+    assert "silently discarded" in result["props_validated_reason"]
+    # review round 4, item 3: absent != empty -- props_not_supplied is
+    # a positive "nothing missing" claim on the validated path only.
+    assert "props_not_supplied" not in result
     plugin.executeAction.assert_called_once()
 
 
@@ -1080,31 +1246,101 @@ def test_execute_action_declared_case_still_hard_rejects(mock_indigo, tmp_path):
 
 # ---------------------------------------------------------------------
 # plugin_execute_action -- Actions.xml unreadable: ATTEMPT the
-# dispatch anyway (review round 3, D -- reverses round 2's refusal)
+# dispatch anyway, but ONLY when nothing device/prop-shaped could go
+# wrong silently (review round 3, D; narrowed by round 4, item 1 --
+# deviceFilter has NO Indigo backstop, unlike a bad action id, and
+# the degraded path can't know the deviceFilter OR the declared props
+# at all)
 # ---------------------------------------------------------------------
 
-def test_execute_action_missing_xml_attempts_dispatch_anyway(mock_indigo, tmp_path):
-    """Actions.xml was never Indigo's own guard against a bad action
-    id (executeAction's own InvalidAction is, confirmed live) -- an
-    unreadable Actions.xml is not a safety gap, only a worse error
-    message. Missing Actions.xml must NOT refuse the call; it must
-    dispatch and report what it couldn't validate."""
+def test_execute_action_missing_xml_no_props_no_device_dispatches(mock_indigo, tmp_path):
+    """The one shape the degraded path may still attempt: no props,
+    no device_id. Indigo's own InvalidAction (with waitUntilDone
+    forced true) is the only thing that could catch a wrong id here,
+    and there's nothing else -- no device, no props -- that could go
+    wrong silently."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
     plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
 
     result = _plugin_execute_action_handler(
-        {"plugin_id": PLUGIN_ID, "action_id": "someRealAction",
-         "props": {"whatever": "value"}},
-        mock_indigo,
+        {"plugin_id": PLUGIN_ID, "action_id": "someRealAction"}, mock_indigo,
     )
     plugin.executeAction.assert_called_once()
     assert result["action_validated"] is False
     assert "no Actions.xml" in result["action_validated_reason"]
     assert result["props_validated"] is False
     assert "could not be validated" in result["props_validated_reason"]
-    assert result["props_not_supplied"] == []
-    assert result["result"] == "completed"
+    assert "props_not_supplied" not in result
+    assert result["result"] == "completed_unverified"
+
+
+def test_execute_action_missing_xml_with_props_refused(mock_indigo, tmp_path):
+    """review round 4, item 1: props on the degraded path are refused
+    outright rather than sent unchecked -- we don't know the action's
+    declared fields at all, so a mistyped prop name has no chance of
+    being caught (Indigo silently drops it regardless)."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None,
+                       forbid_execute=True)
+
+    with pytest.raises(ValueError, match="could not be validated"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "someRealAction",
+             "props": {"whatever": "value"}},
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_missing_xml_with_device_id_refused_without_checking_existence(
+    mock_indigo, tmp_path
+):
+    """review round 4, item 1: device_id on the degraded path is
+    refused outright -- deviceFilter has NO Indigo-side backstop
+    (unlike a bad action id), so this module is the only guard, and
+    it can't validate a deviceFilter it doesn't know. The refusal
+    must happen BEFORE even checking the device exists -- proven by a
+    devices collection that raises AssertionError if touched at all."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None,
+                       forbid_execute=True)
+
+    def _raise_if_touched(_key):
+        raise AssertionError("device existence must not be checked here")
+
+    mock_indigo.devices.__getitem__ = MagicMock(side_effect=_raise_if_touched)
+
+    with pytest.raises(ValueError, match="could not be validated"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "someRealAction", "device_id": 999},
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_missing_xml_with_both_props_and_device_refused(
+    mock_indigo, tmp_path
+):
+    """Both unchecked things named in one refusal, not just whichever
+    was checked first."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None,
+                       forbid_execute=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "someRealAction",
+             "props": {"x": 1}, "device_id": 5},
+            mock_indigo,
+        )
+    message = str(excinfo.value)
+    assert "props" in message
+    assert "device_id" in message
+    plugin.executeAction.assert_not_called()
 
 
 def test_execute_action_malformed_xml_attempts_dispatch_anyway(mock_indigo, tmp_path):
@@ -1121,45 +1357,201 @@ def test_execute_action_malformed_xml_attempts_dispatch_anyway(mock_indigo, tmp_
     assert result["props_validated"] is False
 
 
-def test_execute_action_unreadable_xml_still_validates_device_existence(
-    mock_indigo, tmp_path
-):
-    """Even when the action itself can't be validated, a supplied
-    device_id must still be checked for existence -- that's a live
-    Indigo lookup independent of Actions.xml."""
+def test_execute_action_wait_forced_true_on_degraded_dispatch(mock_indigo, tmp_path):
+    """review round 4, PROBE 1: executeAction("bogusId",
+    waitUntilDone=False) returns None with NO exception at all
+    (confirmed live) -- InvalidAction only raises when
+    waitUntilDone=True. The entire justification for dispatching on
+    the degraded path is that InvalidAction catches a bad id, so
+    waitUntilDone must be forced true there regardless of what the
+    caller asked for, and the override disclosed rather than silently
+    changing the caller's requested semantics."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None,
-                       forbid_execute=True)
-    mock_indigo.devices.__getitem__ = MagicMock(side_effect=KeyError())
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
 
-    with pytest.raises(ValueError, match="no device with id 999"):
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "someRealAction",
+         "wait_until_done": False},
+        mock_indigo,
+    )
+    _, kwargs = plugin.executeAction.call_args
+    assert kwargs["waitUntilDone"] is True
+    assert result["wait_until_done"] is False  # echoes what the caller asked
+    assert result["wait_until_done_overridden"] is True
+    assert "wait_until_done_overridden_reason" in result
+
+
+def test_execute_action_wait_not_overridden_on_validated_path(mock_indigo, tmp_path):
+    """The override is specific to the degraded path -- a fully
+    validated action must NOT have its explicit wait_until_done=False
+    silently promoted to true."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "noop", "wait_until_done": False},
+        mock_indigo,
+    )
+    _, kwargs = plugin.executeAction.call_args
+    assert kwargs["waitUntilDone"] is False
+    assert "wait_until_done_overridden" not in result
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- I/O fault vs. genuinely-absent Actions.xml,
+# and a relative/empty pluginFolderPath (review round 4, items 2 & 7)
+# ---------------------------------------------------------------------
+
+def test_execute_action_io_fault_checking_actions_xml_is_a_hard_failure(
+    mock_indigo, tmp_path, monkeypatch
+):
+    """A real I/O fault (not "genuinely absent") checking for
+    Actions.xml must NOT quietly fold into the degraded "attempt the
+    dispatch anyway" path -- that path's whole justification is
+    "Actions.xml doesn't exist or won't parse", not "something may be
+    badly wrong with this bundle". Must propagate as a hard failure,
+    never dispatched."""
+    import tools.plugin_actions as plugin_actions_module
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
+    actions_xml_path = plugin_actions_module._actions_xml_path(plugin.pluginFolderPath)
+
+    real_stat = os.stat
+
+    def _fake_stat(path, *a, **k):
+        if path == actions_xml_path:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(plugin_actions_module.os, "stat", _fake_stat)
+
+    with pytest.raises(ValueError, match="errno 13"):
         _plugin_execute_action_handler(
-            {"plugin_id": PLUGIN_ID, "action_id": "someRealAction", "device_id": 999},
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_relative_plugin_folder_path_degrades_not_joins(
+    mock_indigo, tmp_path
+):
+    """review round 4, item 7: a relative pluginFolderPath must
+    become a NAMED degradation (action_validated:false), never a
+    silent os.path.join into a path resolved against the plugin
+    host's cwd. device_id/props still refused per item 1, since the
+    action truly can't be validated."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _fake_plugin(plugin_folder_path="Contents/Server Plugin",
+                           forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="could not be validated"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop", "props": {"x": 1}},
             mock_indigo,
         )
     plugin.executeAction.assert_not_called()
 
 
-def test_execute_action_unreadable_xml_dispatches_with_valid_device_id(
+def test_execute_action_relative_plugin_folder_path_still_dispatches_bare_call(
     mock_indigo, tmp_path
 ):
+    """With no props/device_id at all, the relative-path degradation
+    is just another flavour of "action unvalidated" -- the narrowed
+    origin case still gets through."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
-    mock_indigo.devices.__getitem__ = MagicMock(
-        return_value=_fake_device(PLUGIN_ID, "sprinkler")
-    )
+    plugin = _fake_plugin(plugin_folder_path="Contents/Server Plugin")
+    mock_indigo.server.getPlugin.return_value = plugin
 
     result = _plugin_execute_action_handler(
-        {"plugin_id": PLUGIN_ID, "action_id": "someRealAction", "device_id": 42},
-        mock_indigo,
+        {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
     )
     plugin.executeAction.assert_called_once()
-    _, kwargs = plugin.executeAction.call_args
-    assert kwargs["deviceId"] == 42
-    assert result["device_id"] == 42
     assert result["action_validated"] is False
+    assert "not an absolute path" in result["action_validated_reason"]
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- module-private exception type (review round
+# 4, "should fix": a plain ValueError from anywhere inside
+# _parse_actions_xml's transitive calls must NOT silently acquire
+# "proceed with the write" semantics -- only _ActionsXmlError should
+# ---------------------------------------------------------------------
+
+def test_execute_action_unrelated_valueerror_is_not_treated_as_degraded(
+    mock_indigo, tmp_path, monkeypatch
+):
+    """Simulates a hypothetical future bug: something transitively
+    called by _parse_actions_xml raises a plain ValueError that is
+    NOT an _ActionsXmlError. _try_validate_action must NOT catch it
+    and degrade to "attempt dispatch anyway" -- it must propagate as
+    a hard failure, proving the except clause is narrowed to the
+    dedicated type rather than bare ValueError."""
+    import tools.plugin_actions as plugin_actions_module
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
+
+    def _raise_unrelated_valueerror(_path):
+        raise ValueError("some unrelated bug, not an Actions.xml parse failure")
+
+    monkeypatch.setattr(
+        plugin_actions_module, "_parse_actions_xml", _raise_unrelated_valueerror
+    )
+
+    with pytest.raises(ValueError, match="unrelated bug"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+    plugin.executeAction.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# post-dispatch honesty -- except BaseException (review round 4,
+# "should fix": the guarantee is about an irreversible side effect,
+# not the error class)
+# ---------------------------------------------------------------------
+
+def test_execute_action_base_exception_after_dispatch_still_discloses(
+    mock_indigo, tmp_path
+):
+    """A BaseException (not just Exception) after executeAction was
+    genuinely called must still get the WAS-DISPATCHED disclosure --
+    except Exception alone would let this bypass it entirely."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+    plugin.executeAction.side_effect = KeyboardInterrupt()
+
+    with pytest.raises(RuntimeError, match="WAS DISPATCHED"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+
+
+def test_execute_action_base_exception_during_serialization_still_discloses(
+    mock_indigo, tmp_path, monkeypatch
+):
+    """Same guarantee for the post-success serialization guard."""
+    import tools.plugin_actions as plugin_actions_module
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    def _raiser(_value):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(plugin_actions_module, "_json_safe", _raiser)
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, execute_result="some-value")
+
+    with pytest.raises(RuntimeError, match="already ran"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+    plugin.executeAction.assert_called_once()
 
 
 # ---------------------------------------------------------------------
@@ -1291,10 +1683,38 @@ def test_execute_action_wait_until_done_rejects_non_bool(mock_indigo, tmp_path):
     plugin.executeAction.assert_not_called()
 
 
-def test_execute_action_none_return_wait_true_reports_completed(mock_indigo, tmp_path):
-    """waitUntilDone=true + a None return means executeAction ran to
-    completion synchronously -- a stronger claim than the
-    fire-and-forget "dispatched"."""
+def test_execute_action_none_return_wait_true_fully_validated_reports_completed(
+    mock_indigo, tmp_path
+):
+    """waitUntilDone=true + a None return + fully validated action AND
+    props means executeAction ran to completion synchronously with
+    everything confirmed beforehand -- the strongest claim this tool
+    makes. Uses setStandbyMode (has a real declared "mode" field,
+    supplied) rather than noop (no declared fields at all, which
+    review round 4 downgrades to "completed_unverified" -- see
+    test_execute_action_none_return_wait_true_but_unvalidated_reports_completed_unverified)."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, execute_result=None)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "setStandbyMode",
+         "props": {"mode": True}, "wait_until_done": True},
+        mock_indigo,
+    )
+    assert result["result"] == "completed"
+    assert result["props_validated"] is True
+
+
+def test_execute_action_none_return_wait_true_but_unvalidated_reports_completed_unverified(
+    mock_indigo, tmp_path
+):
+    """review round 4, item 4: result:"completed" was byte-identical
+    on the fully-validated and wholly-unvalidated paths. noop has no
+    declared ConfigUI fields at all, so props_validated is false even
+    though the call ran to completion (waited, no exception) -- the
+    result string itself must say so, not just a buried payload
+    field a model might not read."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, execute_result=None)
@@ -1303,7 +1723,8 @@ def test_execute_action_none_return_wait_true_reports_completed(mock_indigo, tmp
         {"plugin_id": PLUGIN_ID, "action_id": "noop", "wait_until_done": True},
         mock_indigo,
     )
-    assert result["result"] == "completed"
+    assert result["result"] == "completed_unverified"
+    assert result["props_validated"] is False
 
 
 def test_execute_action_none_return_wait_false_reports_dispatched(mock_indigo, tmp_path):
@@ -1470,6 +1891,11 @@ def test_execute_action_device_wrong_device_type_rejected(mock_indigo, tmp_path)
 def test_execute_action_comma_separated_filter_accepts_any_alternative(
     mock_indigo, tmp_path
 ):
+    """"self.sprinkler, self.zone" is fully self-scoped (every
+    alternative), so device_validated must be True when the device
+    matches ANY alternative -- result is "completed_unverified" (not
+    plain "completed") only because multiFilterAction has no declared
+    props at all, unrelated to the device check."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
     plugin = _install(mock_indigo, tmp_path, PLUGIN_ID,
@@ -1482,14 +1908,18 @@ def test_execute_action_comma_separated_filter_accepts_any_alternative(
         {"plugin_id": PLUGIN_ID, "action_id": "multiFilterAction", "device_id": 777},
         mock_indigo,
     )
-    assert result["result"] == "completed"
+    assert result["result"] == "completed_unverified"
+    assert result["device_validated"] is True
+    assert "device_validated_reason" not in result
     plugin.executeAction.assert_called_once()
 
 
 def test_execute_action_non_self_filter_skips_ownership_validation(mock_indigo, tmp_path):
     """A deviceFilter that isn't self-scoped at all is left
     unvalidated rather than guessed at -- existence check still
-    runs, but a device from a totally unrelated plugin dispatches."""
+    runs, but a device from a totally unrelated plugin dispatches,
+    and device_validated:false discloses that ownership specifically
+    was never confirmed."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
     plugin = _install(mock_indigo, tmp_path, PLUGIN_ID,
@@ -1502,8 +1932,84 @@ def test_execute_action_non_self_filter_skips_ownership_validation(mock_indigo, 
         {"plugin_id": PLUGIN_ID, "action_id": "nonSelfFilterAction", "device_id": 888},
         mock_indigo,
     )
-    assert result["result"] == "completed"
+    assert result["result"] == "completed_unverified"
+    assert result["device_validated"] is False
+    assert "not self-scoped" in result["device_validated_reason"]
     plugin.executeAction.assert_called_once()
+
+
+def test_execute_action_mixed_filter_does_not_falsely_reject_non_self_device(
+    mock_indigo, tmp_path
+):
+    """review round 4, item 5: deviceFilter="self.zone, indigo.relay"
+    (mixed) must NOT hard-reject a device that legitimately matches
+    the non-self "indigo.relay" alternative -- the old any()-based
+    gate would validate against ONLY the self.zone alternative and
+    reject every real indigo.relay device with a false explanation."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(
+        mock_indigo, tmp_path, PLUGIN_ID,
+        actions_xml=(
+            '<?xml version="1.0"?>\n<Actions>\n'
+            '    <Action id="mixedFilterAction" '
+            'deviceFilter="self.zone, indigo.relay">\n'
+            "        <Name>Mixed Filter</Name>\n"
+            "        <CallbackMethod>mixedFilterAction</CallbackMethod>\n"
+            "    </Action>\n</Actions>\n"
+        ),
+    )
+    # A device that matches NEITHER self.zone NOR belongs to this
+    # plugin at all -- i.e. exactly the kind of device that would
+    # legitimately satisfy "indigo.relay" (a built-in Indigo device
+    # type, not scoped to any plugin).
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device("com.totally.unrelated", "relay")
+    )
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "mixedFilterAction", "device_id": 42},
+        mock_indigo,
+    )
+    assert result["device_validated"] is False
+    assert "mixes in a non-self-scoped" in result["device_validated_reason"]
+    plugin.executeAction.assert_called_once()
+
+
+def test_execute_action_bare_self_plus_typed_alternative_describes_any_type(
+    mock_indigo, tmp_path
+):
+    """review round 4, item 5's closing note: "self, self.foo" must
+    describe itself as accepting ANY deviceTypeId (the bare "self"
+    makes the "self.foo" alternative redundant), not "typeId in
+    ['foo']" -- and the mismatch error must actually be reachable
+    with a wrong-plugin device to exercise the description."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(
+        mock_indigo, tmp_path, PLUGIN_ID,
+        actions_xml=(
+            '<?xml version="1.0"?>\n<Actions>\n'
+            '    <Action id="bareSelfAction" deviceFilter="self, self.foo">\n'
+            "        <Name>Bare Self</Name>\n"
+            "        <CallbackMethod>bareSelfAction</CallbackMethod>\n"
+            "    </Action>\n</Actions>\n"
+        ),
+        forbid_execute=True,
+    )
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device("com.other.plugin", "bar")
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "bareSelfAction", "device_id": 9},
+            mock_indigo,
+        )
+    message = str(excinfo.value)
+    assert "any deviceTypeId" in message
+    assert "typeId in ['foo']" not in message
+    plugin.executeAction.assert_not_called()
 
 
 # ---------------------------------------------------------------------

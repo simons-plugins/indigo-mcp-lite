@@ -35,7 +35,10 @@ module generalizes that mechanism to *every* action-bearing plugin:
   ``<ConfigUI>`` fields at all is flagged ``props_undeclared: true``
   rather than reading as "takes no arguments" -- very common for
   ``uiPath="hidden"`` actions, whose props are real but simply never
-  enumerated in the XML.
+  enumerated in the XML (a ``<ConfigUI>`` built entirely from a
+  ``<Template file="...">`` include gets its own distinct reason,
+  since that's a different fact -- fields genuinely exist, they just
+  aren't readable without resolving the include).
 
 - ``plugin_execute_action`` -- the write. Props arrive as a plain
   JSON-safe dict and are converted to ``indigo.Dict`` before dispatch
@@ -43,55 +46,77 @@ module generalizes that mechanism to *every* action-bearing plugin:
   see ``indigo-configui-values-must-be-indigo-dict``).
 
   **What our pre-dispatch checks actually are, honestly**: Indigo
-  itself already guards both halves of a bad call --
-  ``executeAction`` on an unknown action id raises ``InvalidAction``
-  ("plugin does not have a <CallbackMethod> specified for action id
-  ...") and on a disabled/stopped plugin raises ``PluginDisabled``
-  ("plugin X is not enabled") -- confirmed live, jarvis, 2026-08-24.
-  So the action-id/enabled/running pre-checks in this module are NOT
-  a safety net against silence; they are a BETTER-ERROR layer -- they
+  itself already guards both halves of a bad call -- ``executeAction``
+  on an unknown action id raises ``InvalidAction`` ("plugin does not
+  have a <CallbackMethod> specified for action id ...") and on a
+  disabled/stopped plugin raises ``PluginDisabled`` ("plugin X is not
+  enabled") -- confirmed live, jarvis, 2026-08-24. So the
+  action-id/enabled/running pre-checks in this module are NOT a
+  safety net against silence; they are a BETTER-ERROR layer -- they
   name the real action ids and the real plugin state up front instead
-  of leaving Indigo's own exception text as the only signal. The one
-  genuinely silent failure Indigo does NOT guard is a mistyped prop
-  name: it is dropped without complaint during cross-plugin
+  of leaving Indigo's own exception text as the only signal.
+  ``InvalidAction`` is itself CONDITIONAL, though (also confirmed
+  live): it only raises when ``waitUntilDone=True``. With
+  ``waitUntilDone=False`` a bad action id returns None with NO
+  exception at all. So whenever this module dispatches without having
+  confirmed the action id itself (the degraded path below), it forces
+  ``waitUntilDone=True`` regardless of what the caller asked for and
+  discloses the override (``wait_until_done_overridden``) rather than
+  silently changing the caller's requested semantics. The one
+  genuinely silent failure Indigo does NOT guard at all is a mistyped
+  prop name: it is dropped without complaint during cross-plugin
   serialization and the action runs with missing data
   (``docs/plugin-dev/concepts/actions.md``, a field note explicitly
-  "not covered by the canonical reference"). That is what justifies
-  the prop-key strictness below -- not the action id.
+  "not covered by the canonical reference"; confirmed live against
+  lite's own hidden ``mcp`` action -- with a genuinely undeclared
+  ConfigUI, real props DO arrive at the callback intact, so the
+  permissive path below is sound, not merely hoped-for).
 
   An unknown prop key is rejected rather than sent WHEN the action
   actually declares fields to validate against, for exactly that
-  reason. When the action declares NO fields at all, there is no
-  allowlist to check (an absent one, not an empty one) -- refusing
-  every call to such an action would make the whole hidden-action
-  class uncallable, which is this issue's own origin case, so props
-  pass through unchecked and the response says
-  ``props_validated: false``. When Actions.xml itself can't be read
-  or parsed, the same honesty applies one level up: rather than
-  refuse the call (Actions.xml was never Indigo's own guard, so an
-  unreadable one is not a safety gap -- only a worse error message),
-  this module attempts the dispatch anyway and lets Indigo's own
-  ``InvalidAction`` surface if the id is wrong, reporting
-  ``action_validated: false`` (and, since declared fields are then
-  unknown too, ``props_validated: false``) with the reason.
+  reason. When the action declares NO fields at all (an absent
+  allowlist, not an empty one -- refusing every call to such an
+  action would make the whole hidden-action class uncallable, this
+  issue's own origin case), props pass through unchecked and the
+  response says ``props_validated: false``, with a warning that an
+  unrecognised prop name would be silently dropped by Indigo and the
+  call would still report success. When Actions.xml itself can't be
+  read or parsed at all, the same honesty applies one level up -- but
+  narrowly: since neither the action's declared fields NOR its
+  ``deviceFilter`` are then knowable at all, this module only
+  attempts the dispatch when the caller supplied no props and no
+  ``device_id`` (the one shape Indigo's own ``InvalidAction`` can
+  fully backstop, once ``waitUntilDone`` is forced true); otherwise it
+  refuses outright, naming what could not be checked. This preserves
+  the origin use case exactly -- that case always has a readable
+  Actions.xml with the action legitimately declaring zero fields, the
+  different (and confirmed-safe) path described above.
 
   ``device_id`` is validated for existence AND, when the action's
-  ``deviceFilter`` is ``self``-scoped, that the device is actually
-  owned by the target plugin (and matches the required
-  ``deviceTypeId`` where the filter names one) -- existence alone
-  doesn't stop a device belonging to an unrelated plugin from being
-  dispatched at the wrong target. A static ``<List><Option>`` enum's
-  values are enforced the same way its keys are; a dynamic menu's
-  values are correctly unknowable and left unenforced.
+  ``deviceFilter`` is *entirely* ``self``-scoped (every
+  comma-separated alternative is ``self`` or ``self.<typeId>`` -- a
+  filter mixing in a non-``self`` alternative is left unvalidated
+  rather than falsely rejecting a device that legitimately matches
+  the alternative this module can't check), that the device is
+  actually owned by the target plugin (and matches one of the
+  required ``deviceTypeId``s, unless a bare ``self`` alternative is
+  present, which accepts any type). Existence alone doesn't stop a
+  device belonging to an unrelated plugin from being dispatched at
+  the wrong target -- and unlike a bad action id, Indigo has NO
+  backstop for a wrong device, so this check is a real guard, not
+  merely a better error. ``device_validated`` in the payload says
+  whether ownership was actually confirmed. A static
+  ``<List><Option>`` enum's values are enforced the same way its keys
+  are; a dynamic menu's values are correctly unknowable and left
+  unenforced.
 
   A call that reaches ``executeAction`` and then fails (the dispatch
-  call itself raises, or JSON-serialising its return value does) is
-  reported as having WAS dispatched and may have partially completed
-  -- never as "NOT dispatched" -- and is raised as something other
-  than ValueError/TypeError so ``mcp_handler``'s back-off bucket
-  applies rather than its self-correct-and-retry one; a non-idempotent
-  action (run a sprinkler zone, send a push) must not be blindly
-  retried.
+  call itself raising, or JSON-serialising its return value failing)
+  is reported as WAS DISPATCHED and may have partially completed,
+  NOT as "NOT dispatched" -- and is raised as something other than
+  ValueError/TypeError so ``mcp_handler``'s back-off bucket applies
+  rather than its self-correct-and-retry one; a non-idempotent action
+  (run a sprinkler zone, send a push) must not be blindly retried.
 
 Deliberately NO allowlist/denylist of plugins or actions here --
 object-level write denial is issue #69's job, not this one's.
@@ -120,8 +145,65 @@ _RESOLVABLE_LIST_CLASSES = {
 }
 
 
+class _ActionsXmlError(ValueError):
+    """Raised ONLY by ``_parse_actions_xml`` on a read/parse failure.
+
+    A dedicated type (still a ``ValueError`` subclass, so nothing
+    outside this module changes behaviour) rather than bare
+    ``ValueError`` so ``_try_validate_action``'s parse-failure ->
+    attempt-dispatch-anyway conversion can catch EXACTLY this failure
+    mode. Catching bare ``ValueError`` there would let any future
+    ``ValueError`` raised inside ``_parse_actions_xml`` (or anything
+    it calls) silently acquire "proceed with the write" semantics.
+    """
+
+
 def _actions_xml_path(bundle_path):
     return os.path.join(bundle_path, "Contents", "Server Plugin", "Actions.xml")
+
+
+def _resolve_bundle_path(plugin):
+    """Return the plugin's bundle path, or None if it's missing or
+    not an absolute path.
+
+    ``getattr(plugin, "pluginFolderPath", "")`` defaulting to ``""``
+    would otherwise silently ``os.path.join`` into a RELATIVE path
+    (``"Contents/Server Plugin/Actions.xml"``), resolved against the
+    plugin host process's current working directory -- in principle
+    validating one plugin's action ids against a completely different
+    bundle's Actions.xml if the cwd happened to contain one. Must be
+    a named degradation, never a silent join.
+    """
+    path = getattr(plugin, "pluginFolderPath", "") or ""
+    if not path or not os.path.isabs(path):
+        return None
+    return path
+
+
+def _actions_xml_exists(path):
+    """Check for Actions.xml at ``path`` without swallowing a real
+    I/O fault as "absent".
+
+    ``os.path.isfile`` returns False for BOTH "genuinely doesn't
+    exist" and "couldn't even check" (permission denial, a stale
+    network handle, an unmounted volume -- this workspace runs
+    bundles off ``/Volumes/...``), which is the exact same lie PR #73
+    review round 3 deleted from the old filesystem-scan bundle
+    lookup, relocated here. Only ``FileNotFoundError``/
+    ``NotADirectoryError`` mean "absent"; any other ``OSError`` is
+    raised, naming the path and errno, rather than read as a
+    (false) positive claim that the plugin has no Actions.xml.
+    """
+    try:
+        os.stat(path)
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise ValueError(
+            f"could not check for Actions.xml at {path!r}: {exc} "
+            f"(errno {exc.errno})"
+        ) from exc
 
 
 def _resolve_plugin(indigo_module, plugin_id):
@@ -219,7 +301,7 @@ def _classify_list(list_el):
 
 def _parse_action_props(config_ui_el):
     """Split an ``<Action>``'s ``<ConfigUI><Field>`` children into
-    (props, notes, has_dynamic_fields).
+    (props, notes, has_dynamic_fields, skipped_fields).
 
     ``label``/``separator``/``button`` fields are not props -- a
     label field's ``<Label>`` text is genuinely useful calling
@@ -236,13 +318,18 @@ def _parse_action_props(config_ui_el):
     caller should never be expected to supply it (see
     ``props_not_supplied`` in the handler). A field with no ``id`` at
     all can't be referenced by a caller, so it's dropped rather than
-    polluting ``declared_fields`` with an unusable key.
+    polluting ``declared_fields`` with an unusable key -- but counted
+    into ``skipped_fields`` (unlike an id-less ``<Action>``, which has
+    its own ``skipped_actions`` counter, an id-less ``<Field>`` had no
+    counter at all before this fix, making an action whose fields all
+    lack ids indistinguishable from a genuinely bare ``<ConfigUI/>``).
     """
     props = []
     notes = []
     has_dynamic = False
+    skipped_fields = 0
     if config_ui_el is None:
-        return props, notes, has_dynamic
+        return props, notes, has_dynamic, skipped_fields
 
     for field_el in config_ui_el.findall("Field"):
         field_id, field_type, label, description, default, hidden = _parse_field(field_el)
@@ -258,6 +345,7 @@ def _parse_action_props(config_ui_el):
             notes.append(description)
 
         if field_id is None:
+            skipped_fields += 1
             continue
 
         prop = {"id": field_id, "type": field_type, "label": label, "default": default}
@@ -278,7 +366,7 @@ def _parse_action_props(config_ui_el):
                 has_dynamic = True
         props.append(prop)
 
-    return props, notes, has_dynamic
+    return props, notes, has_dynamic, skipped_fields
 
 
 def _parse_action_element(action_el):
@@ -291,7 +379,8 @@ def _parse_action_element(action_el):
         return None
 
     ui_path = action_el.get("uiPath")
-    props, notes, has_dynamic = _parse_action_props(action_el.find("ConfigUI"))
+    config_ui_el = action_el.find("ConfigUI")
+    props, notes, has_dynamic, skipped_fields = _parse_action_props(config_ui_el)
 
     action = {
         "id": action_el.get("id"),
@@ -305,21 +394,33 @@ def _parse_action_element(action_el):
         "notes": notes,
         "has_dynamic_fields": has_dynamic,
     }
+    if skipped_fields:
+        action["skipped_fields"] = skipped_fields
     if not props:
         # An absent/empty <ConfigUI> (or one with only label/
-        # separator/button fields) is NOT "this action takes no
-        # arguments" -- Indigo doesn't require props to be declared
-        # there at all, and uiPath="hidden" (programmatic-only)
-        # actions conventionally declare nothing while still reading
-        # real props in their callback. Live census: 61 hidden
-        # actions, 51 with zero ConfigUI fields (MQTT Connector's
-        # fetchQueuedMessage reads props.get("message_type") with a
-        # bare <ConfigUI/>).
-        action["props_undeclared"] = True
-        action["props_undeclared_reason"] = (
-            "declares no ConfigUI fields; props may still be accepted "
-            '(common for uiPath="hidden" actions)'
+        # separator/button/id-less fields) is NOT "this action takes
+        # no arguments" -- Indigo doesn't require props to be
+        # declared there at all, and uiPath="hidden" (programmatic-
+        # only) actions conventionally declare nothing while still
+        # reading real props in their callback. Live census: 61
+        # hidden actions, 51 with zero ConfigUI fields (MQTT
+        # Connector's fetchQueuedMessage reads
+        # props.get("message_type") with a bare <ConfigUI/>).
+        uses_template = (
+            config_ui_el is not None and config_ui_el.find("Template") is not None
         )
+        action["props_undeclared"] = True
+        if uses_template:
+            action["props_undeclared_reason"] = (
+                "ConfigUI is a <Template> include -- its fields exist but "
+                "aren't readable without resolving the include, so props "
+                "may still be required"
+            )
+        else:
+            action["props_undeclared_reason"] = (
+                "declares no ConfigUI fields; props may still be accepted "
+                '(common for uiPath="hidden" actions)'
+            )
     return action
 
 
@@ -327,9 +428,9 @@ def _parse_actions_xml(path):
     """Parse an Actions.xml file into ``(actions, skipped_count,
     skipped_ids)``.
 
-    Raises ValueError (naming the path and the underlying error) on
-    any read/parse failure -- an unusable precondition is a FAILED
-    call, not a result that merely looks empty. An ``<Action>``
+    Raises ``_ActionsXmlError`` (naming the path and the underlying
+    error) on any read/parse failure -- an unusable precondition is a
+    FAILED call, not a result that merely looks empty. An ``<Action>``
     element that parses to nothing addressable -- a genuine separator
     like ``<Action id="sep1"/>``, an entry missing ``<Name>``/
     ``<CallbackMethod>`` (indistinguishable from a separator to
@@ -343,7 +444,9 @@ def _parse_actions_xml(path):
     try:
         tree = ET.parse(path)
     except (ET.ParseError, OSError) as exc:
-        raise ValueError(f"Actions.xml at {path!r} could not be parsed: {exc}") from exc
+        raise _ActionsXmlError(
+            f"Actions.xml at {path!r} could not be parsed: {exc}"
+        ) from exc
 
     actions = []
     skipped_count = 0
@@ -371,25 +474,32 @@ def _try_validate_action(plugin, plugin_id, action_id):
     is a known-bad dispatch, not one worth attempting.
 
     Degrades to ``(None, False, reason)`` -- rather than refusing the
-    whole call -- when Actions.xml can't be found/read/parsed at all.
-    Actions.xml was never Indigo's own guard against a bad action id
-    (``executeAction`` itself is, raising ``InvalidAction`` --
+    whole call -- when the bundle path is unusable or Actions.xml
+    can't be found/parsed at all. Actions.xml was never Indigo's own
+    guard against a bad action id (``executeAction`` itself is,
+    raising ``InvalidAction`` when ``waitUntilDone=True`` --
     confirmed live jarvis 2026-08-24), so an unreadable Actions.xml is
     not a safety gap, only a worse error message if the id turns out
-    to be wrong. ``getattr(plugin, "pluginFolderPath", "")`` degrading
-    to "" for a bundle path that's somehow unavailable folds into this
-    same "no Actions.xml at <path>" case rather than needing its own
-    branch -- an installed plugin (already confirmed by
-    ``_resolve_plugin``) has always carried a real path in the live
-    probes behind this module, including for a disabled plugin.
+    to be wrong. A genuine I/O fault checking for the file (as opposed
+    to it being absent) is NOT degraded this way -- see
+    ``_actions_xml_exists`` -- since that signals something may be
+    wrong beyond just "this one file is missing".
     """
-    path = _actions_xml_path(getattr(plugin, "pluginFolderPath", ""))
-    if not os.path.isfile(path):
+    bundle_path = _resolve_bundle_path(plugin)
+    if bundle_path is None:
+        return None, False, (
+            "plugin's pluginFolderPath "
+            f"({getattr(plugin, 'pluginFolderPath', None)!r}) is missing "
+            "or not an absolute path"
+        )
+
+    path = _actions_xml_path(bundle_path)
+    if not _actions_xml_exists(path):
         return None, False, f"no Actions.xml at {path!r}"
 
     try:
         actions, _skipped_count, skipped_ids = _parse_actions_xml(path)
-    except ValueError as exc:
+    except _ActionsXmlError as exc:
         return None, False, str(exc)
 
     by_id = {a["id"]: a for a in actions}
@@ -423,8 +533,11 @@ def _list_plugin_actions_handler(args, indigo_module):
     will fail -- they can differ (a crashed-but-enabled plugin is a
     real Indigo state). A bundle with no Actions.xml at all is a
     legitimate empty result (``no_actions_reason``); a bundle whose
-    Actions.xml exists but can't be parsed is a failed call, not an
-    empty one.
+    Actions.xml exists but can't be parsed, or whose bundle path can't
+    even be determined or checked, is a failed call, not an empty one
+    -- this tool is read-only discovery with nothing to fall back to,
+    so unlike ``plugin_execute_action`` it always refuses outright
+    rather than degrading (see that handler's docstring).
     """
     _reject_unknown_args(args, ("plugin_id",))
     plugin_id = _require_plugin_id(args)
@@ -432,8 +545,17 @@ def _list_plugin_actions_handler(args, indigo_module):
 
     enabled = bool(plugin.isEnabled())
     running = bool(plugin.isRunning())
-    actions_xml_path = _actions_xml_path(getattr(plugin, "pluginFolderPath", ""))
-    if not os.path.isfile(actions_xml_path):
+
+    bundle_path = _resolve_bundle_path(plugin)
+    if bundle_path is None:
+        raise ValueError(
+            f"plugin {plugin_id!r} is installed but its pluginFolderPath "
+            f"({getattr(plugin, 'pluginFolderPath', None)!r}) is missing "
+            "or not an absolute path; cannot locate its Actions.xml."
+        )
+
+    actions_xml_path = _actions_xml_path(bundle_path)
+    if not _actions_xml_exists(actions_xml_path):
         return {
             "results": [],
             "total_count": 0,
@@ -477,13 +599,32 @@ def _validate_prop_value(key, value):
 
 
 def _describe_device_filter_requirement(device_filter):
-    """Human-readable summary of what a ``self``-scoped deviceFilter
-    actually requires, for the self-correcting mismatch error."""
+    """Human-readable summary of what a deviceFilter actually
+    requires, for the self-correcting mismatch error.
+
+    Handles a bare ``"self"`` alternative correctly: it accepts ANY
+    deviceTypeId, making a sibling ``self.<type>`` alternative
+    redundant, so ``"self, self.foo"`` must describe itself as
+    accepting any type -- not "typeId in ['foo']", which it used to.
+    Also names any non-``self`` alternatives, so the description
+    stays correct even if this is ever called for a filter that
+    wasn't fully self-scoped (the current caller only calls it for
+    one that is, but correctness here shouldn't depend on that).
+    """
     alternatives = [f.strip() for f in device_filter.split(",") if f.strip()]
+    bare_self = any(alt == "self" for alt in alternatives)
     type_ids = [a[len("self."):] for a in alternatives if a.startswith("self.")]
-    if type_ids:
-        return f"deviceTypeId in {type_ids}"
-    return "any deviceTypeId"
+    non_self = [a for a in alternatives if a != "self" and not a.startswith("self.")]
+
+    if bare_self:
+        requirement = "any deviceTypeId owned by this plugin"
+    elif type_ids:
+        requirement = f"deviceTypeId in {type_ids}, owned by this plugin"
+    else:
+        requirement = "a device matching this plugin's deviceFilter"
+    if non_self:
+        requirement += f" (or one of these unvalidated alternatives: {non_self})"
+    return requirement
 
 
 def _device_matches_self_filter(dev, plugin_id, device_filter):
@@ -496,7 +637,9 @@ def _device_matches_self_filter(dev, plugin_id, device_filter):
     ``self.sprinkler``) would otherwise happily accept a Sonos
     ZonePlayer id and dispatch to the wrong plugin's device.
     Comma-separated filter lists are ORed (accept if any alternative
-    matches).
+    matches) -- only ever called for a filter where every alternative
+    IS self-scoped (see ``_is_self_scoped_filter``), so it never needs
+    to consider a non-``self`` alternative itself.
     """
     alternatives = [f.strip() for f in device_filter.split(",") if f.strip()]
     dev_plugin_id = getattr(dev, "pluginId", None)
@@ -512,8 +655,47 @@ def _device_matches_self_filter(dev, plugin_id, device_filter):
 
 
 def _is_self_scoped_filter(device_filter):
+    """True only when EVERY comma-separated alternative is self-
+    scoped.
+
+    A mixed filter (e.g. ``"self.zone, indigo.relay"``) is left
+    entirely unvalidated rather than partially checked -- with the
+    old ``any()`` version, a real ``indigo.relay`` device (which
+    legitimately matches the alternative this module can't validate)
+    got hard-rejected by ``_device_matches_self_filter``, which only
+    ever tests self-scoped alternatives, with an error whose every
+    clause was false (it told the caller to find a device that
+    doesn't exist -- no ``indigo.relay``-typed device is ever owned
+    by this plugin, by definition).
+    """
     alternatives = [f.strip() for f in device_filter.split(",") if f.strip()]
-    return any(alt == "self" or alt.startswith("self.") for alt in alternatives)
+    return bool(alternatives) and all(
+        alt == "self" or alt.startswith("self.") for alt in alternatives
+    )
+
+
+def _device_validation_gap_reason(device_filter):
+    """Explain why device OWNERSHIP could not be validated, for the
+    device_validated_reason payload field -- distinguishes "no
+    deviceFilter at all" from "wholly non-self" from "mixed", so the
+    message is accurate to which of those three is actually true
+    rather than a single generic sentence for all of them."""
+    if not device_filter:
+        return (
+            "action declares no deviceFilter, so only the device's "
+            "existence was checked, not ownership"
+        )
+    alternatives = [f.strip() for f in device_filter.split(",") if f.strip()]
+    if any(alt == "self" or alt.startswith("self.") for alt in alternatives):
+        return (
+            "action's deviceFilter mixes in a non-self-scoped "
+            "alternative this module cannot validate, so only the "
+            "device's existence was checked, not ownership"
+        )
+    return (
+        "action's deviceFilter is not self-scoped, so only the "
+        "device's existence was checked, not ownership"
+    )
 
 
 def _plugin_execute_action_handler(args, indigo_module):
@@ -525,13 +707,13 @@ def _plugin_execute_action_handler(args, indigo_module):
     ``isEnabled``/``isRunning`` (a stopped or crashed plugin is a
     failed call, never attempted -- these are genuinely different
     states, see ``system.py``'s ``_serialize_plugin``); best-effort
-    Actions.xml validation (may degrade to "attempt the dispatch
-    anyway" rather than refuse, when the XML can't be read -- see the
-    module docstring); device requirement/ownership; prop key/value
-    validation -- all before ``executeAction`` is ever called. A
-    failure AFTER that point (the dispatch call itself, or
-    serialising its return value) is reported as dispatched, never as
-    not-performed -- see the module docstring's closing paragraph.
+    Actions.xml validation (degrades to "attempt the dispatch anyway"
+    ONLY when the caller gave no props and no device_id -- see the
+    module docstring's narrowing); device requirement/ownership; prop
+    key/value validation -- all before ``executeAction`` is ever
+    called. A failure AFTER that point (the dispatch call itself, or
+    serialising its return value) is reported as WAS DISPATCHED, NOT
+    as not-performed -- see the module docstring's closing paragraph.
     """
     _reject_unknown_args(
         args, ("plugin_id", "action_id", "props", "device_id", "wait_until_done")
@@ -581,43 +763,79 @@ def _plugin_execute_action_handler(args, indigo_module):
 
     # Best-effort Actions.xml validation -- a BETTER-ERROR layer, not
     # a safety net (Indigo's own InvalidAction already guards a bad
-    # action id -- confirmed live). Degrades to attempting the
-    # dispatch when the XML itself can't be read/parsed, rather than
-    # refusing the call outright.
+    # action id -- confirmed live, though only when waitUntilDone is
+    # true, see below). Degrades to attempting the dispatch when the
+    # XML itself can't be read/parsed, rather than refusing the call
+    # outright.
     action, action_validated, action_validated_reason = _try_validate_action(
         plugin, plugin_id, action_id
     )
 
-    # deviceFilter / device_id: requirement + existence + ownership.
-    # Requirement and ownership are only checkable when the action
-    # itself was validated; existence is checked regardless.
+    # Narrow the degraded path: with the action unvalidated, NEITHER
+    # its declared fields NOR its deviceFilter are knowable, and
+    # unlike a bad action id, Indigo has NO backstop at all for a
+    # mistyped prop or a wrong device -- deviceFilter is enforced
+    # client-side by the UI, not by executeAction, and a mistyped prop
+    # is silently dropped regardless. So only dispatch here when
+    # there's nothing device/prop-shaped that could go wrong silently;
+    # otherwise refuse, naming what could not be checked. The origin
+    # use case (a hidden action with real but undeclared props) is
+    # unaffected -- that path always has a READABLE Actions.xml with
+    # the action legitimately declaring zero fields, i.e. action is
+    # NOT None there.
+    if action is None and (raw_props or device_id is not None):
+        unchecked = []
+        if raw_props:
+            unchecked.append("props")
+        if device_id is not None:
+            unchecked.append("device_id")
+        raise ValueError(
+            f"plugin {plugin_id!r}'s action {action_id!r} could not be "
+            f"validated ({action_validated_reason}), so its declared "
+            f"fields and deviceFilter are unknown; refusing to dispatch "
+            f"with {' and '.join(unchecked)} that could not be checked. "
+            "Retry with no props/device_id, or make Actions.xml readable "
+            "first."
+        )
+
+    # deviceFilter / device_id: requirement, then existence, then
+    # ownership. action is guaranteed not None below whenever
+    # device_id is not None -- the gate above already refused
+    # device_id on the degraded (action is None) path.
     if action is not None and action["device_required"] and device_id is None:
         raise ValueError(
             f"action {action_id!r} requires a device (deviceFilter="
             f"{action['device_filter']!r}); pass device_id."
         )
+    device_validated = None
+    device_validated_reason = None
     if device_id is not None:
         dev = _lookup_or_raise(indigo_module.devices, device_id, "device")
-        if action is not None:
-            device_filter = action["device_filter"]
-            if device_filter and _is_self_scoped_filter(device_filter):
-                if not _device_matches_self_filter(dev, plugin_id, device_filter):
-                    raise ValueError(
-                        f"device {device_id} does not match action "
-                        f"{action_id!r}'s deviceFilter {device_filter!r}: it "
-                        f"belongs to plugin {getattr(dev, 'pluginId', None)!r} "
-                        f"(deviceTypeId {getattr(dev, 'deviceTypeId', None)!r}), "
-                        f"but this action requires a device owned by plugin "
-                        f"{plugin_id!r} with "
-                        f"{_describe_device_filter_requirement(device_filter)}."
-                    )
+        device_filter = action["device_filter"]
+        if device_filter and _is_self_scoped_filter(device_filter):
+            if _device_matches_self_filter(dev, plugin_id, device_filter):
+                device_validated = True
+            else:
+                raise ValueError(
+                    f"device {device_id} does not match action "
+                    f"{action_id!r}'s deviceFilter {device_filter!r}: it "
+                    f"belongs to plugin {getattr(dev, 'pluginId', None)!r} "
+                    f"(deviceTypeId {getattr(dev, 'deviceTypeId', None)!r}), "
+                    f"but this action requires "
+                    f"{_describe_device_filter_requirement(device_filter)}."
+                )
+        else:
+            device_validated = False
+            device_validated_reason = _device_validation_gap_reason(device_filter)
 
     # Prop key/value validation. An action that couldn't be validated
     # at all, or one that validated but declares zero ConfigUI fields,
     # has no allowlist to check against -- an ABSENT one, not an empty
     # one -- so props pass through unchecked rather than refusing the
     # call for the whole hidden-action class (this issue's own origin
-    # case).
+    # case). Confirmed live (2026-08-24) against lite's own hidden mcp
+    # action that props genuinely do cross the boundary intact for a
+    # ConfigUI-less action -- this path is sound, not just permissive.
     declared_fields = {p["id"]: p for p in action["props"]} if action is not None else {}
     if declared_fields:
         unknown_props = set(raw_props) - set(declared_fields)
@@ -629,7 +847,10 @@ def _plugin_execute_action_handler(args, indigo_module):
         for key, value in raw_props.items():
             allowed_values = declared_fields[key].get("values")
             if isinstance(allowed_values, list):  # static enum only
-                allowed = {str(opt["value"]) for opt in allowed_values}
+                allowed = {
+                    str(opt["value"]) for opt in allowed_values
+                    if opt["value"] is not None
+                }
                 if str(value) not in allowed:
                     raise ValueError(
                         f"prop {key!r} = {value!r} is not a valid value for "
@@ -640,7 +861,7 @@ def _plugin_execute_action_handler(args, indigo_module):
         props_validated = True
         props_validated_reason = None
     else:
-        props_not_supplied = []
+        props_not_supplied = None
         props_validated = False
         if action is None:
             props_validated_reason = (
@@ -652,24 +873,45 @@ def _plugin_execute_action_handler(args, indigo_module):
             props_validated_reason = (
                 "action declares no ConfigUI fields, so props could not be "
                 "checked against a known set and were passed through "
-                "unchecked"
+                "unchecked -- an unrecognised prop name is silently "
+                "discarded by Indigo (no error raised), so this call can "
+                "report success even if a prop name was mistyped"
             )
 
+    # Confirmed live (2026-08-24): executeAction("bogusId",
+    # waitUntilDone=False) returns None with NO exception at all --
+    # InvalidAction only raises with waitUntilDone=True. The whole
+    # justification for dispatching on the degraded path (action is
+    # None) is that Indigo's own InvalidAction catches a bad id; that
+    # only holds with waitUntilDone=True, so force it here rather than
+    # silently letting a typo'd id through with a success-shaped
+    # response, and disclose the override instead of hiding it.
+    effective_wait_until_done = wait_until_done
+    wait_until_done_overridden = False
+    if not action_validated and not wait_until_done:
+        effective_wait_until_done = True
+        wait_until_done_overridden = True
+
     indigo_props = indigo_module.Dict(raw_props)
-    kwargs = {"props": indigo_props, "waitUntilDone": wait_until_done}
+    kwargs = {"props": indigo_props, "waitUntilDone": effective_wait_until_done}
     if device_id is not None:
         kwargs["deviceId"] = device_id
 
     try:
         result = plugin.executeAction(action_id, **kwargs)
-    except Exception as exc:
+    except BaseException as exc:
         # executeAction WAS called -- a non-idempotent action (run a
         # sprinkler zone, send a push notification) may have already
-        # partially or fully completed. Raising anything other than
-        # ValueError/TypeError routes this to mcp_handler's back-off
-        # bucket (JSON-RPC internal error) rather than its
-        # self-correct-and-retry one -- retrying blindly is the wrong
-        # response to a fault after an irreversible write.
+        # partially or fully completed. Catching BaseException (not
+        # just Exception) and re-raising is justified here and ONLY
+        # here: the guarantee this wraps is about an irreversible side
+        # effect already having happened, not about the error class --
+        # a KeyboardInterrupt/SystemExit reaching the caller here would
+        # otherwise bypass the WAS-DISPATCHED disclosure entirely.
+        # Raising anything other than ValueError/TypeError routes this
+        # to mcp_handler's back-off bucket (JSON-RPC internal error)
+        # rather than its self-correct-and-retry one -- retrying
+        # blindly is the wrong response to a fault after a write.
         raise RuntimeError(
             f"plugin {plugin_id!r} action {action_id!r} WAS DISPATCHED to "
             f"executeAction and may have partially or fully completed "
@@ -684,30 +926,51 @@ def _plugin_execute_action_handler(args, indigo_module):
         "device_id": device_id,
         "wait_until_done": wait_until_done,
         "action_validated": action_validated,
-        "props_not_supplied": props_not_supplied,
         "props_validated": props_validated,
     }
     if not action_validated:
         payload["action_validated_reason"] = action_validated_reason
-    if not props_validated:
+    if wait_until_done_overridden:
+        payload["wait_until_done_overridden"] = True
+        payload["wait_until_done_overridden_reason"] = (
+            "action could not be validated, so waitUntilDone was forced "
+            "true: Indigo's own InvalidAction only raises for a bad "
+            "action id when waitUntilDone is true (confirmed live); with "
+            "false it returns None with no error at all"
+        )
+    if device_validated is not None:
+        payload["device_validated"] = device_validated
+        if not device_validated:
+            payload["device_validated_reason"] = device_validated_reason
+    if props_validated:
+        payload["props_not_supplied"] = props_not_supplied
+    else:
         payload["props_validated_reason"] = props_validated_reason
 
     if result is None:
-        # waitUntilDone=True + no return value: executeAction ran to
-        # completion synchronously. waitUntilDone=False: Indigo queued
-        # the action and returned without waiting at all -- weaker,
-        # not even confirmed at the plugin-callback level.
-        payload["result"] = "completed" if wait_until_done else "dispatched"
+        if not effective_wait_until_done:
+            # Queued and not awaited at all -- no completion signal
+            # whatsoever, not even a raised error could ever surface.
+            payload["result"] = "dispatched"
+        elif props_validated:
+            payload["result"] = "completed"
+        else:
+            # Ran to completion (we waited), but either the action id
+            # or its props (or both) could not be confirmed beforehand
+            # -- distinct from "completed" so a model reading only the
+            # top-line result field can't mistake this for a fully
+            # verified call.
+            payload["result"] = "completed_unverified"
     else:
         try:
             payload["result"] = "returned"
             payload["value"] = _json_safe(result)
-        except Exception as exc:
+        except BaseException as exc:
             # The action itself already succeeded (executeAction
             # returned a value); only serialising it failed. Same
-            # "already happened, don't retry" guarantee as the
-            # executeAction except above -- a bug in our own
-            # serialization must never read as a failed write.
+            # already-happened guarantee as the executeAction except
+            # above, including catching BaseException -- a bug in our
+            # own serialization must never read as a failed write.
             raise RuntimeError(
                 f"plugin {plugin_id!r} action {action_id!r} executed "
                 "successfully (executeAction returned a value) but that "
@@ -725,9 +988,9 @@ def register(handler, *, indigo_module, **_):
             "List one plugin's declared Actions.xml actions: id, name, "
             "callback method, whether it's hidden (uiPath=\"hidden\" -- "
             "programmatic-only, not meant for menus), whether it requires "
-            "a device, and its ConfigUI fields as props (id/type/label/"
-            "default). notes carries guidance text pulled from label "
-            "fields and <Description> elements that isn't itself a prop. "
+            "a device, its ConfigUI fields as props (id/type/label/"
+            "default), and notes (calling guidance pulled from label "
+            "fields and <Description> elements that isn't itself a prop). "
             "An action with NO ConfigUI fields at all is flagged "
             "props_undeclared:true rather than reading as taking no "
             "arguments -- common for uiPath=\"hidden\" actions, which may "
@@ -764,24 +1027,33 @@ def register(handler, *, indigo_module, **_):
             "supply are fine (defaults/optional) but are listed back in "
             "props_not_supplied -- check that field before treating the "
             "call as fully configured. An unrecognized prop key (or an "
-            "out-of-range value for a static enum field) is refused when "
-            "the action declares fields to check against "
-            "(props_validated:true); one with none declared, or whose "
-            "Actions.xml couldn't be read (action_validated:false), has "
-            "no allowlist, so props pass through unchecked and the "
-            "response says props_validated:false with a reason. "
-            "device_id is checked for existence AND, when the action's "
-            "deviceFilter is self-scoped, that the device actually "
-            "belongs to this plugin (and matches the required "
-            "deviceTypeId). wait_until_done (default true) is passed "
-            "straight to executeAction's waitUntilDone: true blocks "
-            "until the action finishes, and a None return then means "
-            "result:\"completed\"; false means Indigo queued the action "
-            "without waiting at all, and a None return means "
-            "result:\"dispatched\" -- weaker, not even confirmed at the "
-            "plugin-callback level. props is a plain object, converted "
-            "to indigo.Dict internally. A non-None return reports "
-            "result:\"returned\" with the value."
+            "out-of-range value for a static enum field) is refused ONLY "
+            "when the action declares fields to check against "
+            "(props_validated:true); one with none declared has no "
+            "allowlist, so props pass through unchecked -- "
+            "props_validated:false with a reason then warns that a "
+            "mistyped prop name is silently dropped by Indigo, not "
+            "refused. If Actions.xml itself couldn't be read "
+            "(action_validated:false), the call only proceeds when NO "
+            "props and NO device_id were given (waitUntilDone is then "
+            "forced true so Indigo's own InvalidAction can catch a bad "
+            "action id -- wait_until_done_overridden:true discloses "
+            "that); otherwise it's refused rather than sending "
+            "unchecked props/device_id. device_id is checked for "
+            "existence AND, when the action's deviceFilter is fully "
+            "self-scoped, that the device actually belongs to this "
+            "plugin (device_validated in the payload says which); a "
+            "wrong device has NO Indigo-side backstop, unlike a wrong "
+            "action id. wait_until_done (default true) is passed to "
+            "executeAction's waitUntilDone: true blocks until the action "
+            "finishes -- a None return then means result:\"completed\", "
+            "or result:\"completed_unverified\" if action_validated or "
+            "props_validated is false; false means Indigo queued the "
+            "action without waiting at all (result:\"dispatched\" on a "
+            "None return -- weaker, no completion signal whatsoever, not "
+            "even an error could ever surface). props is a plain object, "
+            "converted to indigo.Dict internally. A non-None return "
+            "reports result:\"returned\" with the value."
         ),
         input_schema={
             "type": "object",

@@ -387,9 +387,11 @@ def test_wire_dispatch_plugin_execute_action(mock_indigo, tmp_path):
     same rationale as ``test_wire_dispatch_list_plugin_actions`` above.
     Asserts the dispatch actually reached the plugin double
     (``executeAction`` called) and that the payload reports
-    ``result: "completed"`` (waitUntilDone defaults true, and a None
-    return means executeAction ran to completion synchronously), not
-    merely that no error was raised."""
+    ``result: "completed_unverified"`` (waitUntilDone defaults true so
+    the action ran to completion, but the fixture's "noop" action
+    declares no ConfigUI fields at all, so props_validated is false --
+    review round 4 downgrades the result string itself for that case,
+    not just a payload flag), not merely that no error was raised."""
     plugin_id = "com.example.widget"
     bundle = _make_plugin_bundle(tmp_path, plugin_id, _WIRE_ACTIONS_XML)
     plugin = mock_indigo.server.getPlugin.return_value
@@ -406,7 +408,7 @@ def test_wire_dispatch_plugin_execute_action(mock_indigo, tmp_path):
     assert result.get("isError") is not True, result
     plugin.executeAction.assert_called_once()
     inner = json.loads(result["content"][0]["text"])
-    assert inner["result"] == "completed"
+    assert inner["result"] == "completed_unverified"
     assert inner["plugin_id"] == plugin_id
     assert inner["action_id"] == "noop"
 
