@@ -108,6 +108,95 @@ _SKIP_ACTIONS_XML = """<?xml version="1.0"?>
 </Actions>
 """
 
+# Every non-"class=self, has <Option>" shape a <List> can take: the
+# three resolvable Indigo built-in collections, an opaque plugin-
+# owned class, a bare <List method=...> with no class attribute at
+# all (the Sonos shape), and a genuine static enumerated list --
+# proof the inversion doesn't over-flag real static lists.
+_DYNAMIC_LIST_ACTIONS_XML = """<?xml version="1.0"?>
+<Actions>
+    <Action id="pickDevice">
+        <Name>Pick Device</Name>
+        <CallbackMethod>pickDevice</CallbackMethod>
+        <ConfigUI>
+            <Field type="menu" id="target_device">
+                <Label>Device:</Label>
+                <List class="indigo.devices"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="pickActionGroup">
+        <Name>Pick Action Group</Name>
+        <CallbackMethod>pickActionGroup</CallbackMethod>
+        <ConfigUI>
+            <Field type="menu" id="target_group">
+                <Label>Group:</Label>
+                <List class="indigo.actionGroups"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="pickVariable">
+        <Name>Pick Variable</Name>
+        <CallbackMethod>pickVariable</CallbackMethod>
+        <ConfigUI>
+            <Field type="menu" id="target_var">
+                <Label>Variable:</Label>
+                <List class="indigo.variables"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="pickPluginThing">
+        <Name>Pick Plugin Thing</Name>
+        <CallbackMethod>pickPluginThing</CallbackMethod>
+        <ConfigUI>
+            <Field type="menu" id="thing">
+                <Label>Thing:</Label>
+                <List class="plugin" method="getThings"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="pickBareList">
+        <Name>Pick Bare List</Name>
+        <CallbackMethod>pickBareList</CallbackMethod>
+        <ConfigUI>
+            <Field type="menu" id="bare">
+                <Label>Bare:</Label>
+                <List method="getBareList"/>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="pickStatic">
+        <Name>Pick Static</Name>
+        <CallbackMethod>pickStatic</CallbackMethod>
+        <ConfigUI>
+            <Field type="menu" id="opt">
+                <Label>Option:</Label>
+                <List>
+                    <Option value="0">Zero</Option>
+                    <Option value="1">One</Option>
+                </List>
+            </Field>
+        </ConfigUI>
+    </Action>
+</Actions>
+"""
+
+# A comma-separated self-scoped filter (accept if ANY alternative
+# matches) and a filter that isn't self-scoped at all (skip
+# validation rather than guess).
+_COMMA_FILTER_ACTIONS_XML = """<?xml version="1.0"?>
+<Actions>
+    <Action id="multiFilterAction" deviceFilter="self.sprinkler, self.zone">
+        <Name>Multi Filter</Name>
+        <CallbackMethod>multiFilterAction</CallbackMethod>
+    </Action>
+    <Action id="nonSelfFilterAction" deviceFilter="indigo.relay">
+        <Name>Non Self Filter</Name>
+        <CallbackMethod>nonSelfFilterAction</CallbackMethod>
+    </Action>
+</Actions>
+"""
+
 
 # ---------------------------------------------------------------------
 # fixtures / helpers
@@ -141,9 +230,10 @@ def _install(mock_indigo, tmp_path, plugin_id, *, actions_xml=_ACTIONS_XML,
     mock_indigo.server.getInstallFolderPath.return_value = str(tmp_path)
 
 
-def _fake_plugin(enabled=True, execute_result=None, forbid_execute=False):
+def _fake_plugin(enabled=True, running=True, execute_result=None, forbid_execute=False):
     p = MagicMock()
     p.isEnabled = MagicMock(return_value=enabled)
+    p.isRunning = MagicMock(return_value=running)
     if forbid_execute:
         def _raise(*a, **k):
             raise AssertionError("executeAction must not be called")
@@ -151,6 +241,17 @@ def _fake_plugin(enabled=True, execute_result=None, forbid_execute=False):
     else:
         p.executeAction = MagicMock(return_value=execute_result)
     return p
+
+
+def _fake_device(plugin_id, device_type_id):
+    """A device double that satisfies a `self.<device_type_id>`
+    deviceFilter for `plugin_id` -- MagicMock auto-vivifies attributes,
+    so a bare MagicMock() would satisfy the OLD existence-only check
+    but not the ownership check the fix in #71's review adds."""
+    dev = MagicMock()
+    dev.pluginId = plugin_id
+    dev.deviceTypeId = device_type_id
+    return dev
 
 
 def _plain_dict_indigo(mock_indigo):
@@ -254,6 +355,104 @@ def test_list_plugin_actions_static_menu_values_enumerated(mock_indigo, tmp_path
     assert weather["has_dynamic_fields"] is False
 
 
+def test_list_plugin_actions_resolvable_indigo_list_classes_name_the_tool(
+    mock_indigo, tmp_path
+):
+    """indigo.devices/actionGroups/variables menus ARE resolvable by
+    the caller -- just via a different lite tool, not free text and
+    not an unresolvable plugin callback like class="self"."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+
+    device_prop = next(
+        p for p in by_id["pickDevice"]["props"] if p["id"] == "target_device"
+    )
+    assert device_prop["values"] == "dynamic"
+    assert device_prop["values_source"] == "indigo.devices"
+    assert device_prop["values_source_tool"] == "list_devices"
+    assert by_id["pickDevice"]["has_dynamic_fields"] is True
+
+    group_prop = next(
+        p for p in by_id["pickActionGroup"]["props"] if p["id"] == "target_group"
+    )
+    assert group_prop["values"] == "dynamic"
+    assert group_prop["values_source"] == "indigo.actionGroups"
+    assert group_prop["values_source_tool"] == "list_action_groups"
+
+    var_prop = next(
+        p for p in by_id["pickVariable"]["props"] if p["id"] == "target_var"
+    )
+    assert var_prop["values"] == "dynamic"
+    assert var_prop["values_source"] == "indigo.variables"
+    assert var_prop["values_source_tool"] == "list_variables"
+
+
+def test_list_plugin_actions_plugin_class_list_dynamic_with_no_tool(mock_indigo, tmp_path):
+    """class="plugin" (or anything else non-resolvable) is still
+    flagged dynamic with whatever class/method is present, but gets
+    no values_source_tool since lite can't resolve it either."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+
+    prop = next(p for p in by_id["pickPluginThing"]["props"] if p["id"] == "thing")
+    assert prop["values"] == "dynamic"
+    assert prop["values_source"] == "getThings"
+    assert "values_source_tool" not in prop
+
+
+def test_list_plugin_actions_bare_list_no_class_still_flagged_dynamic(
+    mock_indigo, tmp_path
+):
+    """The Sonos shape: a <List method=...> with NO class attribute
+    at all. The old class=="self" check missed this entirely --
+    zero <Option> children is what makes a list dynamic, not the
+    class value."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+
+    prop = next(p for p in by_id["pickBareList"]["props"] if p["id"] == "bare")
+    assert prop["values"] == "dynamic"
+    assert prop["values_source"] == "getBareList"
+    assert by_id["pickBareList"]["has_dynamic_fields"] is True
+
+
+def test_list_plugin_actions_static_list_with_options_never_flagged_dynamic(
+    mock_indigo, tmp_path
+):
+    """Proof the inversion doesn't over-flag: a real enumerated
+    <List><Option> set (no class attribute at all here) must still
+    read as static, not dynamic."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+
+    prop = next(p for p in by_id["pickStatic"]["props"] if p["id"] == "opt")
+    assert prop["values"] == [
+        {"value": "0", "label": "Zero"},
+        {"value": "1", "label": "One"},
+    ]
+    assert by_id["pickStatic"]["has_dynamic_fields"] is False
+
+
 def test_list_plugin_actions_hidden_flag(mock_indigo, tmp_path):
     from tools.plugin_actions import _list_plugin_actions_handler
 
@@ -265,6 +464,32 @@ def test_list_plugin_actions_hidden_flag(mock_indigo, tmp_path):
     assert by_id["internalSync"]["hidden"] is True
     assert by_id["internalSync"]["ui_path"] == "hidden"
     assert by_id["setStandbyMode"]["hidden"] is False
+
+
+def test_list_plugin_actions_no_configui_flagged_props_undeclared(mock_indigo, tmp_path):
+    """An action with NO <ConfigUI> at all (internalSync, hidden --
+    the MQTT Connector fetchQueuedMessage shape) must NOT read as
+    "takes no arguments": props_undeclared:true plus a reason,
+    distinct from an action that genuinely declares zero-but-real
+    fields is impossible to distinguish from "declares nothing", so
+    both collapse to the same honest signal."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+
+    internal_sync = by_id["internalSync"]
+    assert internal_sync["props"] == []
+    assert internal_sync["props_undeclared"] is True
+    assert "no ConfigUI fields" in internal_sync["props_undeclared_reason"]
+
+    # An action that DOES declare fields must not be flagged.
+    standby = by_id["setStandbyMode"]
+    assert standby["props"]
+    assert "props_undeclared" not in standby
 
 
 def test_list_plugin_actions_disabled_plugin_bundle_still_lists(mock_indigo, tmp_path):
@@ -279,6 +504,20 @@ def test_list_plugin_actions_disabled_plugin_bundle_still_lists(mock_indigo, tmp
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     assert result["enabled"] is False
     assert result["total_count"] == 5
+
+
+def test_list_plugin_actions_reports_running_distinct_from_enabled(mock_indigo, tmp_path):
+    """enabled and running can differ (a crashed-but-enabled plugin
+    is a real Indigo state) -- both must be reported, not just
+    enabled."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin(enabled=True, running=False)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    assert result["enabled"] is True
+    assert result["running"] is False
 
 
 def test_list_plugin_actions_no_actions_xml_is_legit_empty(mock_indigo, tmp_path):
@@ -386,7 +625,28 @@ def test_execute_action_disabled_plugin_fatal_and_never_dispatched(mock_indigo, 
     plugin = _fake_plugin(enabled=False, forbid_execute=True)
     mock_indigo.server.getPlugin.return_value = plugin
 
-    with pytest.raises(ValueError, match="not enabled/running"):
+    with pytest.raises(ValueError, match="not enabled"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_enabled_but_not_running_fatal_and_never_dispatched(
+    mock_indigo, tmp_path
+):
+    """isEnabled() True but isRunning() False (crashed, or still
+    starting) is a real, distinct Indigo state -- see
+    system.py's _serialize_plugin -- and must fail the call with
+    accurate wording, not the "not enabled" text from the check
+    above."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+    plugin = _fake_plugin(enabled=True, running=False, forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="not running"):
         _plugin_execute_action_handler(
             {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
         )
@@ -440,6 +700,34 @@ def test_execute_action_unknown_prop_key_names_declared_fields(mock_indigo, tmp_
     assert "modee" in message
     assert "mode" in message
     plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_undeclared_props_pass_through_unchecked(mock_indigo, tmp_path):
+    """The primary #71 use case: a hidden action with NO declared
+    ConfigUI fields (internalSync -- the MQTT Connector
+    fetchQueuedMessage / uiPath="hidden" shape) must still be
+    callable with arbitrary props. An absent allowlist is not an
+    empty one -- refusing this would make the whole hidden-action
+    class uncallable."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+    plugin = _fake_plugin(enabled=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    result = _plugin_execute_action_handler(
+        {
+            "plugin_id": PLUGIN_ID,
+            "action_id": "internalSync",
+            "props": {"message_type": "queued", "anything_else": 5},
+        },
+        mock_indigo,
+    )
+    assert result["result"] == "dispatched"
+    assert result["props_validated"] is False
+    assert "props_validated_reason" in result
+    assert result["props_not_supplied"] == []
+    plugin.executeAction.assert_called_once()
 
 
 # ---------------------------------------------------------------------
@@ -535,6 +823,51 @@ def test_execute_action_missing_actions_xml_raises(mock_indigo, tmp_path):
 
 
 # ---------------------------------------------------------------------
+# plugin_execute_action -- skipped_ids threaded through dispatch
+# ---------------------------------------------------------------------
+
+def test_execute_action_skipped_id_reports_could_not_be_validated(mock_indigo, tmp_path):
+    """An id that IS in the XML but couldn't be parsed as callable
+    (missing <Name>/<CallbackMethod>) must NOT be told "no such
+    action" -- that would be a false statement. It gets told the real
+    reason instead."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML)
+    plugin = _fake_plugin(enabled=True, forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError, match="could not be validated"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "malformedNoCallback"},
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_unknown_id_notes_skipped_count(mock_indigo, tmp_path):
+    """A genuinely unknown id (not even among the skipped ones) still
+    gets the real known-ids list, plus a note that some declared ids
+    could not be parsed -- so the caller isn't misled into thinking
+    the XML holds exactly the ids listed."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML)
+    plugin = _fake_plugin(enabled=True, forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+
+    with pytest.raises(ValueError) as excinfo:
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "totallyBogus"}, mock_indigo
+        )
+    message = str(excinfo.value)
+    assert "totallyBogus" in message
+    assert "realAction" in message
+    assert "2" in message  # skipped_ids count note (sep1 + malformedNoCallback)
+    plugin.executeAction.assert_not_called()
+
+
+# ---------------------------------------------------------------------
 # plugin_execute_action -- deviceFilter / device_id
 # ---------------------------------------------------------------------
 
@@ -584,7 +917,9 @@ def test_execute_action_valid_device_id_dispatches_with_deviceId_kwarg(mock_indi
     _install(mock_indigo, tmp_path, PLUGIN_ID)
     plugin = _fake_plugin(enabled=True)
     mock_indigo.server.getPlugin.return_value = plugin
-    mock_indigo.devices.__getitem__ = MagicMock(return_value=MagicMock())
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device(PLUGIN_ID, "sprinkler")
+    )
 
     result = _plugin_execute_action_handler(
         {
@@ -601,6 +936,100 @@ def test_execute_action_valid_device_id_dispatches_with_deviceId_kwarg(mock_indi
 
 
 # ---------------------------------------------------------------------
+# plugin_execute_action -- deviceFilter OWNERSHIP (not just existence)
+# ---------------------------------------------------------------------
+
+def test_execute_action_device_owned_by_wrong_plugin_rejected(mock_indigo, tmp_path):
+    """Existence alone (_lookup_or_raise) doesn't prove ownership --
+    Netro's startZoneWithDelay (filter self.sprinkler) must NOT
+    happily accept a device that belongs to some other plugin."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+    plugin = _fake_plugin(enabled=True, forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device("com.other.plugin", "sprinkler")
+    )
+
+    with pytest.raises(ValueError, match="does not match action"):
+        _plugin_execute_action_handler(
+            {
+                "plugin_id": PLUGIN_ID,
+                "action_id": "startZoneWithDelay",
+                "device_id": 555,
+                "props": {"zone": "1", "duration": "15"},
+            },
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_device_wrong_device_type_rejected(mock_indigo, tmp_path):
+    """Right plugin, wrong deviceTypeId -- self.sprinkler must not
+    accept a "zone" device from the same plugin."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+    plugin = _fake_plugin(enabled=True, forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device(PLUGIN_ID, "zone")
+    )
+
+    with pytest.raises(ValueError, match="deviceTypeId"):
+        _plugin_execute_action_handler(
+            {
+                "plugin_id": PLUGIN_ID,
+                "action_id": "startZoneWithDelay",
+                "device_id": 555,
+                "props": {"zone": "1", "duration": "15"},
+            },
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_comma_separated_filter_accepts_any_alternative(
+    mock_indigo, tmp_path
+):
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_COMMA_FILTER_ACTIONS_XML)
+    plugin = _fake_plugin(enabled=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device(PLUGIN_ID, "zone")
+    )
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "multiFilterAction", "device_id": 777},
+        mock_indigo,
+    )
+    assert result["result"] == "dispatched"
+
+
+def test_execute_action_non_self_filter_skips_ownership_validation(mock_indigo, tmp_path):
+    """A deviceFilter that isn't self-scoped at all is left
+    unvalidated rather than guessed at -- existence check still
+    runs, but a device from a totally unrelated plugin dispatches."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_COMMA_FILTER_ACTIONS_XML)
+    plugin = _fake_plugin(enabled=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device("com.completely.unrelated", "widget")
+    )
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "nonSelfFilterAction", "device_id": 888},
+        mock_indigo,
+    )
+    assert result["result"] == "dispatched"
+
+
+# ---------------------------------------------------------------------
 # plugin_execute_action -- props_not_supplied
 # ---------------------------------------------------------------------
 
@@ -610,7 +1039,9 @@ def test_execute_action_reports_props_not_supplied(mock_indigo, tmp_path):
     _install(mock_indigo, tmp_path, PLUGIN_ID)
     plugin = _fake_plugin(enabled=True)
     mock_indigo.server.getPlugin.return_value = plugin
-    mock_indigo.devices.__getitem__ = MagicMock(return_value=MagicMock())
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device(PLUGIN_ID, "sprinkler")
+    )
 
     result = _plugin_execute_action_handler(
         {
@@ -622,6 +1053,8 @@ def test_execute_action_reports_props_not_supplied(mock_indigo, tmp_path):
         mock_indigo,
     )
     assert result["props_not_supplied"] == ["duration"]
+    assert result["props_validated"] is True
+    assert "props_validated_reason" not in result
 
 
 # ---------------------------------------------------------------------
