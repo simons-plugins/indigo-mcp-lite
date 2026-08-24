@@ -337,10 +337,28 @@ def _require_int_id(args, key="id"):
     tools but Phase 4 control tools pass ``"device_id"``,
     ``"variable_id"``, etc., so the same validator applies everywhere
     without each tool reimplementing it.
+
+    Negative values are rejected here rather than left to the
+    collection subscript. Confirmed live on jarvis 2026-08-24:
+    ``indigo.devices[-1]`` raises ``OverflowError: can't convert
+    negative value to unsigned int`` -- Indigo's id space is
+    UNSIGNED, so no negative id can ever name a real object. Left to
+    the subscript it becomes a ``_LookupFault`` (the back-off bucket),
+    which is the wrong advice for a mistake the caller can fix by
+    passing a valid id. ``0`` is deliberately NOT rejected: it is
+    almost certainly not a real id, but it reaches the collection and
+    comes back as the friendly "no X with id 0", which is already the
+    right answer -- and "almost certainly" is not the bar for a
+    validator every tool depends on.
     """
     value = _coerce_int(args.get(key))
     if value is None:
         raise ValueError(f"{key} must be an integer")
+    if value < 0:
+        raise ValueError(
+            f"{key} must be a non-negative integer (Indigo object ids are "
+            f"unsigned); got {value}"
+        )
     return value
 
 
@@ -361,13 +379,42 @@ def _reject_unknown_args(args, allowed):
         )
 
 
+class _LookupFault(RuntimeError):
+    """Raised when ``collection[entity_id]`` itself fails, rather than
+    genuinely finding no such id.
+
+    Probed live against Indigo 2025.2 (issue #74): a missing id raises
+    ``KeyError`` — that's the only exception shape confirmed to mean
+    "no such id"; a bad key TYPE raises ``TypeError``/``OverflowError``
+    instead, never ``IndexError``/``ValueError``. Deliberately not a
+    ``ValueError``/``TypeError``: ``mcp_handler`` routes those to its
+    self-correct-and-retry bucket ("adjust your arguments"), but a
+    fault means nothing is wrong with the id, so this must reach the
+    back-off bucket instead — the same reasoning ``plugin_actions``'s
+    ``_ActionsXmlIOError`` already applies to a stale filesystem
+    handle.
+    """
+
+
 def _lookup_or_raise(collection, entity_id, entity_label):
-    """Subscript ``collection[entity_id]`` and translate Indigo's
-    KeyError / IndexError / ValueError into a friendly ValueError."""
+    """Subscript ``collection[entity_id]`` and translate a genuinely
+    missing id (``KeyError``) into a friendly ``ValueError``.
+
+    Anything else the subscript raises is a FAILED lookup, not an
+    absent entity — wrapped in ``_LookupFault`` (see its docstring)
+    rather than folded into the same "not found" message, so a
+    transient Indigo-side fault can't misreport as a confident "no
+    device with id N" and can't gate a write (``plugin_actions``'s
+    device_id existence check) on a false negative.
+    """
     try:
         return collection[entity_id]
-    except (KeyError, IndexError, ValueError):
-        raise ValueError(f"no {entity_label} with id {entity_id}")
+    except KeyError as exc:
+        raise ValueError(f"no {entity_label} with id {entity_id}") from exc
+    except Exception as exc:
+        raise _LookupFault(
+            f"lookup for {entity_label} id {entity_id} failed: {exc}"
+        ) from exc
 
 
 # Attributes worth surfacing on a single-device lookup beyond the slim
