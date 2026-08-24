@@ -15,7 +15,15 @@ module generalizes that mechanism to *every* action-bearing plugin:
   ``Contents/Server Plugin/Actions.xml`` with stdlib
   ``xml.etree.ElementTree``. The bundle path comes from
   ``tools.system._scan_plugin_bundles``, which already scans both
-  ``Plugins/`` and ``Plugins (Disabled)/``.
+  ``Plugins/`` and ``Plugins (Disabled)/``. A ``<Action>`` element
+  that parses to nothing usable (a genuine separator, but also any
+  entry actually missing ``<Name>``/``<CallbackMethod>`` -- this
+  parser cannot tell those apart) is counted into ``skipped_actions``
+  / ``skipped_action_ids`` rather than silently dropped, and a
+  bundle whose Actions.xml parses fine but declares zero callable
+  actions says so via ``no_actions_reason`` rather than reading as
+  the same bare empty result as a missing Actions.xml — same
+  ``skipped_automations`` convention as ``automation_contents.py``.
 - ``plugin_execute_action`` — the write. Props arrive as a plain
   JSON-safe dict and are converted to ``indigo.Dict`` before dispatch
   (the ConfigUI-values gotcha: a plain dict silently seeds nothing —
@@ -150,22 +158,37 @@ def _parse_action_element(action_el):
 
 
 def _parse_actions_xml(path):
-    """Parse an Actions.xml file into a list of action dicts.
+    """Parse an Actions.xml file into ``(actions, skipped_count,
+    skipped_ids)``.
 
     Raises ValueError (naming the path and the underlying error) on
     any read/parse failure — an unusable precondition is a FAILED
-    call, never an empty list. Separator actions are excluded."""
+    call, never an empty list. An ``<Action>`` element
+    ``_parse_action_element`` excludes (a genuine separator like
+    ``<Action id="sep1"/>``, but also any entry that's just plain
+    missing ``<Name>``/``<CallbackMethod>`` -- this parser cannot
+    tell those two cases apart) is counted rather than silently
+    dropped, the same ``skipped_automations`` convention
+    ``automation_contents.py`` uses: a caller must be able to tell
+    "nothing was skipped" from "something was and I can't see it"."""
     try:
         tree = ET.parse(path)
     except (ET.ParseError, OSError) as exc:
         raise ValueError(f"Actions.xml at {path!r} could not be parsed: {exc}") from exc
 
     actions = []
+    skipped_count = 0
+    skipped_ids = []
     for action_el in tree.getroot().findall("Action"):
         parsed = _parse_action_element(action_el)
-        if parsed is not None:
-            actions.append(parsed)
-    return actions
+        if parsed is None:
+            skipped_count += 1
+            action_id = action_el.get("id")
+            if action_id:
+                skipped_ids.append(action_id)
+            continue
+        actions.append(parsed)
+    return actions, skipped_count, skipped_ids
 
 
 def _load_actions_for_dispatch(bundle_path, plugin_id, action_id):
@@ -183,12 +206,13 @@ def _load_actions_for_dispatch(bundle_path, plugin_id, action_id):
             f"cannot be validated, so action {action_id!r} was NOT dispatched."
         )
     try:
-        return _parse_actions_xml(path), path
+        actions, _skipped_count, _skipped_ids = _parse_actions_xml(path)
     except ValueError as exc:
         raise ValueError(
             f"{exc}; the call cannot be validated, so action {action_id!r} "
             "was NOT dispatched."
         ) from exc
+    return actions, path
 
 
 def _list_plugin_actions_handler(args, indigo_module):
@@ -223,14 +247,25 @@ def _list_plugin_actions_handler(args, indigo_module):
             "no_actions_reason": "plugin bundle declares no Actions.xml",
         }
 
-    actions = _parse_actions_xml(actions_xml_path)
-    return {
+    actions, skipped_count, skipped_ids = _parse_actions_xml(actions_xml_path)
+    result = {
         "results": actions,
         "total_count": len(actions),
         "plugin_id": plugin_id,
         "enabled": enabled,
         "actions_xml_path": actions_xml_path,
     }
+    if not actions:
+        # Parsed fine but declares zero callable actions (a real but
+        # empty <Actions/>, or every entry got skipped) -- a distinct
+        # fact from "no Actions.xml at all", so it gets a distinct
+        # reason rather than reading as the same bare empty success.
+        result["no_actions_reason"] = "Actions.xml declares no callable actions"
+    if skipped_count:
+        result["skipped_actions"] = skipped_count
+        if skipped_ids:
+            result["skipped_action_ids"] = skipped_ids
+    return result
 
 
 def _validate_prop_value(key, value):

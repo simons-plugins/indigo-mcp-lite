@@ -84,6 +84,30 @@ _ACTIONS_XML = """<?xml version="1.0"?>
 
 PLUGIN_ID = "com.example.widget"
 
+# A real but empty <Actions/> (UK-Trains / mqtt-device-sniffer shape,
+# per the 2026-08-24 15-plugin sweep) -- parses fine, zero actions,
+# and must be distinguishable from "no Actions.xml file at all".
+_EMPTY_ACTIONS_XML = """<?xml version="1.0"?>
+<Actions/>
+"""
+
+# One real action plus a genuine separator plus an entry that's
+# missing <CallbackMethod> (indistinguishable from a separator to
+# _parse_action_element, but a real-world malformed entry would look
+# just like this) -- both must be counted, neither swallowed.
+_SKIP_ACTIONS_XML = """<?xml version="1.0"?>
+<Actions>
+    <Action id="realAction">
+        <Name>Real Action</Name>
+        <CallbackMethod>realAction</CallbackMethod>
+    </Action>
+    <Action id="sep1"/>
+    <Action id="malformedNoCallback">
+        <Name>Malformed Missing Callback</Name>
+    </Action>
+</Actions>
+"""
+
 
 # ---------------------------------------------------------------------
 # fixtures / helpers
@@ -267,6 +291,43 @@ def test_list_plugin_actions_no_actions_xml_is_legit_empty(mock_indigo, tmp_path
     assert result["results"] == []
     assert result["total_count"] == 0
     assert result["no_actions_reason"] == "plugin bundle declares no Actions.xml"
+
+
+def test_list_plugin_actions_real_empty_actions_xml_has_distinct_reason(mock_indigo, tmp_path):
+    """A real <Actions/> that parses fine but declares zero actions
+    (the UK-Trains / mqtt-device-sniffer shape) must NOT report the
+    same reason as a missing Actions.xml file -- two different facts,
+    two different strings."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_EMPTY_ACTIONS_XML)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    assert result["results"] == []
+    assert result["total_count"] == 0
+    assert result["no_actions_reason"] == "Actions.xml declares no callable actions"
+    assert result["no_actions_reason"] != "plugin bundle declares no Actions.xml"
+    assert "skipped_actions" not in result
+
+
+def test_list_plugin_actions_reports_skipped_actions_and_ids(mock_indigo, tmp_path):
+    """Excluded <Action> elements (separator + a genuinely malformed
+    entry missing CallbackMethod) must be counted, not silently
+    dropped -- and the callable action alongside them must still come
+    back intact."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML)
+    mock_indigo.server.getPlugin.return_value = _fake_plugin()
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+
+    assert result["skipped_actions"] == 2
+    assert set(result["skipped_action_ids"]) == {"sep1", "malformedNoCallback"}
+    assert [a["id"] for a in result["results"]] == ["realAction"]
+    assert result["total_count"] == 1
+    assert "no_actions_reason" not in result
 
 
 def test_list_plugin_actions_malformed_xml_raises_not_empty(mock_indigo, tmp_path):
