@@ -1,21 +1,29 @@
 """TDD tests for list_plugin_actions / plugin_execute_action (issue #71).
 
 Covers the degradation paths named in the issue and the workspace
-testing convention: a disabled plugin must fail BEFORE executeAction
-is ever touched; an unknown action id must list the real ones; an
-unknown prop key must be rejected (never silently dropped — that's
-the "silently seeds nothing" cross-plugin trap this tool exists to
-close); a plain-dict props argument must reach executeAction as an
-indigo.Dict; a fire-and-forget action must report "dispatched", not a
-confirmed effect; and a malformed/missing Actions.xml must raise
-rather than read as "this plugin has no actions".
+testing convention, PLUS the five defects and ten follow-on items
+found across #71's review rounds (round 2 and round 3 -- see PR #73):
+
+- ``getPlugin`` never raises (confirmed live jarvis 2026-08-24) --
+  ``isInstalled()`` is the only real not-installed signal.
+- an unknown/disabled-plugin action id is NOT a silent no-op --
+  Indigo raises ``InvalidAction``/``PluginDisabled`` itself
+  (confirmed live) -- so our pre-checks are a better-error layer, not
+  a safety net, and an unreadable Actions.xml degrades to "attempt
+  the dispatch anyway" rather than refusing the call.
+- a call that reaches ``executeAction`` and then fails must never say
+  "NOT dispatched" -- the action may have partially completed.
+- real-world Actions.xml field shapes (button/hidden/Description/
+  bare ``default``/id-less fields and actions) that the original
+  parser mishandled.
+- static ``<List><Option>`` enum values are enforced at dispatch,
+  same as prop keys.
 
 Fixture Actions.xml is modeled on the real
 ``netro/Netro Sprinklers.indigoPlugin/.../Actions.xml`` and
-``indigo-auto-lights/Auto Lights.indigoPlugin/.../Actions.xml`` shapes:
-a deviceFilter + dynamic menu action, a static-list menu action, a
-label+checkbox action with no device filter, a hidden action, a bare
-separator, and a no-ConfigUI action.
+``indigo-auto-lights/Auto Lights.indigoPlugin/.../Actions.xml`` shapes,
+plus a dedicated ``_FIELD_SHAPES_ACTIONS_XML`` for the real-world
+field/action shapes named above.
 """
 import plistlib
 from unittest.mock import MagicMock
@@ -197,17 +205,55 @@ _COMMA_FILTER_ACTIONS_XML = """<?xml version="1.0"?>
 </Actions>
 """
 
+# Real-world field/action shapes the original parser mishandled
+# (review round 3, item G): a button field, a hidden="true" field, a
+# real prop field carrying <Description> instead of/alongside
+# <Label>, a field using the bare `default` attribute instead of
+# `defaultValue`, a field with NO id at all, and an <Action> with NO
+# id at all.
+_FIELD_SHAPES_ACTIONS_XML = """<?xml version="1.0"?>
+<Actions>
+    <Action id="richAction">
+        <Name>Rich Action</Name>
+        <CallbackMethod>richAction</CallbackMethod>
+        <ConfigUI>
+            <Field type="button" id="refreshButton">
+                <Label>Refresh</Label>
+            </Field>
+            <Field type="textfield" id="description" hidden="true">
+                <Label>Description (computed)</Label>
+            </Field>
+            <Field type="textfield" id="notes_field">
+                <Label>Notes:</Label>
+                <Description>The more useful sentence lives here.</Description>
+            </Field>
+            <Field type="textfield" id="legacy_default" default="42">
+                <Label>Legacy default:</Label>
+            </Field>
+            <Field type="textfield" id="both_defaults" default="old" defaultValue="new">
+                <Label>Both defaults:</Label>
+            </Field>
+            <Field type="textfield">
+                <Label>No id at all:</Label>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action>
+        <Name>No Id Action</Name>
+        <CallbackMethod>noIdAction</CallbackMethod>
+    </Action>
+</Actions>
+"""
+
 
 # ---------------------------------------------------------------------
 # fixtures / helpers
 # ---------------------------------------------------------------------
 
 def _make_bundle(plugins_dir, plugin_id, *, actions_xml=_ACTIONS_XML, name=None):
-    """Build a fake ``*.indigoPlugin`` bundle with Info.plist and
-    (optionally) Actions.xml, mirroring test_system_plugins.py's
-    ``_make_bundle`` plus the Server Plugin/Actions.xml layer this
-    module actually reads. ``actions_xml=None`` omits the file
-    entirely (bundle declares no actions)."""
+    """Build a fake ``*.indigoPlugin`` bundle with a real Info.plist
+    and (optionally) a real Actions.xml on disk. Returns the bundle
+    path."""
     bundle_name = name or plugin_id.replace(".", "_") + ".indigoPlugin"
     bundle = plugins_dir / bundle_name
     server_plugin = bundle / "Contents" / "Server Plugin"
@@ -219,39 +265,87 @@ def _make_bundle(plugins_dir, plugin_id, *, actions_xml=_ACTIONS_XML, name=None)
     return bundle
 
 
-def _install(mock_indigo, tmp_path, plugin_id, *, actions_xml=_ACTIONS_XML,
-             disabled_subdir=False):
-    """Install one bundle under Plugins/ (or Plugins (Disabled)/) and
-    point getInstallFolderPath at tmp_path."""
-    subdir = "Plugins (Disabled)" if disabled_subdir else "Plugins"
-    plugins_dir = tmp_path / subdir
-    plugins_dir.mkdir(parents=True, exist_ok=True)
-    _make_bundle(plugins_dir, plugin_id, actions_xml=actions_xml)
-    mock_indigo.server.getInstallFolderPath.return_value = str(tmp_path)
+def _raise_if_touched(*_args, **_kwargs):
+    raise AssertionError("executeAction must not be called")
 
 
-def _fake_plugin(enabled=True, running=True, execute_result=None, forbid_execute=False):
-    p = MagicMock()
-    p.isEnabled = MagicMock(return_value=enabled)
-    p.isRunning = MagicMock(return_value=running)
-    if forbid_execute:
-        def _raise(*a, **k):
-            raise AssertionError("executeAction must not be called")
-        p.executeAction = MagicMock(side_effect=_raise)
-    else:
-        p.executeAction = MagicMock(return_value=execute_result)
-    return p
+class _FakePlugin:
+    """Real (non-Mock) plugin double.
+
+    #71 review round 3 (item F): MagicMock auto-vivifies every
+    unstubbed attribute as a truthy MagicMock -- which is exactly why
+    an isRunning() gap could go untested for two review rounds (round
+    1 didn't check it at all; round 2 only pinned isEnabled). A plain
+    object exposing ONLY the attributes this module actually uses
+    means any access to something unstubbed raises AttributeError
+    instead of quietly returning "yes".
+    """
+
+    def __init__(self, *, installed=True, enabled=True, running=True,
+                 plugin_folder_path="", execute_result=None,
+                 forbid_execute=False):
+        self._installed = installed
+        self._enabled = enabled
+        self._running = running
+        self.pluginFolderPath = plugin_folder_path
+        self.executeAction = MagicMock(
+            side_effect=_raise_if_touched if forbid_execute else None,
+            return_value=execute_result,
+        )
+
+    def isInstalled(self):
+        return self._installed
+
+    def isEnabled(self):
+        return self._enabled
+
+    def isRunning(self):
+        return self._running
+
+
+def _fake_plugin(**kwargs):
+    return _FakePlugin(**kwargs)
 
 
 def _fake_device(plugin_id, device_type_id):
     """A device double that satisfies a `self.<device_type_id>`
     deviceFilter for `plugin_id` -- MagicMock auto-vivifies attributes,
-    so a bare MagicMock() would satisfy the OLD existence-only check
-    but not the ownership check the fix in #71's review adds."""
+    so a bare MagicMock() would satisfy an existence-only check but
+    not the ownership check (review round 2, item 4)."""
     dev = MagicMock()
     dev.pluginId = plugin_id
     dev.deviceTypeId = device_type_id
     return dev
+
+
+def _install(mock_indigo, tmp_path, plugin_id, *, actions_xml=_ACTIONS_XML,
+             disabled_subdir=False, installed=True, enabled=True, running=True,
+             execute_result=None, forbid_execute=False):
+    """Create a real bundle on disk (Info.plist + optional
+    Actions.xml) and wire ``mock_indigo.server.getPlugin`` to return a
+    ``_FakePlugin`` whose ``pluginFolderPath`` points at it.
+
+    #71 review round 3 (item B) deleted the ``getInstallFolderPath``
+    filesystem-scan lookup in favour of reading ``pluginFolderPath``
+    straight off the plugin object (proven correct live, including
+    for a disabled plugin) -- so the double's path must be real and
+    must match the bundle actually written to disk. ``disabled_subdir``
+    only affects where the bundle lives on disk now; lookup no longer
+    depends on which subdirectory it's in. Returns the configured
+    plugin double so a test can still tweak
+    ``executeAction.side_effect`` etc. afterward.
+    """
+    subdir = "Plugins (Disabled)" if disabled_subdir else "Plugins"
+    plugins_dir = tmp_path / subdir
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    bundle = _make_bundle(plugins_dir, plugin_id, actions_xml=actions_xml)
+    plugin = _fake_plugin(
+        installed=installed, enabled=enabled, running=running,
+        plugin_folder_path=str(bundle),
+        execute_result=execute_result, forbid_execute=forbid_execute,
+    )
+    mock_indigo.server.getPlugin.return_value = plugin
+    return plugin
 
 
 def _plain_dict_indigo(mock_indigo):
@@ -275,12 +369,12 @@ def test_list_plugin_actions_happy_path(mock_indigo, tmp_path):
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin(enabled=True)
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
 
     assert result["plugin_id"] == PLUGIN_ID
     assert result["enabled"] is True
+    assert result["running"] is True
     ids = {a["id"] for a in result["results"]}
     # sep1 is a spacer, excluded
     assert ids == {"setStandbyMode", "startZoneWithDelay", "reportWeather",
@@ -292,7 +386,6 @@ def test_list_plugin_actions_excludes_separator(mock_indigo, tmp_path):
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     assert all(a["id"] != "sep1" for a in result["results"])
@@ -302,7 +395,6 @@ def test_list_plugin_actions_label_field_becomes_note_not_prop(mock_indigo, tmp_
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     by_id = {a["id"]: a for a in result["results"]}
@@ -314,47 +406,6 @@ def test_list_plugin_actions_label_field_becomes_note_not_prop(mock_indigo, tmp_
     assert any("automated functions" in note for note in standby["notes"])
 
 
-def test_list_plugin_actions_dynamic_menu_flagged(mock_indigo, tmp_path):
-    from tools.plugin_actions import _list_plugin_actions_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
-
-    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
-    by_id = {a["id"]: a for a in result["results"]}
-    start_zone = by_id["startZoneWithDelay"]
-
-    assert start_zone["has_dynamic_fields"] is True
-    zone_prop = next(p for p in start_zone["props"] if p["id"] == "zone")
-    assert zone_prop["values"] == "dynamic"
-    assert zone_prop["values_source"] == "getZoneList"
-    # never presented as free text
-    duration_prop = next(p for p in start_zone["props"] if p["id"] == "duration")
-    assert duration_prop.get("values") is None
-    assert duration_prop["default"] == "15"
-    # the label sibling field became a note, not a prop
-    assert any("1-180" in note for note in start_zone["notes"])
-    assert start_zone["device_required"] is True
-    assert start_zone["device_filter"] == "self.sprinkler"
-
-
-def test_list_plugin_actions_static_menu_values_enumerated(mock_indigo, tmp_path):
-    from tools.plugin_actions import _list_plugin_actions_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
-
-    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
-    by_id = {a["id"]: a for a in result["results"]}
-    weather = by_id["reportWeather"]
-    condition_prop = next(p for p in weather["props"] if p["id"] == "condition")
-    assert condition_prop["values"] == [
-        {"value": "0", "label": "Clear"},
-        {"value": "1", "label": "Cloudy"},
-    ]
-    assert weather["has_dynamic_fields"] is False
-
-
 def test_list_plugin_actions_resolvable_indigo_list_classes_name_the_tool(
     mock_indigo, tmp_path
 ):
@@ -364,7 +415,6 @@ def test_list_plugin_actions_resolvable_indigo_list_classes_name_the_tool(
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     by_id = {a["id"]: a for a in result["results"]}
@@ -399,7 +449,6 @@ def test_list_plugin_actions_plugin_class_list_dynamic_with_no_tool(mock_indigo,
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     by_id = {a["id"]: a for a in result["results"]}
@@ -420,7 +469,6 @@ def test_list_plugin_actions_bare_list_no_class_still_flagged_dynamic(
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     by_id = {a["id"]: a for a in result["results"]}
@@ -440,7 +488,6 @@ def test_list_plugin_actions_static_list_with_options_never_flagged_dynamic(
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_DYNAMIC_LIST_ACTIONS_XML)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     by_id = {a["id"]: a for a in result["results"]}
@@ -453,11 +500,49 @@ def test_list_plugin_actions_static_list_with_options_never_flagged_dynamic(
     assert by_id["pickStatic"]["has_dynamic_fields"] is False
 
 
+def test_list_plugin_actions_dynamic_menu_flagged(mock_indigo, tmp_path):
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    start_zone = by_id["startZoneWithDelay"]
+
+    assert start_zone["has_dynamic_fields"] is True
+    zone_prop = next(p for p in start_zone["props"] if p["id"] == "zone")
+    assert zone_prop["values"] == "dynamic"
+    assert zone_prop["values_source"] == "getZoneList"
+    # never presented as free text
+    duration_prop = next(p for p in start_zone["props"] if p["id"] == "duration")
+    assert duration_prop.get("values") is None
+    assert duration_prop["default"] == "15"
+    # the label sibling field became a note, not a prop
+    assert any("1-180" in note for note in start_zone["notes"])
+    assert start_zone["device_required"] is True
+    assert start_zone["device_filter"] == "self.sprinkler"
+
+
+def test_list_plugin_actions_static_menu_values_enumerated(mock_indigo, tmp_path):
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    weather = by_id["reportWeather"]
+    condition_prop = next(p for p in weather["props"] if p["id"] == "condition")
+    assert condition_prop["values"] == [
+        {"value": "0", "label": "Clear"},
+        {"value": "1", "label": "Cloudy"},
+    ]
+    assert weather["has_dynamic_fields"] is False
+
+
 def test_list_plugin_actions_hidden_flag(mock_indigo, tmp_path):
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     by_id = {a["id"]: a for a in result["results"]}
@@ -469,14 +554,10 @@ def test_list_plugin_actions_hidden_flag(mock_indigo, tmp_path):
 def test_list_plugin_actions_no_configui_flagged_props_undeclared(mock_indigo, tmp_path):
     """An action with NO <ConfigUI> at all (internalSync, hidden --
     the MQTT Connector fetchQueuedMessage shape) must NOT read as
-    "takes no arguments": props_undeclared:true plus a reason,
-    distinct from an action that genuinely declares zero-but-real
-    fields is impossible to distinguish from "declares nothing", so
-    both collapse to the same honest signal."""
+    "takes no arguments": props_undeclared:true plus a reason."""
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     by_id = {a["id"]: a for a in result["results"]}
@@ -498,8 +579,7 @@ def test_list_plugin_actions_disabled_plugin_bundle_still_lists(mock_indigo, tmp
     plugin_execute_action call will fail."""
     from tools.plugin_actions import _list_plugin_actions_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID, disabled_subdir=True)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin(enabled=False)
+    _install(mock_indigo, tmp_path, PLUGIN_ID, disabled_subdir=True, enabled=False)
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     assert result["enabled"] is False
@@ -512,8 +592,7 @@ def test_list_plugin_actions_reports_running_distinct_from_enabled(mock_indigo, 
     enabled."""
     from tools.plugin_actions import _list_plugin_actions_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin(enabled=True, running=False)
+    _install(mock_indigo, tmp_path, PLUGIN_ID, enabled=True, running=False)
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     assert result["enabled"] is True
@@ -524,7 +603,6 @@ def test_list_plugin_actions_no_actions_xml_is_legit_empty(mock_indigo, tmp_path
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     assert result["results"] == []
@@ -540,7 +618,6 @@ def test_list_plugin_actions_real_empty_actions_xml_has_distinct_reason(mock_ind
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_EMPTY_ACTIONS_XML)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
     assert result["results"] == []
@@ -558,7 +635,6 @@ def test_list_plugin_actions_reports_skipped_actions_and_ids(mock_indigo, tmp_pa
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
 
@@ -571,35 +647,28 @@ def test_list_plugin_actions_reports_skipped_actions_and_ids(mock_indigo, tmp_pa
 
 def test_list_plugin_actions_malformed_xml_raises_not_empty(mock_indigo, tmp_path):
     """A parse failure must raise, never read as 'this plugin has no
-    actions' -- the mutation this test exists to kill."""
+    actions' -- the mutation this test exists to kill. Unlike
+    plugin_execute_action (which degrades to attempting the dispatch
+    anyway -- see the D-tagged tests below), list_plugin_actions is
+    read-only discovery with nothing to fall back to, so it still
+    refuses outright."""
     from tools.plugin_actions import _list_plugin_actions_handler
 
     _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml="<Actions><Action")
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
 
     with pytest.raises(ValueError, match="could not be parsed"):
         _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
 
 
 def test_list_plugin_actions_unknown_plugin_id_names_it(mock_indigo, tmp_path):
+    """getPlugin never raises (confirmed live jarvis 2026-08-24) --
+    the real shape is a plugin object with isInstalled() False, not
+    a lookup exception."""
     from tools.plugin_actions import _list_plugin_actions_handler
 
-    mock_indigo.server.getPlugin.side_effect = KeyError("nope")
+    mock_indigo.server.getPlugin.return_value = _fake_plugin(installed=False)
     with pytest.raises(ValueError, match="com.unknown"):
         _list_plugin_actions_handler({"plugin_id": "com.unknown"}, mock_indigo)
-
-
-def test_list_plugin_actions_no_bundle_found_raises(mock_indigo, tmp_path):
-    """getPlugin resolves (e.g. mocked) but the filesystem scan finds
-    no matching bundle."""
-    from tools.plugin_actions import _list_plugin_actions_handler
-
-    (tmp_path / "Plugins").mkdir()
-    mock_indigo.server.getInstallFolderPath.return_value = str(tmp_path)
-    mock_indigo.server.getPlugin.return_value = _fake_plugin()
-
-    with pytest.raises(ValueError, match="no installed bundle"):
-        _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
 
 
 def test_list_plugin_actions_rejects_unknown_args(mock_indigo, tmp_path):
@@ -612,7 +681,154 @@ def test_list_plugin_actions_rejects_unknown_args(mock_indigo, tmp_path):
 
 
 # ---------------------------------------------------------------------
-# plugin_execute_action -- disabled plugin never reaches executeAction
+# list_plugin_actions -- real-world field shapes (review round 3, G)
+# ---------------------------------------------------------------------
+
+def test_list_plugin_actions_button_field_excluded_from_props(mock_indigo, tmp_path):
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    rich = by_id["richAction"]
+    prop_ids = {p["id"] for p in rich["props"]}
+    assert "refreshButton" not in prop_ids
+    assert any("Refresh" in note for note in rich["notes"])
+
+
+def test_list_plugin_actions_hidden_field_flagged(mock_indigo, tmp_path):
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    rich = by_id["richAction"]
+    desc_prop = next(p for p in rich["props"] if p["id"] == "description")
+    assert desc_prop.get("hidden") is True
+
+    # A normal field must NOT be flagged hidden.
+    legacy = next(p for p in rich["props"] if p["id"] == "legacy_default")
+    assert "hidden" not in legacy
+
+
+def test_list_plugin_actions_description_becomes_note(mock_indigo, tmp_path):
+    """<Description> (13 live) was dropped entirely before this fix;
+    it's kept as calling guidance, same as <Label> text, and applies
+    to real prop fields too, not just label/separator fields."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    rich = by_id["richAction"]
+    assert any("more useful sentence" in note for note in rich["notes"])
+    # the field itself is still a normal prop, unaffected
+    notes_field = next(p for p in rich["props"] if p["id"] == "notes_field")
+    assert notes_field["label"] == "Notes:"
+
+
+def test_list_plugin_actions_default_attribute_fallback(mock_indigo, tmp_path):
+    """The parser read only defaultValue before this fix, so 26 real
+    fields using a bare `default` attribute reported default: null."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    rich = by_id["richAction"]
+    legacy = next(p for p in rich["props"] if p["id"] == "legacy_default")
+    assert legacy["default"] == "42"
+
+
+def test_list_plugin_actions_defaultValue_wins_over_default(mock_indigo, tmp_path):
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    rich = by_id["richAction"]
+    both = next(p for p in rich["props"] if p["id"] == "both_defaults")
+    assert both["default"] == "new"
+
+
+def test_list_plugin_actions_id_less_field_excluded_from_props(mock_indigo, tmp_path):
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    by_id = {a["id"]: a for a in result["results"]}
+    rich = by_id["richAction"]
+    # 6 fields total; button (note), hidden description, notes_field,
+    # legacy_default, both_defaults are real props (5); the id-less
+    # field is dropped entirely.
+    assert None not in {p["id"] for p in rich["props"]}
+    assert len(rich["props"]) == 4
+
+
+def test_list_plugin_actions_id_less_action_routed_through_skipped_bookkeeping(
+    mock_indigo, tmp_path
+):
+    """An <Action> with Name/CallbackMethod but no id attribute can't
+    be looked up by id at all -- it must not appear in results (which
+    would silently collide under a None key) and must still be
+    visible via skipped_actions rather than vanishing outright."""
+    from tools.plugin_actions import _list_plugin_actions_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _list_plugin_actions_handler({"plugin_id": PLUGIN_ID}, mock_indigo)
+    ids = {a["id"] for a in result["results"]}
+    assert None not in ids
+    assert ids == {"richAction"}
+    assert result["skipped_actions"] == 1
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- isInstalled / not-installed (review round 3, A)
+# ---------------------------------------------------------------------
+
+def test_execute_action_unknown_plugin_id_names_it(mock_indigo, tmp_path):
+    """getPlugin never raises (confirmed live jarvis 2026-08-24) --
+    the real shape is a plugin object with isInstalled() False.
+    forbid_execute=True proves the not-installed check runs before
+    any dispatch attempt (review round 3, F: this test previously
+    omitted that, passing incidentally rather than by assertion)."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _fake_plugin(installed=False, forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
+    with pytest.raises(ValueError, match="com.unknown"):
+        _plugin_execute_action_handler(
+            {"plugin_id": "com.unknown", "action_id": "noop"}, mock_indigo
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_installed_but_disabled_still_names_not_enabled(
+    mock_indigo, tmp_path
+):
+    """A genuinely installed-but-disabled plugin must get the
+    not-enabled message, not the not-installed one -- proves
+    isInstalled() and isEnabled() are checked as distinct signals."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, enabled=False,
+                       forbid_execute=True)
+    with pytest.raises(ValueError, match="not enabled"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+    plugin.executeAction.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- disabled / not-running never reach dispatch
 # ---------------------------------------------------------------------
 
 def test_execute_action_disabled_plugin_fatal_and_never_dispatched(mock_indigo, tmp_path):
@@ -621,9 +837,8 @@ def test_execute_action_disabled_plugin_fatal_and_never_dispatched(mock_indigo, 
     got the isEnabled ValueError instead."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=False, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, enabled=False,
+                       forbid_execute=True)
 
     with pytest.raises(ValueError, match="not enabled"):
         _plugin_execute_action_handler(
@@ -642,9 +857,8 @@ def test_execute_action_enabled_but_not_running_fatal_and_never_dispatched(
     above."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, running=False, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, enabled=True,
+                       running=False, forbid_execute=True)
 
     with pytest.raises(ValueError, match="not running"):
         _plugin_execute_action_handler(
@@ -653,16 +867,37 @@ def test_execute_action_enabled_but_not_running_fatal_and_never_dispatched(
     plugin.executeAction.assert_not_called()
 
 
+def test_execute_action_enabled_gate_runs_before_action_validation(mock_indigo, tmp_path):
+    """review round 3, F1: a mutation moving the enabled/running gate
+    to just after Actions.xml validation must be caught. Actions.xml
+    is READABLE here on purpose: D's relaxation means an unreadable
+    Actions.xml no longer raises at all (it degrades gracefully), so
+    that combination can no longer distinguish check order -- a
+    disabled plugin + a genuinely UNKNOWN action id in a readable
+    Actions.xml is the pairing that still does: _try_validate_action
+    DOES raise for that case, so if it ran first we'd see the
+    unknown-action-id message instead of the enabled one."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, enabled=False,
+                       forbid_execute=True)
+
+    with pytest.raises(ValueError, match="not enabled"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "totallyBogusActionId"},
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
 # ---------------------------------------------------------------------
-# plugin_execute_action -- unknown action id
+# plugin_execute_action -- unknown action id (Actions.xml readable)
 # ---------------------------------------------------------------------
 
 def test_execute_action_unknown_action_id_lists_real_ones(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
 
     with pytest.raises(ValueError) as excinfo:
         _plugin_execute_action_handler(
@@ -676,16 +911,37 @@ def test_execute_action_unknown_action_id_lists_real_ones(mock_indigo, tmp_path)
     plugin.executeAction.assert_not_called()
 
 
+def test_execute_action_unknown_action_id_survives_id_less_actions_present(
+    mock_indigo, tmp_path
+):
+    """review round 3, G: an id-less <Action> used to reach
+    sorted(by_id) and raise an opaque TypeError from inside the
+    unknown-action-id error path, replacing the self-correcting
+    message with a Python internal. Must still get the normal
+    message."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID,
+                       actions_xml=_FIELD_SHAPES_ACTIONS_XML, forbid_execute=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "totallyBogus"}, mock_indigo
+        )
+    message = str(excinfo.value)
+    assert "totallyBogus" in message
+    assert "richAction" in message
+    plugin.executeAction.assert_not_called()
+
+
 # ---------------------------------------------------------------------
-# plugin_execute_action -- unknown prop key
+# plugin_execute_action -- unknown prop key / static option values
 # ---------------------------------------------------------------------
 
 def test_execute_action_unknown_prop_key_names_declared_fields(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
 
     with pytest.raises(ValueError) as excinfo:
         _plugin_execute_action_handler(
@@ -702,18 +958,87 @@ def test_execute_action_unknown_prop_key_names_declared_fields(mock_indigo, tmp_
     plugin.executeAction.assert_not_called()
 
 
+def test_execute_action_rejects_out_of_range_static_option_value(mock_indigo, tmp_path):
+    """review round 3, H: a static <List><Option> enum's VALUES were
+    never enforced, only its key -- condition="7" against an action
+    declaring only 0/1 returned a clean "dispatched"."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        _plugin_execute_action_handler(
+            {
+                "plugin_id": PLUGIN_ID,
+                "action_id": "reportWeather",
+                "props": {"condition": "7"},
+            },
+            mock_indigo,
+        )
+    message = str(excinfo.value)
+    assert "condition" in message
+    assert "7" in message
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_accepts_int_value_matching_string_option(mock_indigo, tmp_path):
+    """An int 0 must match a declared Option value="0" -- config
+    values are strings in the XML but callers reasonably pass ints."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+
+    result = _plugin_execute_action_handler(
+        {
+            "plugin_id": PLUGIN_ID,
+            "action_id": "reportWeather",
+            "props": {"condition": 0},
+        },
+        mock_indigo,
+    )
+    assert result["props_validated"] is True
+    plugin.executeAction.assert_called_once()
+
+
+def test_execute_action_dynamic_list_value_not_enforced(mock_indigo, tmp_path):
+    """A dynamic menu's legal values are correctly unknowable -- must
+    NOT be enforced the way a static enum's are."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device(PLUGIN_ID, "sprinkler")
+    )
+
+    result = _plugin_execute_action_handler(
+        {
+            "plugin_id": PLUGIN_ID,
+            "action_id": "startZoneWithDelay",
+            "device_id": 1,
+            "props": {"zone": "99999", "duration": "15"},  # dynamic, unenforceable
+        },
+        mock_indigo,
+    )
+    assert result["props_validated"] is True
+    plugin.executeAction.assert_called_once()
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- undeclared props (action HAS no fields)
+# ---------------------------------------------------------------------
+
 def test_execute_action_undeclared_props_pass_through_unchecked(mock_indigo, tmp_path):
     """The primary #71 use case: a hidden action with NO declared
     ConfigUI fields (internalSync -- the MQTT Connector
     fetchQueuedMessage / uiPath="hidden" shape) must still be
     callable with arbitrary props. An absent allowlist is not an
     empty one -- refusing this would make the whole hidden-action
-    class uncallable."""
+    class uncallable. Actions.xml WAS readable and the action WAS
+    found there, so action_validated is true even though
+    props_validated is false."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
 
     result = _plugin_execute_action_handler(
         {
@@ -723,11 +1048,289 @@ def test_execute_action_undeclared_props_pass_through_unchecked(mock_indigo, tmp
         },
         mock_indigo,
     )
-    assert result["result"] == "dispatched"
+    assert result["result"] == "completed"
+    assert result["action_validated"] is True
+    assert "action_validated_reason" not in result
     assert result["props_validated"] is False
     assert "props_validated_reason" in result
+    assert "no ConfigUI fields" in result["props_validated_reason"]
     assert result["props_not_supplied"] == []
     plugin.executeAction.assert_called_once()
+
+
+def test_execute_action_declared_case_still_hard_rejects(mock_indigo, tmp_path):
+    """Regression guard: the undeclared-props fix must not weaken the
+    declared case -- an action that DOES declare fields keeps
+    hard-rejecting unknown prop keys."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
+
+    with pytest.raises(ValueError, match="unknown prop"):
+        _plugin_execute_action_handler(
+            {
+                "plugin_id": PLUGIN_ID,
+                "action_id": "setStandbyMode",
+                "props": {"modee": True},
+            },
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- Actions.xml unreadable: ATTEMPT the
+# dispatch anyway (review round 3, D -- reverses round 2's refusal)
+# ---------------------------------------------------------------------
+
+def test_execute_action_missing_xml_attempts_dispatch_anyway(mock_indigo, tmp_path):
+    """Actions.xml was never Indigo's own guard against a bad action
+    id (executeAction's own InvalidAction is, confirmed live) -- an
+    unreadable Actions.xml is not a safety gap, only a worse error
+    message. Missing Actions.xml must NOT refuse the call; it must
+    dispatch and report what it couldn't validate."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "someRealAction",
+         "props": {"whatever": "value"}},
+        mock_indigo,
+    )
+    plugin.executeAction.assert_called_once()
+    assert result["action_validated"] is False
+    assert "no Actions.xml" in result["action_validated_reason"]
+    assert result["props_validated"] is False
+    assert "could not be validated" in result["props_validated_reason"]
+    assert result["props_not_supplied"] == []
+    assert result["result"] == "completed"
+
+
+def test_execute_action_malformed_xml_attempts_dispatch_anyway(mock_indigo, tmp_path):
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml="<Actions><Action")
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "someRealAction"}, mock_indigo
+    )
+    plugin.executeAction.assert_called_once()
+    assert result["action_validated"] is False
+    assert "could not be parsed" in result["action_validated_reason"]
+    assert result["props_validated"] is False
+
+
+def test_execute_action_unreadable_xml_still_validates_device_existence(
+    mock_indigo, tmp_path
+):
+    """Even when the action itself can't be validated, a supplied
+    device_id must still be checked for existence -- that's a live
+    Indigo lookup independent of Actions.xml."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None,
+                       forbid_execute=True)
+    mock_indigo.devices.__getitem__ = MagicMock(side_effect=KeyError())
+
+    with pytest.raises(ValueError, match="no device with id 999"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "someRealAction", "device_id": 999},
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_unreadable_xml_dispatches_with_valid_device_id(
+    mock_indigo, tmp_path
+):
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
+    mock_indigo.devices.__getitem__ = MagicMock(
+        return_value=_fake_device(PLUGIN_ID, "sprinkler")
+    )
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "someRealAction", "device_id": 42},
+        mock_indigo,
+    )
+    plugin.executeAction.assert_called_once()
+    _, kwargs = plugin.executeAction.call_args
+    assert kwargs["deviceId"] == 42
+    assert result["device_id"] == 42
+    assert result["action_validated"] is False
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- post-dispatch honesty (review round 3, E)
+# ---------------------------------------------------------------------
+
+def test_execute_action_post_dispatch_failure_never_says_not_dispatched(
+    mock_indigo, tmp_path
+):
+    """A mutation proved this unpinned: changing the post-executeAction
+    error text to claim "nothing was performed" passed the entire
+    suite. Every PRE-dispatch error correctly says "was NOT
+    dispatched"; this one, which fires AFTER executeAction was
+    genuinely called, must say the opposite and must not be
+    ValueError/TypeError (mcp_handler routes those to the
+    self-correct-and-retry bucket; a fault after an irreversible write
+    needs the back-off bucket instead)."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    side_effects_recorded = []
+
+    def _fail_after_recording(*_args, **_kwargs):
+        side_effects_recorded.append("touched the plugin")
+        raise Exception("plugin-side blew up")
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+    plugin.executeAction.side_effect = _fail_after_recording
+
+    with pytest.raises(Exception) as excinfo:
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+    assert side_effects_recorded == ["touched the plugin"]
+    message = str(excinfo.value)
+    assert "NOT performed" not in message
+    assert "NOT dispatched" not in message
+    assert "DISPATCHED" in message
+    assert not isinstance(excinfo.value, ValueError)
+    assert not isinstance(excinfo.value, TypeError)
+
+
+def test_execute_action_serialization_failure_after_success_reports_dispatched(
+    mock_indigo, tmp_path, monkeypatch
+):
+    """_json_safe sat OUTSIDE the try before this fix, so a
+    serialization failure after a genuinely successful action would
+    have reported as a failed write. It must carry the same
+    already-happened guarantee."""
+    import tools.plugin_actions as plugin_actions_module
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    def _raiser(_value):
+        raise Exception("cannot serialize this")
+
+    monkeypatch.setattr(plugin_actions_module, "_json_safe", _raiser)
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, execute_result="some-value")
+
+    with pytest.raises(Exception) as excinfo:
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+    plugin.executeAction.assert_called_once()
+    message = str(excinfo.value)
+    assert "NOT performed" not in message
+    assert "NOT dispatched" not in message
+    assert "already ran" in message
+    assert not isinstance(excinfo.value, ValueError)
+    assert not isinstance(excinfo.value, TypeError)
+
+
+def test_execute_action_action_raising_after_dispatch_is_surfaced(mock_indigo, tmp_path):
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+    plugin.executeAction.side_effect = Exception("plugin-side validation failed")
+
+    with pytest.raises(Exception, match="plugin-side validation failed"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+        )
+
+
+# ---------------------------------------------------------------------
+# plugin_execute_action -- wait_until_done (review round 3, F2/F3)
+# ---------------------------------------------------------------------
+
+def test_execute_action_wait_until_done_passed_through_when_false(mock_indigo, tmp_path):
+    """Hardcoding waitUntilDone=True passed all prior tests -- none of
+    them ever exercised a non-default value."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "noop", "wait_until_done": False},
+        mock_indigo,
+    )
+    _, kwargs = plugin.executeAction.call_args
+    assert kwargs["waitUntilDone"] is False
+    assert result["wait_until_done"] is False
+
+
+def test_execute_action_wait_until_done_defaults_true_and_is_echoed(mock_indigo, tmp_path):
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+    )
+    _, kwargs = plugin.executeAction.call_args
+    assert kwargs["waitUntilDone"] is True
+    assert result["wait_until_done"] is True
+
+
+def test_execute_action_wait_until_done_rejects_non_bool(mock_indigo, tmp_path):
+    """Deleting the bool type-check passed all prior tests -- add a
+    real assertion that a non-bool is rejected before dispatch."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
+
+    with pytest.raises(ValueError, match="wait_until_done"):
+        _plugin_execute_action_handler(
+            {"plugin_id": PLUGIN_ID, "action_id": "noop", "wait_until_done": "yes"},
+            mock_indigo,
+        )
+    plugin.executeAction.assert_not_called()
+
+
+def test_execute_action_none_return_wait_true_reports_completed(mock_indigo, tmp_path):
+    """waitUntilDone=true + a None return means executeAction ran to
+    completion synchronously -- a stronger claim than the
+    fire-and-forget "dispatched"."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, execute_result=None)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "noop", "wait_until_done": True},
+        mock_indigo,
+    )
+    assert result["result"] == "completed"
+
+
+def test_execute_action_none_return_wait_false_reports_dispatched(mock_indigo, tmp_path):
+    """waitUntilDone=false + a None return means Indigo queued the
+    action and returned without waiting at all -- weaker than
+    "completed", not even confirmed at the plugin-callback level."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, execute_result=None)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "noop", "wait_until_done": False},
+        mock_indigo,
+    )
+    assert result["result"] == "dispatched"
+
+
+def test_execute_action_non_none_return_reports_returned_value(mock_indigo, tmp_path):
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, execute_result="ok-42")
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+    )
+    assert result["result"] == "returned"
+    assert result["value"] == "ok-42"
 
 
 # ---------------------------------------------------------------------
@@ -737,10 +1340,8 @@ def test_execute_action_undeclared_props_pass_through_unchecked(mock_indigo, tmp
 def test_execute_action_converts_plain_dict_to_indigo_dict(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
     _plain_dict_indigo(mock_indigo)
-    plugin = _fake_plugin(enabled=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
 
     result = _plugin_execute_action_handler(
         {
@@ -754,117 +1355,7 @@ def test_execute_action_converts_plain_dict_to_indigo_dict(mock_indigo, tmp_path
     mock_indigo.Dict.assert_called_once_with({"mode": True})
     _, kwargs = plugin.executeAction.call_args
     assert kwargs["props"] == {"mode": True, "__is_indigo_dict__": True}
-    assert result["result"] == "dispatched"
-
-
-# ---------------------------------------------------------------------
-# plugin_execute_action -- fire-and-forget vs returned value
-# ---------------------------------------------------------------------
-
-def test_execute_action_none_return_reports_dispatched_not_confirmed(mock_indigo, tmp_path):
-    from tools.plugin_actions import _plugin_execute_action_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, execute_result=None)
-    mock_indigo.server.getPlugin.return_value = plugin
-
-    result = _plugin_execute_action_handler(
-        {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
-    )
-    assert result["result"] == "dispatched"
-    assert "value" not in result
-    assert result["props_not_supplied"] == []
-
-
-def test_execute_action_non_none_return_reports_returned_value(mock_indigo, tmp_path):
-    from tools.plugin_actions import _plugin_execute_action_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, execute_result="ok-42")
-    mock_indigo.server.getPlugin.return_value = plugin
-
-    result = _plugin_execute_action_handler(
-        {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
-    )
-    assert result["result"] == "returned"
-    assert result["value"] == "ok-42"
-
-
-# ---------------------------------------------------------------------
-# plugin_execute_action -- malformed Actions.xml
-# ---------------------------------------------------------------------
-
-def test_execute_action_malformed_xml_raises(mock_indigo, tmp_path):
-    from tools.plugin_actions import _plugin_execute_action_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml="<Actions><Action")
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
-
-    with pytest.raises(ValueError, match="cannot be validated"):
-        _plugin_execute_action_handler(
-            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
-        )
-    plugin.executeAction.assert_not_called()
-
-
-def test_execute_action_missing_actions_xml_raises(mock_indigo, tmp_path):
-    from tools.plugin_actions import _plugin_execute_action_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=None)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
-
-    with pytest.raises(ValueError, match="cannot be validated"):
-        _plugin_execute_action_handler(
-            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
-        )
-    plugin.executeAction.assert_not_called()
-
-
-# ---------------------------------------------------------------------
-# plugin_execute_action -- skipped_ids threaded through dispatch
-# ---------------------------------------------------------------------
-
-def test_execute_action_skipped_id_reports_could_not_be_validated(mock_indigo, tmp_path):
-    """An id that IS in the XML but couldn't be parsed as callable
-    (missing <Name>/<CallbackMethod>) must NOT be told "no such
-    action" -- that would be a false statement. It gets told the real
-    reason instead."""
-    from tools.plugin_actions import _plugin_execute_action_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
-
-    with pytest.raises(ValueError, match="could not be validated"):
-        _plugin_execute_action_handler(
-            {"plugin_id": PLUGIN_ID, "action_id": "malformedNoCallback"},
-            mock_indigo,
-        )
-    plugin.executeAction.assert_not_called()
-
-
-def test_execute_action_unknown_id_notes_skipped_count(mock_indigo, tmp_path):
-    """A genuinely unknown id (not even among the skipped ones) still
-    gets the real known-ids list, plus a note that some declared ids
-    could not be parsed -- so the caller isn't misled into thinking
-    the XML holds exactly the ids listed."""
-    from tools.plugin_actions import _plugin_execute_action_handler
-
-    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
-
-    with pytest.raises(ValueError) as excinfo:
-        _plugin_execute_action_handler(
-            {"plugin_id": PLUGIN_ID, "action_id": "totallyBogus"}, mock_indigo
-        )
-    message = str(excinfo.value)
-    assert "totallyBogus" in message
-    assert "realAction" in message
-    assert "2" in message  # skipped_ids count note (sep1 + malformedNoCallback)
-    plugin.executeAction.assert_not_called()
+    assert result["result"] == "completed"
 
 
 # ---------------------------------------------------------------------
@@ -874,9 +1365,7 @@ def test_execute_action_unknown_id_notes_skipped_count(mock_indigo, tmp_path):
 def test_execute_action_device_required_without_device_id_refused(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
 
     with pytest.raises(ValueError, match="requires a device"):
         _plugin_execute_action_handler(
@@ -893,9 +1382,7 @@ def test_execute_action_device_required_without_device_id_refused(mock_indigo, t
 def test_execute_action_device_id_validated_against_real_devices(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
     mock_indigo.devices.__getitem__ = MagicMock(side_effect=KeyError())
 
     with pytest.raises(ValueError, match="no device with id 999"):
@@ -914,9 +1401,7 @@ def test_execute_action_device_id_validated_against_real_devices(mock_indigo, tm
 def test_execute_action_valid_device_id_dispatches_with_deviceId_kwarg(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
     mock_indigo.devices.__getitem__ = MagicMock(
         return_value=_fake_device(PLUGIN_ID, "sprinkler")
     )
@@ -935,19 +1420,13 @@ def test_execute_action_valid_device_id_dispatches_with_deviceId_kwarg(mock_indi
     assert kwargs["deviceId"] == 12345
 
 
-# ---------------------------------------------------------------------
-# plugin_execute_action -- deviceFilter OWNERSHIP (not just existence)
-# ---------------------------------------------------------------------
-
 def test_execute_action_device_owned_by_wrong_plugin_rejected(mock_indigo, tmp_path):
     """Existence alone (_lookup_or_raise) doesn't prove ownership --
     Netro's startZoneWithDelay (filter self.sprinkler) must NOT
     happily accept a device that belongs to some other plugin."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
     mock_indigo.devices.__getitem__ = MagicMock(
         return_value=_fake_device("com.other.plugin", "sprinkler")
     )
@@ -970,9 +1449,7 @@ def test_execute_action_device_wrong_device_type_rejected(mock_indigo, tmp_path)
     accept a "zone" device from the same plugin."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
     mock_indigo.devices.__getitem__ = MagicMock(
         return_value=_fake_device(PLUGIN_ID, "zone")
     )
@@ -995,9 +1472,8 @@ def test_execute_action_comma_separated_filter_accepts_any_alternative(
 ):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_COMMA_FILTER_ACTIONS_XML)
-    plugin = _fake_plugin(enabled=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID,
+                       actions_xml=_COMMA_FILTER_ACTIONS_XML)
     mock_indigo.devices.__getitem__ = MagicMock(
         return_value=_fake_device(PLUGIN_ID, "zone")
     )
@@ -1006,7 +1482,8 @@ def test_execute_action_comma_separated_filter_accepts_any_alternative(
         {"plugin_id": PLUGIN_ID, "action_id": "multiFilterAction", "device_id": 777},
         mock_indigo,
     )
-    assert result["result"] == "dispatched"
+    assert result["result"] == "completed"
+    plugin.executeAction.assert_called_once()
 
 
 def test_execute_action_non_self_filter_skips_ownership_validation(mock_indigo, tmp_path):
@@ -1015,9 +1492,8 @@ def test_execute_action_non_self_filter_skips_ownership_validation(mock_indigo, 
     runs, but a device from a totally unrelated plugin dispatches."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_COMMA_FILTER_ACTIONS_XML)
-    plugin = _fake_plugin(enabled=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID,
+                       actions_xml=_COMMA_FILTER_ACTIONS_XML)
     mock_indigo.devices.__getitem__ = MagicMock(
         return_value=_fake_device("com.completely.unrelated", "widget")
     )
@@ -1026,19 +1502,18 @@ def test_execute_action_non_self_filter_skips_ownership_validation(mock_indigo, 
         {"plugin_id": PLUGIN_ID, "action_id": "nonSelfFilterAction", "device_id": 888},
         mock_indigo,
     )
-    assert result["result"] == "dispatched"
+    assert result["result"] == "completed"
+    plugin.executeAction.assert_called_once()
 
 
 # ---------------------------------------------------------------------
-# plugin_execute_action -- props_not_supplied
+# plugin_execute_action -- props_not_supplied (incl. hidden exclusion)
 # ---------------------------------------------------------------------
 
 def test_execute_action_reports_props_not_supplied(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID)
     mock_indigo.devices.__getitem__ = MagicMock(
         return_value=_fake_device(PLUGIN_ID, "sprinkler")
     )
@@ -1057,6 +1532,22 @@ def test_execute_action_reports_props_not_supplied(mock_indigo, tmp_path):
     assert "props_validated_reason" not in result
 
 
+def test_execute_action_hidden_field_excluded_from_props_not_supplied(mock_indigo, tmp_path):
+    """A hidden="true" field is runtime-computed by the plugin -- it
+    must never appear in props_not_supplied, which would otherwise
+    read as "the caller forgot something" for a field nobody is
+    supposed to supply."""
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_FIELD_SHAPES_ACTIONS_XML)
+
+    result = _plugin_execute_action_handler(
+        {"plugin_id": PLUGIN_ID, "action_id": "richAction"}, mock_indigo
+    )
+    assert "description" not in result["props_not_supplied"]
+    assert "legacy_default" in result["props_not_supplied"]
+
+
 # ---------------------------------------------------------------------
 # plugin_execute_action -- prop value type validation
 # ---------------------------------------------------------------------
@@ -1064,9 +1555,7 @@ def test_execute_action_reports_props_not_supplied(mock_indigo, tmp_path):
 def test_execute_action_rejects_non_scalar_prop_value(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True, forbid_execute=True)
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
 
     with pytest.raises(ValueError, match="mode"):
         _plugin_execute_action_handler(
@@ -1085,36 +1574,97 @@ def test_execute_action_rejects_non_scalar_prop_value(mock_indigo, tmp_path):
 # ---------------------------------------------------------------------
 
 def test_execute_action_rejects_unknown_top_level_args(mock_indigo, tmp_path):
+    """Isolation test (review round 3, F4): this refusal must happen
+    before any Indigo call at all, including a plugin lookup."""
     from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _fake_plugin(forbid_execute=True)
+    mock_indigo.server.getPlugin.return_value = plugin
 
     with pytest.raises(ValueError, match="unknown argument"):
         _plugin_execute_action_handler(
             {"plugin_id": PLUGIN_ID, "action_id": "noop", "bogus": 1}, mock_indigo
         )
+    plugin.executeAction.assert_not_called()
 
 
-def test_execute_action_action_raising_is_surfaced(mock_indigo, tmp_path):
+# ---------------------------------------------------------------------
+# plugin_execute_action -- skipped_ids threaded through dispatch
+# ---------------------------------------------------------------------
+
+def test_execute_action_skipped_id_reports_could_not_be_validated(mock_indigo, tmp_path):
+    """An id that IS in the XML but couldn't be parsed as callable
+    (missing <Name>/<CallbackMethod>) must NOT be told "no such
+    action" -- that would be a false statement. It gets told the real
+    reason instead."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    _install(mock_indigo, tmp_path, PLUGIN_ID)
-    plugin = _fake_plugin(enabled=True)
-    plugin.executeAction.side_effect = Exception("plugin-side validation failed")
-    mock_indigo.server.getPlugin.return_value = plugin
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML,
+                       forbid_execute=True)
 
-    with pytest.raises(ValueError, match="plugin-side validation failed"):
+    with pytest.raises(ValueError, match="could not be validated"):
         _plugin_execute_action_handler(
-            {"plugin_id": PLUGIN_ID, "action_id": "noop"}, mock_indigo
+            {"plugin_id": PLUGIN_ID, "action_id": "malformedNoCallback"},
+            mock_indigo,
         )
+    plugin.executeAction.assert_not_called()
 
 
-def test_execute_action_unknown_plugin_id_names_it(mock_indigo, tmp_path):
+def test_execute_action_unknown_id_notes_skipped_count(mock_indigo, tmp_path):
+    """A genuinely unknown id (not even among the skipped ones) still
+    gets the real known-ids list, plus a note that some declared ids
+    could not be parsed -- so the caller isn't misled into thinking
+    the XML holds exactly the ids listed."""
     from tools.plugin_actions import _plugin_execute_action_handler
 
-    mock_indigo.server.getPlugin.side_effect = KeyError("nope")
-    with pytest.raises(ValueError, match="com.unknown"):
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, actions_xml=_SKIP_ACTIONS_XML,
+                       forbid_execute=True)
+
+    with pytest.raises(ValueError) as excinfo:
         _plugin_execute_action_handler(
-            {"plugin_id": "com.unknown", "action_id": "noop"}, mock_indigo
+            {"plugin_id": PLUGIN_ID, "action_id": "totallyBogus"}, mock_indigo
         )
+    message = str(excinfo.value)
+    assert "totallyBogus" in message
+    assert "realAction" in message
+    assert "2" in message  # skipped_ids count note (sep1 + malformedNoCallback)
+    plugin.executeAction.assert_not_called()
+
+
+# ---------------------------------------------------------------------
+# tool descriptions (review round 3, I) -- read by a model at runtime
+# ---------------------------------------------------------------------
+
+def test_list_plugin_actions_description_mentions_enabled_running_notes(mock_indigo):
+    from tools.plugin_actions import register
+
+    handler = MagicMock()
+    register(handler, indigo_module=mock_indigo)
+    call = next(
+        c for c in handler.register_tool.call_args_list
+        if c.kwargs["name"] == "list_plugin_actions"
+    )
+    description = call.kwargs["description"]
+    assert "enabled" in description
+    assert "running" in description
+    assert "notes" in description
+
+
+def test_plugin_execute_action_description_mentions_wait_and_device_and_not_supplied(
+    mock_indigo
+):
+    from tools.plugin_actions import register
+
+    handler = MagicMock()
+    register(handler, indigo_module=mock_indigo)
+    call = next(
+        c for c in handler.register_tool.call_args_list
+        if c.kwargs["name"] == "plugin_execute_action"
+    )
+    description = call.kwargs["description"]
+    assert "wait_until_done" in description
+    assert "device_id" in description
+    assert "props_not_supplied" in description
 
 
 # ---------------------------------------------------------------------

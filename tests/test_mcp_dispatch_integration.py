@@ -330,8 +330,11 @@ def test_wire_dispatch_list_uncataloged_devices(mock_indigo):
 def _make_plugin_bundle(tmp_path, plugin_id, actions_xml):
     """Build a minimal real ``*.indigoPlugin`` bundle (Info.plist +
     Actions.xml) under ``tmp_path/Plugins`` for the #71 wire-dispatch
-    tests below -- ``tools.system._scan_plugin_bundles`` reads real
-    files, so a MagicMock alone can't stand in for the bundle."""
+    tests below. Returns the bundle path -- #71 review round 3 (item
+    B) replaced the filesystem-scan lookup with reading the plugin
+    object's own ``pluginFolderPath``, so the caller must wire that
+    onto the ``getPlugin`` double explicitly rather than relying on
+    ``getInstallFolderPath``."""
     import plistlib
 
     bundle = tmp_path / "Plugins" / (plugin_id.replace(".", "_") + ".indigoPlugin")
@@ -340,6 +343,7 @@ def _make_plugin_bundle(tmp_path, plugin_id, actions_xml):
     with open(bundle / "Contents" / "Info.plist", "wb") as fh:
         plistlib.dump({"CFBundleIdentifier": plugin_id}, fh)
     (server_plugin / "Actions.xml").write_text(actions_xml)
+    return bundle
 
 
 _WIRE_ACTIONS_XML = (
@@ -356,16 +360,20 @@ _WIRE_ACTIONS_XML = (
 def test_wire_dispatch_list_plugin_actions(mock_indigo, tmp_path):
     """Issue #71 wire-dispatch regression guard: ``list_plugin_actions``
     registers as ``lambda **args:``; ``mcp_handler.dispatch_tool`` calls
-    ``handler(**tool_args)``. Every direct unit test in
+    ``handler(**tool_args)``. Every handler-level unit test in
     ``test_plugin_actions.py`` calls ``_list_plugin_actions_handler``
-    itself and so bypasses the lambda entirely -- only a real
-    ``MCPHandler.handle_request`` round trip, with a real ``plugin_id``
-    argument flowing through the ``**`` unpacking, would catch a
-    ``lambda args:`` typo here."""
+    directly and so bypasses the lambda entirely (its two registration
+    tests call neither, since they only inspect the registration
+    record) -- only a real ``MCPHandler.handle_request`` round trip,
+    with a real ``plugin_id`` argument flowing through the ``**``
+    unpacking, exercises the lambda itself."""
     plugin_id = "com.example.widget"
-    _make_plugin_bundle(tmp_path, plugin_id, _WIRE_ACTIONS_XML)
-    mock_indigo.server.getInstallFolderPath.return_value = str(tmp_path)
-    mock_indigo.server.getPlugin.return_value.isEnabled.return_value = True
+    bundle = _make_plugin_bundle(tmp_path, plugin_id, _WIRE_ACTIONS_XML)
+    plugin = mock_indigo.server.getPlugin.return_value
+    plugin.pluginFolderPath = str(bundle)
+    plugin.isInstalled.return_value = True
+    plugin.isEnabled.return_value = True
+    plugin.isRunning.return_value = True
 
     result = _wire_call(mock_indigo, "list_plugin_actions", {"plugin_id": plugin_id})
     assert result.get("isError") is not True, result
@@ -379,12 +387,16 @@ def test_wire_dispatch_plugin_execute_action(mock_indigo, tmp_path):
     same rationale as ``test_wire_dispatch_list_plugin_actions`` above.
     Asserts the dispatch actually reached the plugin double
     (``executeAction`` called) and that the payload reports
-    ``result: "dispatched"``, not merely that no error was raised."""
+    ``result: "completed"`` (waitUntilDone defaults true, and a None
+    return means executeAction ran to completion synchronously), not
+    merely that no error was raised."""
     plugin_id = "com.example.widget"
-    _make_plugin_bundle(tmp_path, plugin_id, _WIRE_ACTIONS_XML)
-    mock_indigo.server.getInstallFolderPath.return_value = str(tmp_path)
+    bundle = _make_plugin_bundle(tmp_path, plugin_id, _WIRE_ACTIONS_XML)
     plugin = mock_indigo.server.getPlugin.return_value
+    plugin.pluginFolderPath = str(bundle)
+    plugin.isInstalled.return_value = True
     plugin.isEnabled.return_value = True
+    plugin.isRunning.return_value = True
     plugin.executeAction.return_value = None
 
     result = _wire_call(
@@ -394,7 +406,7 @@ def test_wire_dispatch_plugin_execute_action(mock_indigo, tmp_path):
     assert result.get("isError") is not True, result
     plugin.executeAction.assert_called_once()
     inner = json.loads(result["content"][0]["text"])
-    assert inner["result"] == "dispatched"
+    assert inner["result"] == "completed"
     assert inner["plugin_id"] == plugin_id
     assert inner["action_id"] == "noop"
 
