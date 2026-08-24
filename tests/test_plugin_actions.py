@@ -2251,6 +2251,41 @@ def test_execute_action_device_id_validated_against_real_devices(mock_indigo, tm
     plugin.executeAction.assert_not_called()
 
 
+def test_execute_action_device_lookup_fault_does_not_dispatch_or_claim_absence(
+    mock_indigo, tmp_path
+):
+    """Issue #74: a device lookup that FAULTS (Indigo-side, not "no
+    such id") must not be misreported as "no device with id N", must
+    not route through mcp_handler's self-correct-and-retry bucket
+    (ValueError/TypeError), and above all must never reach
+    executeAction -- proven with a devices collection that raises if
+    touched a second time, i.e. any retry after this failure is also
+    caught."""
+    from tools.lookup import _LookupFault
+    from tools.plugin_actions import _plugin_execute_action_handler
+
+    plugin = _install(mock_indigo, tmp_path, PLUGIN_ID, forbid_execute=True)
+    mock_indigo.devices.__getitem__ = MagicMock(
+        side_effect=OverflowError("can't convert negative value to unsigned int")
+    )
+
+    with pytest.raises(_LookupFault) as excinfo:
+        _plugin_execute_action_handler(
+            {
+                "plugin_id": PLUGIN_ID,
+                "action_id": "startZoneWithDelay",
+                "device_id": 999,
+                "props": {"zone": "1", "duration": "15"},
+            },
+            mock_indigo,
+        )
+
+    assert not isinstance(excinfo.value, ValueError)
+    assert not isinstance(excinfo.value, TypeError)
+    assert "no device with id" not in str(excinfo.value)
+    plugin.executeAction.assert_not_called()
+
+
 def test_execute_action_valid_device_id_dispatches_with_deviceId_kwarg(mock_indigo, tmp_path):
     from tools.plugin_actions import _plugin_execute_action_handler
 
