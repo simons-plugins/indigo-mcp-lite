@@ -1,0 +1,70 @@
+# Runs the pytest suite (tests/) and the README-drift check on every
+# PR and on every push to main.
+#
+# Before this workflow existed, the only CI here was version-check.yml
+# (PluginVersion bumped + well-formed), catalog-refresh.yml, and
+# create-release.yml — none of them ran a single test. A green
+# `gh pr checks` meant "the version was bumped", nothing about
+# correctness, so a red local suite could merge (and create-release
+# could tag/ship it) with no signal in the loop at all. See #77 and
+# the post-merge review of #73 (#76) for the incident that surfaced
+# this gap. Do not remove this workflow as "redundant" with
+# version-check — it is the only one that actually runs the tests.
+#
+# The plugin and its test suite are stdlib-only by design (ADR-0003 in
+# the workspace root) plus pytest itself, so there is no dependency
+# install step here beyond pytest.
+#
+# Matrix: 3.10 is pyproject.toml's `requires-python` floor (users on
+# older Indigo builds may still be on it); 3.13 is what production
+# actually runs — confirmed live on jarvis 2026-08-24:
+#   IndigoPluginHost3 -e "print(sys.version)" -> 3.13.9
+#   readlink /Library/Frameworks/Python.framework/Versions/Current -> 3.13
+# A 3.10-only matrix would let a 3.13-specific breakage pass CI and
+# ship straight to the environment the plugin actually runs in; a
+# 3.13-only matrix would silently drop the floor the package publicly
+# claims. `fail-fast: false` so both legs report even when one breaks
+# -- whether a failure is version-specific or universal is most of
+# the diagnostic value here, worth far more than the few seconds saved
+# by fail-fast on a sub-second suite.
+
+name: Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run test suite
+        run: python3 -m pytest
+
+      # Version-independent (pure text diff against README.md), so it
+      # only needs to run once -- guarded to the 3.13 leg (production)
+      # rather than duplicated across both matrix legs, which would
+      # just be the same check reported twice with no extra signal.
+      - name: Check README tool table is up to date
+        if: matrix.python-version == '3.13'
+        run: python3 scripts/generate_tool_doc.py --check
