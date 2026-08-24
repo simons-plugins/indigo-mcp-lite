@@ -64,6 +64,10 @@ def _build_handler():
 _SYSTEM_TOOLS = frozenset({
     "query_event_log", "list_plugins", "get_plugin_by_id",
     "get_plugin_status", "restart_plugin",
+    # Issue #71: plugin action discovery/dispatch. Grouped with the
+    # other plugin-lifecycle tools (same reasoning as restart_plugin
+    # being System rather than Control) instead of Lookup/Control.
+    "list_plugin_actions", "plugin_execute_action",
 })
 
 
@@ -76,8 +80,19 @@ _AUTOMATION_CONTENT_TOOLS = frozenset({
 })
 
 
+# Auto Lights config tools (issue #66) get their own group for the
+# same reason as Automation contents above: auto_lights_list_zones
+# would otherwise match the generic list_* Lookup rule while its
+# three write siblings (set_level/set_zone_enabled/reset_locks) would
+# match no predicate at all and silently vanish from the table.
+_AUTO_LIGHTS_TOOLS = frozenset({
+    "auto_lights_list_zones", "auto_lights_set_level",
+    "auto_lights_set_zone_enabled", "auto_lights_reset_locks",
+})
+
+
 def _is_lookup(n):
-    if n in _SYSTEM_TOOLS or n in _AUTOMATION_CONTENT_TOOLS:
+    if n in _SYSTEM_TOOLS or n in _AUTOMATION_CONTENT_TOOLS or n in _AUTO_LIGHTS_TOOLS:
         return False
     return n.startswith("list_") or n.startswith("get_")
 
@@ -105,6 +120,7 @@ _GROUPS = (
     ("History", lambda n: n in _HISTORY_TOOLS),
     ("System", lambda n: n in _SYSTEM_TOOLS),
     ("Search", lambda n: n == "find_devices"),
+    ("Auto Lights config", lambda n: n in _AUTO_LIGHTS_TOOLS),
 )
 
 
