@@ -244,17 +244,31 @@ def _execute_autolights_action(indigo_module, action_id, props=None):
     ``executeAction`` — the documented cross-plugin call, same family
     as ``restart_plugin``'s ``.restart()``.
 
-    ``executeAction`` is NOT documented to raise when the target
-    plugin is disabled/stopped — every canonical Indigo scripting
-    example that calls it (email, easydaq, timersandpesters,
-    airfoilpro, virtual-devices) guards the call with
-    ``if plugin.isEnabled():`` first rather than relying on an
-    exception, which is the strongest signal available that a call to
-    a stopped plugin can return quietly. So this checks ``isEnabled()``
-    itself and raises rather than let a quiet no-op read as success —
-    the same principle ``auto_lights_set_level`` applies to its
-    restart. Any other failure (plugin not installed, action itself
-    raising) is likewise mapped to a friendly ``ValueError``.
+    Confirmed live (jarvis, 2026-08-24, Indigo 2025.2): ``executeAction``
+    on a DISABLED plugin raises ``PluginDisabled`` ("plugin Z-Wave
+    Watcher is not enabled"), and on a bad action id raises
+    ``InvalidAction`` ("plugin does not have a <CallbackMethod>
+    specified for action id ...") — but only when ``waitUntilDone=True``;
+    with ``waitUntilDone=False`` a bad action id instead returns
+    ``None`` with no exception at all. (Same probe that corrected the
+    identical — and now disproven — inference in ``plugin_actions.py``
+    for issue #71; see issue #75.) So this function's own
+    ``isEnabled()`` check below is NOT a safety net against a silent
+    no-op — Indigo already raises on its own. It is a BETTER-ERROR
+    layer: ``PluginDisabled`` names neither which plugin nor what to
+    do about it, while the ``ValueError`` raised here names Auto
+    Lights specifically and tells the caller to enable it.
+
+    This function always calls with ``waitUntilDone=True`` below, so
+    the ``InvalidAction`` guard against a bad action id is live today
+    — but that safety is ACCIDENTAL, not enforced by anything in this
+    function: it follows only from that hardcoded ``waitUntilDone=True``.
+    If a future change made this call fire-and-forget
+    (``waitUntilDone=False``), a bad ``action_id`` would silently stop
+    raising and this module would report success without Auto Lights
+    having run anything, with nothing here to catch it. Any other
+    failure (plugin not installed, action itself raising) is likewise
+    mapped to a friendly ``ValueError``.
 
     KNOWN GAP, not fixed here on purpose: ``isEnabled()`` reflects
     process state, not Auto Lights' own agent readiness. If its
@@ -282,11 +296,15 @@ def _execute_autolights_action(indigo_module, action_id, props=None):
         ) from exc
 
     if not plugin.isEnabled():
-        # This only catches "process disabled/stopped". A
-        # half-initialised Auto Lights (agent is None) still reports
-        # isEnabled() == True -- see the KNOWN GAP note above. That
-        # case silently no-ops enable_zone/disable_zone but does NOT
-        # affect reset_all_locks/reset_zone_locks, which raise instead.
+        # BETTER-ERROR layer, not a safety net: executeAction would
+        # also raise PluginDisabled here (confirmed live, see the
+        # docstring above), but that names neither Auto Lights nor
+        # the remedy. This only catches "process disabled/stopped" --
+        # a half-initialised Auto Lights (agent is None) still
+        # reports isEnabled() == True -- see the KNOWN GAP note
+        # above. That case silently no-ops enable_zone/disable_zone
+        # but does NOT affect reset_all_locks/reset_zone_locks, which
+        # raise instead.
         raise ValueError(
             f"Auto Lights plugin ({AUTOLIGHTS_PLUGIN_ID}) is installed "
             f"but not enabled/running; action {action_id!r} was NOT "
@@ -450,11 +468,13 @@ def _set_level_handler(args, indigo_module):
         ) from exc
 
     # plugin.restart()'s behaviour on a disabled plugin is undocumented
-    # -- treat it as unsafe rather than assume it raises, the same way
-    # _execute_autolights_action treats executeAction. Without this
-    # check a disabled Auto Lights would leave the write live-on-disk
-    # but not live-in-process while this call still reported success
-    # and claimed every zone lock had been reset.
+    # and NOT covered by the live probe that confirmed executeAction's
+    # behaviour (see _execute_autolights_action's docstring) --
+    # restart() is a different method. Treat it as unsafe rather than
+    # assume it raises. Without this check a disabled Auto Lights
+    # would leave the write live-on-disk but not live-in-process while
+    # this call still reported success and claimed every zone lock had
+    # been reset.
     if not plugin.isEnabled():
         raise ValueError(
             f"Auto Lights config was written and backed up (backup: "
