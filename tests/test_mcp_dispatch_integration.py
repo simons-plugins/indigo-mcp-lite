@@ -327,6 +327,92 @@ def test_wire_dispatch_list_uncataloged_devices(mock_indigo):
     assert "catalog_snapshot" in inner
 
 
+def _make_plugin_bundle(tmp_path, plugin_id, actions_xml):
+    """Build a minimal real ``*.indigoPlugin`` bundle (Info.plist +
+    Actions.xml) under ``tmp_path/Plugins`` for the #71 wire-dispatch
+    tests below. Returns the bundle path -- #71 review round 3 (item
+    B) replaced the filesystem-scan lookup with reading the plugin
+    object's own ``pluginFolderPath``, so the caller must wire that
+    onto the ``getPlugin`` double explicitly rather than relying on
+    ``getInstallFolderPath``."""
+    import plistlib
+
+    bundle = tmp_path / "Plugins" / (plugin_id.replace(".", "_") + ".indigoPlugin")
+    server_plugin = bundle / "Contents" / "Server Plugin"
+    server_plugin.mkdir(parents=True)
+    with open(bundle / "Contents" / "Info.plist", "wb") as fh:
+        plistlib.dump({"CFBundleIdentifier": plugin_id}, fh)
+    (server_plugin / "Actions.xml").write_text(actions_xml)
+    return bundle
+
+
+_WIRE_ACTIONS_XML = (
+    '<?xml version="1.0"?>\n'
+    "<Actions>\n"
+    '    <Action id="noop">\n'
+    "        <Name>No Op</Name>\n"
+    "        <CallbackMethod>noop</CallbackMethod>\n"
+    "    </Action>\n"
+    "</Actions>\n"
+)
+
+
+def test_wire_dispatch_list_plugin_actions(mock_indigo, tmp_path):
+    """Issue #71 wire-dispatch regression guard: ``list_plugin_actions``
+    registers as ``lambda **args:``; ``mcp_handler.dispatch_tool`` calls
+    ``handler(**tool_args)``. Every handler-level unit test in
+    ``test_plugin_actions.py`` calls ``_list_plugin_actions_handler``
+    directly and so bypasses the lambda entirely (its two registration
+    tests call neither, since they only inspect the registration
+    record) -- only a real ``MCPHandler.handle_request`` round trip,
+    with a real ``plugin_id`` argument flowing through the ``**``
+    unpacking, exercises the lambda itself."""
+    plugin_id = "com.example.widget"
+    bundle = _make_plugin_bundle(tmp_path, plugin_id, _WIRE_ACTIONS_XML)
+    plugin = mock_indigo.server.getPlugin.return_value
+    plugin.pluginFolderPath = str(bundle)
+    plugin.isInstalled.return_value = True
+    plugin.isEnabled.return_value = True
+    plugin.isRunning.return_value = True
+
+    result = _wire_call(mock_indigo, "list_plugin_actions", {"plugin_id": plugin_id})
+    assert result.get("isError") is not True, result
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["total_count"] == 1
+    assert inner["results"][0]["id"] == "noop"
+
+
+def test_wire_dispatch_plugin_execute_action(mock_indigo, tmp_path):
+    """Issue #71 wire-dispatch regression guard for the write tool --
+    same rationale as ``test_wire_dispatch_list_plugin_actions`` above.
+    Asserts the dispatch actually reached the plugin double
+    (``executeAction`` called) and that the payload reports
+    ``result: "completed_unverified"`` (waitUntilDone defaults true so
+    the action ran to completion, but the fixture's "noop" action
+    declares no ConfigUI fields at all, so props_validated is false --
+    review round 4 downgrades the result string itself for that case,
+    not just a payload flag), not merely that no error was raised."""
+    plugin_id = "com.example.widget"
+    bundle = _make_plugin_bundle(tmp_path, plugin_id, _WIRE_ACTIONS_XML)
+    plugin = mock_indigo.server.getPlugin.return_value
+    plugin.pluginFolderPath = str(bundle)
+    plugin.isInstalled.return_value = True
+    plugin.isEnabled.return_value = True
+    plugin.isRunning.return_value = True
+    plugin.executeAction.return_value = None
+
+    result = _wire_call(
+        mock_indigo, "plugin_execute_action",
+        {"plugin_id": plugin_id, "action_id": "noop"},
+    )
+    assert result.get("isError") is not True, result
+    plugin.executeAction.assert_called_once()
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["result"] == "completed_unverified"
+    assert inner["plugin_id"] == plugin_id
+    assert inner["action_id"] == "noop"
+
+
 def test_wire_dispatch_capability_refusal_is_friendly_tool_error(
         mock_indigo, monkeypatch):
     """A catalog capability refusal must arrive on the wire as a clean
