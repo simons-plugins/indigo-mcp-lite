@@ -342,7 +342,9 @@ def register(handler, *, indigo_module):
             "List every installed Indigo plugin with id, display name, "
             "version, install path, and live enabled/running/installed "
             "flags. Plugins that disappear between enumeration and "
-            "lookup (rare install/uninstall race) are skipped silently."
+            "lookup (rare install/uninstall race) are skipped silently. "
+            "This does NOT show what a plugin can be told to do — use "
+            "list_plugin_actions(plugin_id) for its declared actions."
         ),
         input_schema={"type": "object", "properties": {}},
         handler=lambda **args: _list_plugins_handler(args, indigo_module),
@@ -352,7 +354,9 @@ def register(handler, *, indigo_module):
         description=(
             "Return a single plugin by id with full metadata + live "
             "enabled/running/installed flags. Raises if the id is not "
-            "installed."
+            "installed. This does NOT show what the plugin can be told "
+            "to do — use list_plugin_actions(plugin_id) for its "
+            "declared actions."
         ),
         input_schema=_PLUGIN_ID_SCHEMA,
         handler=lambda **args: _get_plugin_by_id_handler(args, indigo_module),
