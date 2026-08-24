@@ -7,9 +7,21 @@ table going stale -- ``list_plugin_actions``/``plugin_execute_action``'s
 descriptions drifted across review round 3 without a regenerate, and
 no test or CI check noticed. This test performs the same comparison
 ``--check`` now does, as a permanent guard against a repeat.
+
+Post-merge review, item 9: ``"--check" in sys.argv[1:]`` was itself
+typo-tolerant -- ``--chek`` silently fell through to the default
+print-and-exit-0 path, the exact failure mode ``--check`` was added to
+catch, one layer up. Fixed with ``argparse``, which rejects an unknown
+flag with a nonzero exit; ``test_typo_flag_is_rejected_not_silently_
+ignored`` below pins that. Note that nothing in this repo actually
+RUNS ``--check`` (no CI workflow, no pre-commit hook references
+``generate_tool_doc``) -- this test file remains the real enforcement
+point, not the CLI flag.
 """
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -77,3 +89,31 @@ def test_check_flag_exits_zero_when_up_to_date(monkeypatch):
         raise AssertionError(
             f"main() must not exit nonzero when README is current, got {exc.code}"
         )
+
+
+def test_typo_flag_is_rejected_not_silently_ignored(monkeypatch):
+    """Post-merge review, item 9: a typo'd flag (e.g. --chek) must be
+    rejected with a usage error, not silently fall through to the
+    default print-and-exit-0 behaviour -- the exact failure mode
+    --check itself exists to catch, one layer up. Pre-argparse,
+    "--check" in sys.argv[1:] made this a no-op for anything but the
+    exact string "--check"."""
+    mod = _load_generate_tool_doc()
+    monkeypatch.setattr(sys, "argv", ["generate_tool_doc.py", "--chek"])
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main()
+    assert excinfo.value.code != 0
+
+
+def test_readme_missing_markers_raises_named_error(tmp_path, monkeypatch):
+    """Post-merge review, item 9 (minor): a README missing the BEGIN/
+    END TOOL TABLE markers used to raise a raw
+    "ValueError: substring not found" from text.index -- must name
+    what's actually wrong instead."""
+    mod = _load_generate_tool_doc()
+    fake_readme = tmp_path / "README.md"
+    fake_readme.write_text("no markers here at all\n")
+    monkeypatch.setattr(mod, "REPO_ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match="BEGIN TOOL TABLE"):
+        mod._readme_committed_block()

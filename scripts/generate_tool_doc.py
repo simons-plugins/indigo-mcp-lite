@@ -18,6 +18,7 @@ in the table on the next regenerate.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -182,22 +183,59 @@ def _readme_committed_block():
     text = readme_path.read_text()
     begin = "<!-- BEGIN TOOL TABLE -->\n"
     end = "\n<!-- END TOOL TABLE -->"
-    start_idx = text.index(begin) + len(begin)
-    end_idx = text.index(end, start_idx)
+    try:
+        start_idx = text.index(begin) + len(begin)
+        end_idx = text.index(end, start_idx)
+    except ValueError as exc:
+        raise ValueError(
+            f"{readme_path} is missing the {begin.strip()!r} / "
+            f"{end.strip()!r} markers -- cannot locate the tool table to "
+            "compare against."
+        ) from exc
     return text[start_idx:end_idx]
 
 
-def main():
-    """``--check`` (used in CI / pre-commit) verifies the README's
-    committed block matches the live registry and exits nonzero on
-    drift, WITHOUT writing anything -- previously this flag was
-    silently ignored and the script always printed + exited 0, so
-    nothing ever caught a stale README (item 6, PR #73 review round
-    4: the description text drifted from actual behaviour and no
-    check existed to notice). Default (no flag) behaviour is
-    unchanged: print the table to stdout for pasting by hand."""
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Generate (or check) the README's tool-list table."
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Compare the live registry against README.md's committed "
+            "table and exit nonzero on drift, without writing anything. "
+            "NOT wired into CI or a pre-commit hook today -- "
+            "tests/test_generate_tool_doc.py is the actual enforcement "
+            "point (see module docstring). Uses argparse so a typo'd "
+            "flag (e.g. --chek) is rejected with a usage error instead "
+            "of silently falling through to the default print-and-exit-0 "
+            "behaviour -- the exact failure mode --check itself was "
+            "added to catch, one layer up (PR #73 review round 4, item "
+            "6, then found unfixed by the post-#73 review)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    """``--check`` verifies the README's committed block matches the
+    live registry and exits nonzero on drift, WITHOUT writing anything.
+    Default (no flag) behaviour is unchanged: print the table to
+    stdout for pasting by hand.
+
+    Nothing in this repo currently RUNS ``--check`` automatically --
+    grepping ``.github/``, ``.pre-commit-config.yaml``, and
+    ``Makefile`` for ``generate_tool_doc`` finds no matches.
+    ``tests/test_generate_tool_doc.py`` (which calls
+    ``generate_table()``/``_readme_committed_block()`` directly, not
+    this CLI) is the actual enforcement point; treat this flag as a
+    convenience for a human running it by hand, not a guard anything
+    depends on.
+    """
+    args = _parse_args(argv)
     table = generate_table()
-    if "--check" in sys.argv[1:]:
+    if args.check:
         committed = _readme_committed_block()
         if table.rstrip("\n") != committed.rstrip("\n"):
             print(
