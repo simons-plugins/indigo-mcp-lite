@@ -337,10 +337,28 @@ def _require_int_id(args, key="id"):
     tools but Phase 4 control tools pass ``"device_id"``,
     ``"variable_id"``, etc., so the same validator applies everywhere
     without each tool reimplementing it.
+
+    Negative values are rejected here rather than left to the
+    collection subscript. Confirmed live on jarvis 2026-08-24:
+    ``indigo.devices[-1]`` raises ``OverflowError: can't convert
+    negative value to unsigned int`` -- Indigo's id space is
+    UNSIGNED, so no negative id can ever name a real object. Left to
+    the subscript it becomes a ``_LookupFault`` (the back-off bucket),
+    which is the wrong advice for a mistake the caller can fix by
+    passing a valid id. ``0`` is deliberately NOT rejected: it is
+    almost certainly not a real id, but it reaches the collection and
+    comes back as the friendly "no X with id 0", which is already the
+    right answer -- and "almost certainly" is not the bar for a
+    validator every tool depends on.
     """
     value = _coerce_int(args.get(key))
     if value is None:
         raise ValueError(f"{key} must be an integer")
+    if value < 0:
+        raise ValueError(
+            f"{key} must be a non-negative integer (Indigo object ids are "
+            f"unsigned); got {value}"
+        )
     return value
 
 

@@ -120,3 +120,64 @@ def test_fault_from_lookup_reaches_mcp_handler_back_off_bucket(mock_indigo):
     body = json.loads(response["content"])
     assert "error" in body, f"expected a JSON-RPC protocol error, got: {body}"
     assert body["error"]["code"] == -32603
+
+
+# ---------------------------------------------------------------------
+# negative ids: refused at the validator, never reach the collection
+# ---------------------------------------------------------------------
+
+class _FatalCollection:
+    """A collection that makes being touched a test failure.
+
+    Per the workspace convention, the way to assert something did NOT
+    happen is to make it fatal: if the negative-id guard ever stops
+    short-circuiting, the subscript runs and this raises instead of
+    the expected friendly ValueError.
+    """
+
+    def __getitem__(self, key):  # pragma: no cover - must never run
+        raise AssertionError(
+            f"collection was subscripted with {key!r}; the negative-id "
+            "guard should have refused before the lookup"
+        )
+
+
+def test_negative_id_refused_by_validator_and_never_subscripted(mock_indigo):
+    """A negative id is a caller mistake, not a server fault.
+
+    Indigo's id space is unsigned (live-confirmed 2026-08-24:
+    ``indigo.devices[-1]`` raises OverflowError), so left to the
+    subscript this became a _LookupFault -> back-off bucket, telling a
+    model to retry later over something it could fix immediately.
+    """
+    from tools.lookup import _LookupFault, _lookup_or_raise, _require_int_id
+
+    with pytest.raises(ValueError) as excinfo:
+        _lookup_or_raise(_FatalCollection(), _require_int_id({"id": -1}), "device")
+
+    message = str(excinfo.value)
+    assert "non-negative" in message
+    assert "-1" in message
+    # self-correct bucket, not the back-off one
+    assert not isinstance(excinfo.value, _LookupFault)
+
+
+def test_zero_id_still_reaches_collection_and_gets_friendly_not_found(mock_indigo):
+    """Guard against the negative check creeping up to include 0.
+
+    0 is almost certainly not a real id, but it reaches the collection
+    and comes back as the friendly not-found -- already the right
+    answer. "Almost certainly" is not the bar for a validator every
+    tool depends on.
+    """
+    from tools.lookup import _LookupFault, _lookup_or_raise, _require_int_id
+
+    class _Missing:
+        def __getitem__(self, key):
+            raise KeyError(f"key id {key} not found in database")
+
+    assert _require_int_id({"id": 0}) == 0
+    with pytest.raises(ValueError) as excinfo:
+        _lookup_or_raise(_Missing(), 0, "device")
+    assert "no device with id 0" in str(excinfo.value)
+    assert not isinstance(excinfo.value, _LookupFault)
