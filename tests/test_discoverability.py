@@ -81,6 +81,11 @@ def test_plugin_ships_instructions_naming_every_tool_family():
     # ...and routes the props case to the tool that actually resolves
     # it, rather than leaving the client to read raw props itself.
     assert "acts_on_via_props" in text
+    # Plugin-specific families a client would never guess from the
+    # four generic groups above. Without this line the lamplighter_*
+    # tools are discoverable only by reading 86 tool descriptions.
+    assert "lamplighter_" in text
+    assert "lamplighter_explain" in text
 
 
 def _descriptions(mock_indigo):

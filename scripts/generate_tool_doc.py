@@ -92,8 +92,19 @@ _AUTO_LIGHTS_TOOLS = frozenset({
 })
 
 
+# Lamplighter tools (PRD 5.12). A prefix rule rather than a frozenset:
+# every tool in the family is named lamplighter_*, and unlike the
+# auto_lights set this one is expected to grow, so a missed frozenset
+# entry would silently drop a tool from the README (the exact failure
+# the exactly-one-group check exists to catch). Checked BEFORE the
+# generic list_*/get_* Lookup rule for the same reason _SYSTEM_TOOLS is.
+def _is_lamplighter(n):
+    return n.startswith("lamplighter_")
+
+
 def _is_lookup(n):
-    if n in _SYSTEM_TOOLS or n in _AUTOMATION_CONTENT_TOOLS or n in _AUTO_LIGHTS_TOOLS:
+    if (n in _SYSTEM_TOOLS or n in _AUTOMATION_CONTENT_TOOLS
+            or n in _AUTO_LIGHTS_TOOLS or _is_lamplighter(n)):
         return False
     return n.startswith("list_") or n.startswith("get_")
 
@@ -122,6 +133,7 @@ _GROUPS = (
     ("System", lambda n: n in _SYSTEM_TOOLS),
     ("Search", lambda n: n == "find_devices"),
     ("Auto Lights config", lambda n: n in _AUTO_LIGHTS_TOOLS),
+    ("Lamplighter", _is_lamplighter),
 )
 
 

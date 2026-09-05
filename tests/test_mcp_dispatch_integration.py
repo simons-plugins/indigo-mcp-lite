@@ -492,6 +492,114 @@ def test_wire_dispatch_auto_lights_set_level(mock_indigo, tmp_path):
     assert kitchen["device_period_map"]["1256902388"]["3"] == 42
 
 
+_LAMPLIGHTER_PLUGIN_ID = "com.simons-plugins.indigo-lamplighter"
+
+_LAMPLIGHTER_WIRE_CONFIG = {
+    "version": 1,
+    "zones": [
+        {
+            "name": "Kitchen",
+            "enabled": True,
+            "presence_devices": [1465867145],
+            "hold_seconds": 300,
+            "lux": None,
+            "lights": [772478931],
+            "periods": [{"name": "Dusk", "from": "18:00", "to": "23:00",
+                         "mode": "on_and_off", "levels": {"772478931": 50}}],
+        },
+    ],
+}
+
+
+def _write_lamplighter_config(mock_indigo, tmp_path, config):
+    """Write a minimal Lamplighter config at its real Preferences path
+    under ``tmp_path`` -- note ``Preferences/Plugins/<id>/``, one level
+    different from Auto Lights above. Never touches a real install."""
+    config_dir = tmp_path / "Preferences" / "Plugins" / _LAMPLIGHTER_PLUGIN_ID
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "lamplighter.json"
+    config_path.write_text(json.dumps(config))
+    mock_indigo.server.getInstallFolderPath.return_value = str(tmp_path)
+    return config_path
+
+
+def test_wire_dispatch_lamplighter_list_zones(mock_indigo, tmp_path):
+    """Wire-dispatch regression guard for the family's read tool --
+    same rationale as the auto_lights wire tests above. It takes no
+    arguments, so ``{}`` IS its full argument set and still exercises
+    the ``**`` unpacking (a mutated ``lambda args:`` registration fails
+    on ``handler()`` with a missing positional)."""
+    _write_lamplighter_config(mock_indigo, tmp_path, _LAMPLIGHTER_WIRE_CONFIG)
+    mock_indigo.devices = []
+
+    result = _wire_call(mock_indigo, "lamplighter_list_zones", {})
+    assert result.get("isError") is not True, result
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["total_count"] == 1
+    assert inner["zones"][0]["name"] == "Kitchen"
+    # No device exists in this fixture, so the join must SAY so rather
+    # than quietly returning a config-only row.
+    assert inner["zones_without_device"] == ["Kitchen"]
+
+
+def test_wire_dispatch_lamplighter_update_zone(mock_indigo, tmp_path):
+    """Wire-dispatch guard for the family's highest blast-radius tool:
+    it writes a sibling plugin's config file. Real arguments, a tmp
+    config fixture, and ``getPlugin`` is the ``mock_indigo`` double, so
+    no real plugin is touched."""
+    from unittest.mock import MagicMock
+
+    import tools.lamplighter as lamplighter_module
+
+    config_path = _write_lamplighter_config(
+        mock_indigo, tmp_path, _LAMPLIGHTER_WIRE_CONFIG
+    )
+    mock_indigo.devices = []
+    mock_indigo.Dict = MagicMock(side_effect=dict)
+    plugin = mock_indigo.server.getPlugin.return_value
+    plugin.isEnabled.return_value = True
+    plugin.executeAction.return_value = {
+        "ok": True, "zones": ["Kitchen"], "enabled": ["Kitchen"],
+    }
+    # The reload poll would otherwise sleep 0.5s x 20 on the wire path.
+    original_sleep = lamplighter_module._sleep
+    lamplighter_module._sleep = lambda _seconds: None
+    try:
+        result = _wire_call(
+            mock_indigo, "lamplighter_update_zone",
+            {"zone": "Kitchen", "patch": {"hold_seconds": 600}},
+        )
+    finally:
+        lamplighter_module._sleep = original_sleep
+
+    assert result.get("isError") is not True, result
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["status"] == "ok"
+    written = json.loads(config_path.read_text())
+    assert written["zones"][0]["hold_seconds"] == 600
+
+
+def test_wire_dispatch_lamplighter_explain(mock_indigo):
+    """The action's return value has to survive the whole trip:
+    executeAction -> _json_safe -> the tool result's JSON text."""
+    from unittest.mock import MagicMock
+
+    mock_indigo.Dict = MagicMock(side_effect=dict)
+    plugin = mock_indigo.server.getPlugin.return_value
+    plugin.isEnabled.return_value = True
+    plugin.executeAction.return_value = {
+        "ok": True, "zone": "Kitchen", "at": "2026-09-05T18:30:00",
+        "explain": "Kitchen: occupied and dark in Dusk.",
+        "desired": [{"device": 772478931, "name": "Strips", "level": 50}],
+    }
+
+    result = _wire_call(mock_indigo, "lamplighter_explain", {"zone": "Kitchen"})
+    assert result.get("isError") is not True, result
+    inner = json.loads(result["content"][0]["text"])
+    assert inner["explain"] == "Kitchen: occupied and dark in Dusk."
+    assert inner["desired"][0]["level"] == 50
+
+
 def test_wire_dispatch_capability_refusal_is_friendly_tool_error(
         mock_indigo, monkeypatch):
     """A catalog capability refusal must arrive on the wire as a clean
