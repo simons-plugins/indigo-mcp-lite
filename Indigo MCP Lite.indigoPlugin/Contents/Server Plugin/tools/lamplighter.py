@@ -109,6 +109,13 @@ _CONFIG_SUBPATH = os.path.join(
 _RELOAD_POLL_SECONDS = 10.0
 _RELOAD_POLL_INTERVAL = 0.5
 
+#: How long to give the lamplighter_controller device to report back
+#: the on/off a plugin-wide enable just commanded. Short, because the
+#: only thing being waited on is one local state publish -- but not
+#: zero: see ``_confirm_controller_state``.
+_ENABLE_CONFIRM_SECONDS = 2.0
+_ENABLE_CONFIRM_INTERVAL = 0.5
+
 #: The zone-device states worth putting in a list row. The full state
 #: dict goes out from ``lamplighter_get_zone`` instead.
 _ZONE_SLIM_STATES = (
@@ -117,8 +124,15 @@ _ZONE_SLIM_STATES = (
     "evaluations_today", "writes_today", "overrides_today",
 )
 
+#: ``config_loaded_at`` (ISO local timestamp of the last SUCCESSFUL
+#: load/reload, untouched by a rejected edit) and ``config_zone_count``
+#: are the two states the reload check leans on. Both are read with
+#: ``.get`` and degrade to ``None`` on a Lamplighter that has not
+#: shipped them yet, in which case the check falls back to the
+#: longer-standing ``zones`` count and to weak evidence.
 _CONTROLLER_STATES = (
-    "config_status", "zones", "zones_enabled", "zones_overridden",
+    "config_status", "config_loaded_at", "config_zone_count",
+    "zones", "zones_enabled", "zones_overridden",
     "evaluations_today", "writes_today", "overrides_today",
 )
 
@@ -454,6 +468,46 @@ def _controller_payload(sweep):
 # -- cross-plugin actions -------------------------------------------------
 
 
+def _require_lamplighter_plugin(indigo_module, what):
+    """Lamplighter's plugin handle, or a ValueError naming BOTH causes
+    and BOTH remedies.
+
+    ``indigo.server.getPlugin()`` never raises -- it returns a handle
+    for a plugin id that names nothing at all, and that handle's
+    ``isEnabled()`` is simply false. So a false ``isEnabled()`` means
+    EITHER "not installed" OR "installed but disabled/stopped", and
+    nothing available here can tell the two apart. The old wording
+    picked one ("installed but not enabled ... Enable it in Indigo"),
+    which sends somebody who has never installed Lamplighter to a
+    Plugins menu that does not list it. Both are named instead.
+
+    ``what`` is the thing that did not happen, capitalised, so the
+    sentence reads "Action 'lock_zone' was NOT performed."
+    """
+    try:
+        plugin = indigo_module.server.getPlugin(LAMPLIGHTER_PLUGIN_ID)
+    except Exception as exc:
+        # Documented never to happen. Kept because a friendly error
+        # costs nothing, while a bare AttributeError out of a future
+        # or mocked IOM costs a confusing bug report.
+        raise ValueError(
+            f"Lamplighter ({LAMPLIGHTER_PLUGIN_ID}) could not be looked "
+            f"up ({exc}); {what} was NOT performed."
+        ) from exc
+
+    if not plugin.isEnabled():
+        raise ValueError(
+            f"Lamplighter ({LAMPLIGHTER_PLUGIN_ID}) is unavailable: it is "
+            "either NOT INSTALLED at all, or installed but not "
+            "enabled/running. Indigo's getPlugin() returns a handle "
+            "either way and never raises, so these two cannot be told "
+            f"apart from here. {what} was NOT performed. If Lamplighter "
+            "is listed in Indigo's Plugins menu, enable it there; if it "
+            "is not listed, install it first."
+        )
+    return plugin
+
+
 def _execute_lamplighter_action(indigo_module, action_id, props=None,
                                 *, side_effect_free=False):
     """Invoke one of Lamplighter's own ``Actions.xml`` actions and
@@ -483,21 +537,9 @@ def _execute_lamplighter_action(indigo_module, action_id, props=None,
     affected: it answers ``{"ok": false, "message": ...}`` for a
     ``None`` engine, which this module surfaces as a failed call.
     """
-    try:
-        plugin = indigo_module.server.getPlugin(LAMPLIGHTER_PLUGIN_ID)
-    except Exception as exc:
-        raise ValueError(
-            f"Lamplighter plugin ({LAMPLIGHTER_PLUGIN_ID}) is not "
-            f"installed or unavailable ({exc}); action {action_id!r} "
-            "was NOT performed."
-        ) from exc
-
-    if not plugin.isEnabled():
-        raise ValueError(
-            f"Lamplighter plugin ({LAMPLIGHTER_PLUGIN_ID}) is installed "
-            f"but not enabled/running; action {action_id!r} was NOT "
-            "performed. Enable it in Indigo and try again."
-        )
+    plugin = _require_lamplighter_plugin(
+        indigo_module, f"Action {action_id!r}"
+    )
 
     indigo_props = indigo_module.Dict(props or {})
     try:
@@ -669,73 +711,199 @@ def _get_zone_handler(args, indigo_module):
         out["duplicate_zone_devices"] = {
             zone_name: sweep["duplicates"][zone_name]
         }
+    if sweep["unnamed"]:
+        # "This zone has no device" and "there IS a zone device but its
+        # zone_name could not be read" are different problems with
+        # different fixes -- set the prop, versus create the device --
+        # and skipped_device alone cannot tell them apart. One of these
+        # may well BE this zone's device.
+        out["unnamed_zone_devices"] = [
+            {
+                "id": _json_safe(getattr(dev, "id", None)),
+                "name": _json_safe(getattr(dev, "name", None)),
+            }
+            for dev in sweep["unnamed"]
+        ]
     if sweep["attr_read_errors"]:
         out["attr_read_errors"] = sweep["attr_read_errors"]
     return out
 
 
 def _reload_snapshot(indigo_module, zone_name):
-    """The handful of live values a reload is visible in, or ``None``
-    if the device list could not be read at all this time round."""
+    """One observation of the live values a reload shows up in.
+
+    Always returns a dict, and ``observed`` says whether that dict can
+    be trusted at all. A FAILED observation is never evidence: it can
+    neither confirm a reload nor deny one, and comparing it as though
+    its missing values were real is how "the IOM hiccuped" turns into
+    "the plugin ignored your write". Three ways it fails:
+
+    - the device list would not iterate;
+    - ANY single device would not read (``attr_read_errors``), because
+      the one that failed may be the very controller or zone device
+      this comparison rests on;
+    - there is no single ``lamplighter_controller``, so
+      ``config_loaded_at`` -- the only strong signal that survives an
+      edit which changes nothing else -- cannot be read at all.
+
+    ``reason`` carries the swallowed error text, so a caller can be
+    told WHY the check did not happen rather than just that it did not.
+    """
     try:
         sweep = _sweep_devices(indigo_module)
-    except Exception:
-        return None
-    controller, _skipped = _controller_payload(sweep)
+    except Exception as exc:
+        return {
+            "observed": False,
+            "reason": f"the Indigo device list could not be read ({exc})",
+            "attr_read_errors": 0,
+        }
+    attr_read_errors = sweep["attr_read_errors"]
+    if attr_read_errors:
+        return {
+            "observed": False,
+            "reason": (
+                f"{attr_read_errors} device(s) could not be read, so this "
+                "observation is incomplete and cannot be compared"
+            ),
+            "attr_read_errors": attr_read_errors,
+        }
+    controller, skipped = _controller_payload(sweep)
+    if controller is None:
+        return {"observed": False, "reason": skipped,
+                "attr_read_errors": attr_read_errors}
     dev = sweep["zone_devices"].get(zone_name)
     return {
-        "config_status": (controller or {}).get("config_status"),
-        "zones": (controller or {}).get("zones"),
+        "observed": True,
+        "reason": None,
+        "attr_read_errors": attr_read_errors,
+        "config_loaded_at": controller.get("config_loaded_at"),
+        "config_zone_count": controller.get("config_zone_count"),
+        "zones": controller.get("zones"),
+        "config_status": controller.get("config_status"),
         "zone_device_present": dev is not None,
         "explain": _json_safe(_states_of(dev).get("explain")) if dev else None,
     }
 
 
 def _reload_evidence(before, after):
-    """What changed, in words, or ``None`` for "nothing observable"."""
-    if not before["zone_device_present"] and after["zone_device_present"]:
-        return (
-            "the zone's lamplighter_zone device appeared, which only "
-            "happens when the plugin has reloaded the file"
-        )
-    if before["config_status"] != after["config_status"]:
-        return (
-            "the controller's config_status changed from "
-            f"{before['config_status']!r} to {after['config_status']!r}"
-        )
-    if before["zones"] != after["zones"]:
-        return (
-            "the controller's configured-zone count changed from "
-            f"{before['zones']} to {after['zones']}"
-        )
-    if before["explain"] != after["explain"]:
-        return "the zone device's explain line changed"
-    return None
+    """``(text, strength)`` where strength is "strong", "weak" or None.
+
+    STRONG is a change only a config LOAD can produce:
+
+    - ``config_loaded_at`` moving. Lamplighter stamps it on a
+      successful load and leaves it alone for an edit it refused, so it
+      is the one signal that separates "reloaded" from "looked and
+      said no".
+    - the configured-zone count moving (``config_zone_count``, or the
+      longer-standing ``zones``, so the check still works on a
+      Lamplighter that has not shipped the former yet). Only the loader
+      writes either.
+    - the zone's device appearing, which only ``_create_missing_devices``
+      after a reload can do.
+
+    WEAK is a change a reload would explain but does not require, and
+    which something else produces just as readily:
+
+    - ``explain`` is rewritten on every re-plan, and a re-plan happens
+      on any input edge. Somebody walking past a presence sensor while
+      this call was in flight produces exactly this signal.
+    - ``config_status`` moves when a load is ATTEMPTED -- including one
+      that was attempted and refused, which is the opposite of what
+      the caller wants to hear.
+
+    Weak evidence may never be reported as ``reloaded: true``. It is
+    still worth returning: "something moved, but not the thing that
+    would settle it" is more useful than silence.
+
+    ``config_loaded_at`` is compared for CHANGE, never for ordering. It
+    is a LOCAL timestamp, so it legitimately goes backwards for an hour
+    every autumn; an ``after > before`` test would call that a
+    non-reload. "Different, and non-empty" is the claim the data
+    actually supports, so it is the claim made.
+    """
+    if not before.get("zone_device_present") and after.get("zone_device_present"):
+        return ("the zone's lamplighter_zone device appeared, which only "
+                "happens when the plugin has reloaded the file"), "strong"
+
+    loaded_before = before.get("config_loaded_at")
+    loaded_after = after.get("config_loaded_at")
+    if loaded_after and loaded_after != loaded_before:
+        return ("the controller's config_loaded_at moved from "
+                f"{loaded_before!r} to {loaded_after!r}, which Lamplighter "
+                "only stamps on a successful load"), "strong"
+
+    for key in ("config_zone_count", "zones"):
+        if before.get(key) != after.get(key):
+            return (f"the controller's {key} changed from "
+                    f"{before.get(key)} to {after.get(key)}"), "strong"
+
+    if before.get("config_status") != after.get("config_status"):
+        return ("the controller's config_status changed from "
+                f"{before.get('config_status')!r} to "
+                f"{after.get('config_status')!r} -- a load was ATTEMPTED, "
+                "but that alone does not say it succeeded"), "weak"
+
+    if before.get("explain") != after.get("explain"):
+        return ("the zone device's explain line changed -- consistent with "
+                "a reload, but any input edge (someone walking past a "
+                "presence sensor) produces the same signal"), "weak"
+
+    return None, None
 
 
 def _wait_for_reload(indigo_module, zone_name, before):
     """Watch for evidence Lamplighter picked the new file up.
 
-    Returns ``(reloaded, evidence, config_status)``. ``reloaded`` is
-    strictly "evidence was seen", never "the plugin reloaded": a patch
-    that changes nothing a device publishes (a comment-level edit, or
-    a period name a zone is not currently in) produces no observable
-    change, and the caller is told that in ``reload_note`` rather than
-    being handed a confident false. The write itself is already on
-    disk either way -- Lamplighter stats the file every 5 s and will
-    pick it up with or without this poll.
+    Returns as soon as STRONG evidence appears: once the question is
+    answered there is nothing to gain by sitting out the rest of the
+    cap, and a caller is waiting on this. Weak evidence is recorded but
+    does NOT end the wait -- a sensor tripping in the first half second
+    must not stop us seeing the real thing three seconds later.
+
+    With no usable baseline there is nothing to compare against, so the
+    poll does not run at all rather than spending ten seconds proving
+    nothing.
     """
+    out = {
+        "reloaded": False,
+        "reload_evidence": None,
+        "reload_evidence_strength": None,
+        "config_status": None,
+        "attr_read_errors": before.get("attr_read_errors", 0),
+        "skipped": None,
+        "observed_after": False,
+        "unobserved_reason": None,
+    }
+    if not before.get("observed"):
+        out["skipped"] = (
+            "no baseline observation could be taken before the write, so "
+            "there is nothing to compare against: "
+            f"{before.get('reason')}"
+        )
+        return out
+
     steps = max(1, int(round(_RELOAD_POLL_SECONDS / _RELOAD_POLL_INTERVAL)))
-    after = None
     for _ in range(steps):
         _sleep(_RELOAD_POLL_INTERVAL)
         after = _reload_snapshot(indigo_module, zone_name)
-        if after is None or before is None:
+        out["attr_read_errors"] = max(
+            out["attr_read_errors"], after.get("attr_read_errors", 0)
+        )
+        if not after.get("observed"):
+            out["unobserved_reason"] = after.get("reason")
             continue
-        evidence = _reload_evidence(before, after)
-        if evidence:
-            return True, evidence, after["config_status"]
-    return False, None, after["config_status"] if after else None
+        out["observed_after"] = True
+        out["config_status"] = after.get("config_status")
+        evidence, strength = _reload_evidence(before, after)
+        if strength == "strong":
+            out["reloaded"] = True
+            out["reload_evidence"] = evidence
+            out["reload_evidence_strength"] = "strong"
+            return out
+        if strength == "weak" and out["reload_evidence"] is None:
+            out["reload_evidence"] = evidence
+            out["reload_evidence_strength"] = "weak"
+    return out
 
 
 def _update_zone_handler(args, indigo_module):
@@ -833,11 +1001,17 @@ def _update_zone_handler(args, indigo_module):
         f"was written to {path!r}",
     )
     if verdict.get("ok") is not True:
+        # Same defect as explain's, fixed in the same way: a verdict
+        # with no message must not render as the word "None", which
+        # reads as a refusal reason rather than as its absence.
+        refusal = verdict.get("message")
+        if not isinstance(refusal, str) or not refusal:
+            refusal = "Lamplighter returned ok:false with no message"
         raise ValueError(
             "Lamplighter refused the proposed configuration at "
-            f"{verdict.get('path') or '(the top level)'}: "
-            f"{verdict.get('message')!r}. Nothing was written to "
-            f"{path!r}; the file on disk is unchanged."
+            f"{verdict.get('path') or '(the top level)'}: {refusal}. "
+            f"Nothing was written to {path!r}; the file on disk is "
+            "unchanged."
         )
 
     stat_recheck = _stat(path)
@@ -880,34 +1054,76 @@ def _update_zone_handler(args, indigo_module):
             "but the live config was not modified."
         ) from exc
 
-    reloaded, evidence, config_status = _wait_for_reload(
-        indigo_module, final_name, before
-    )
+    # EVERYTHING from here on runs after os.replace has already
+    # swapped the file in. A raise past this point is not a failed
+    # write -- the write succeeded -- so it must not reach the caller
+    # looking like one, or the obvious response (retry) re-applies a
+    # patch that already landed. Wrapped whole, with both paths named
+    # in the text. `except Exception`, never BaseException: a
+    # KeyboardInterrupt/SystemExit is Indigo shutting the host down and
+    # must keep its own type.
+    try:
+        watch = _wait_for_reload(indigo_module, final_name, before)
 
-    out = {
-        "status": "ok",
-        "zone": final_name,
-        "created": created,
-        "written": path,
-        "backup": backup_path,
-        "reloaded": reloaded,
-        "reload_evidence": evidence,
-        "config_status": config_status,
-        "validated_zones": verdict.get("zones"),
-        "validated_enabled": verdict.get("enabled"),
-    }
-    if not reloaded:
-        out["reload_note"] = (
-            "the write landed and Lamplighter validated it, but no "
-            f"observable change appeared within {_RELOAD_POLL_SECONDS:g}s. "
-            "That is NOT evidence the plugin ignored it: an edit which "
-            "changes nothing a device publishes produces no signal, and "
-            "Lamplighter re-stats the file every 5s regardless. Read the "
-            "zone back with lamplighter_get_zone to confirm."
-        )
-    if warnings:
-        out["warnings"] = warnings
-    return out
+        out = {
+            "status": "ok",
+            "zone": final_name,
+            "created": created,
+            "written": path,
+            "backup": backup_path,
+            "reloaded": watch["reloaded"],
+            "reload_evidence": watch["reload_evidence"],
+            "reload_evidence_strength": watch["reload_evidence_strength"],
+            "config_status": watch["config_status"],
+            "validated_zones": verdict.get("zones"),
+            "validated_enabled": verdict.get("enabled"),
+        }
+        if watch["attr_read_errors"]:
+            out["attr_read_errors"] = watch["attr_read_errors"]
+
+        if watch["skipped"]:
+            # Nothing was looked at, so `reloaded: false` is UNCLAIMED
+            # rather than a finding. Deliberately no reassuring note
+            # here: "nothing observable changed" would be a statement
+            # about an observation that never happened.
+            out["reload_check_skipped"] = watch["skipped"]
+        elif not watch["observed_after"]:
+            out["reload_note"] = (
+                "the write landed and Lamplighter validated it, but the "
+                "reload could NOT BE OBSERVED at any point in the "
+                f"{_RELOAD_POLL_SECONDS:g}s window: "
+                f"{watch['unobserved_reason']}. `reloaded: false` here "
+                "means \"not looked at\", not \"did not happen\". Read "
+                "the zone back with lamplighter_get_zone."
+            )
+        elif not watch["reloaded"]:
+            weak = watch["reload_evidence"]
+            out["reload_note"] = (
+                "the write landed and Lamplighter validated it, but "
+                "nothing conclusive changed within "
+                f"{_RELOAD_POLL_SECONDS:g}s"
+                + (f" (only weak evidence: {weak})" if weak else "")
+                + ". That is NOT evidence the plugin ignored it: an edit "
+                "which changes nothing the controller publishes produces "
+                "no signal, and Lamplighter re-stats the file every 5s "
+                "regardless. Read the zone back with "
+                "lamplighter_get_zone to confirm."
+            )
+
+        if warnings:
+            out["warnings"] = warnings
+        return out
+    except Exception as exc:
+        raise RuntimeError(
+            f"the Lamplighter config file WAS written to {path!r} (the "
+            f"previous contents are backed up at {backup_path!r}) and "
+            "Lamplighter will pick it up within about 5 seconds -- but "
+            "this call then failed while confirming the reload: "
+            f"{type(exc).__name__}: {exc}. The edit is NOT lost and must "
+            "NOT be blindly re-applied. Read the zone back with "
+            "lamplighter_get_zone; to undo, copy the backup over the "
+            "written path."
+        ) from exc
 
 
 def _reset_override_handler(args, indigo_module):
@@ -961,6 +1177,160 @@ def _lock_zone_handler(args, indigo_module):
     return {"status": "ok", "zone": zone_name}
 
 
+def _controller_enabled_now(indigo_module):
+    """``(enabled, reason_unavailable)`` -- the controller's live on/off.
+
+    ``None`` for the flag whenever the read could not be trusted: a
+    sweep that raised, a sweep with ``attr_read_errors`` (the device
+    that failed may be the controller), no single controller, or a
+    non-boolean onState. A failed read must never come back as
+    ``False`` -- that would report "the enable did not take" for what
+    is actually "we could not look", which is the same confident wrong
+    answer the reload check exists to avoid.
+    """
+    try:
+        sweep = _sweep_devices(indigo_module)
+    except Exception as exc:
+        return None, f"the Indigo device list could not be re-read ({exc})"
+    if sweep["attr_read_errors"]:
+        return None, (
+            f"{sweep['attr_read_errors']} device(s) could not be read "
+            "during the check, so the controller's state is not "
+            "trustworthy"
+        )
+    controller, skipped = _controller_payload(sweep)
+    if controller is None:
+        return None, skipped
+    value = controller.get("enabled")
+    if not isinstance(value, bool):
+        return None, (
+            "the controller device reported a non-boolean on/off state "
+            f"({value!r})"
+        )
+    return value, None
+
+
+def _confirm_controller_state(indigo_module, wanted):
+    """Read the controller's on/off back, returning as soon as it says
+    ``wanted``.
+
+    A single immediate re-read would be a new false negative rather
+    than a check. ``indigo.device.turnOn/turnOff`` hands the command to
+    the OWNING plugin in another process, and the state it publishes
+    back lands a moment later -- so a one-shot read would report
+    ``applied: false`` on a perfectly good write simply because the
+    round trip had not finished, which is exactly the class of
+    confident wrong answer this check was added to remove. Hence a
+    bounded poll. The cap is short (``_ENABLE_CONFIRM_SECONDS``)
+    because the only thing being waited on is one local state publish,
+    not a config reload.
+
+    Compares against ``wanted`` rather than against the previous value
+    on purpose: switching an already-off controller off changes
+    nothing and is still correctly applied.
+    """
+    steps = max(
+        1, int(round(_ENABLE_CONFIRM_SECONDS / _ENABLE_CONFIRM_INTERVAL))
+    )
+    value, unavailable = _controller_enabled_now(indigo_module)
+    for _ in range(steps):
+        if value == wanted:
+            return value, None
+        _sleep(_ENABLE_CONFIRM_INTERVAL)
+        value, unavailable = _controller_enabled_now(indigo_module)
+    return value, unavailable
+
+
+def _set_plugin_enabled(indigo_module, enabled):
+    """The plugin-wide enable: the lamplighter_controller relay's own
+    on/off (its Devices.xml says so). Lamplighter's Actions.xml has no
+    global-enable action, so this is one of the few places a device
+    write is the right mechanism rather than a second-best one.
+    """
+    sweep = _sweep_devices(indigo_module)
+    controller, skipped = _controller_payload(sweep)
+    if controller is None:
+        raise ValueError(
+            f"the Lamplighter plugin-wide enable could not be set: "
+            f"{skipped}. Nothing was performed. Pass `zone` to "
+            "enable/disable one zone instead."
+        )
+    controller_id = controller["id"]
+    if not isinstance(controller_id, int) or isinstance(controller_id, bool):
+        raise ValueError(
+            "the lamplighter_controller device reported a non-numeric id "
+            f"({controller_id!r}); refusing to switch it. Nothing was "
+            "performed."
+        )
+
+    # The same gate every action path uses, and it is NOT redundant
+    # here just because this is a device write. The controller device
+    # outlives the plugin: with Lamplighter uninstalled or disabled its
+    # device is still sitting in the Indigo database, so turnOn/turnOff
+    # succeeds at the Indigo level, changes no automation whatsoever,
+    # and -- without this -- the tool reports ok. That is the whole
+    # failure mode this family exists to prevent, reached by the one
+    # path that had no gate on it.
+    _require_lamplighter_plugin(indigo_module, "The plugin-wide enable")
+
+    enabled_before = controller.get("enabled")
+    try:
+        if enabled:
+            indigo_module.device.turnOn(controller_id)
+        else:
+            indigo_module.device.turnOff(controller_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"the Lamplighter controller device ({controller_id}) WAS "
+            f"DISPATCHED a turn{'On' if enabled else 'Off'} command and "
+            "may have partially or fully taken effect before this error: "
+            f"{type(exc).__name__}: {exc}. Do NOT blindly retry -- read "
+            "the controller back with lamplighter_list_zones and check "
+            "Lamplighter's own event log first."
+        ) from exc
+
+    enabled_after, unavailable = _confirm_controller_state(
+        indigo_module, enabled
+    )
+
+    if enabled_after is None:
+        status, applied = "unconfirmed", None
+        note = (
+            "the command was sent, but the controller's on/off could not "
+            f"be read back ({unavailable}), so whether it took effect is "
+            "UNKNOWN -- neither confirmed nor denied. Read it back with "
+            "lamplighter_list_zones."
+        )
+    elif enabled_after == enabled:
+        status, applied, note = "ok", True, None
+    else:
+        status, applied = "not_applied", False
+        note = (
+            "the command was sent but the controller device still reports "
+            f"enabled={enabled_after} after "
+            f"{_ENABLE_CONFIRM_SECONDS:g}s, so the plugin-wide enable did "
+            "NOT take effect. A half-started Lamplighter still reports "
+            "isEnabled() true while its device callbacks do nothing -- "
+            "check its event log."
+        )
+
+    out = {
+        "status": status,
+        "applied": applied,
+        "zone": None,
+        "scope": "plugin",
+        "enabled": enabled,
+        "enabled_before": (
+            enabled_before if isinstance(enabled_before, bool) else None
+        ),
+        "enabled_after": enabled_after,
+        "controller_id": controller_id,
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
 def _set_enabled_handler(args, indigo_module):
     _reject_unknown_args(args, ("zone", "enabled"))
     if "enabled" not in args or not isinstance(args["enabled"], bool):
@@ -971,37 +1341,7 @@ def _set_enabled_handler(args, indigo_module):
     zone_name = args.get("zone")
 
     if zone_name is None:
-        # Plugin-wide. Lamplighter's Actions.xml has NO global-enable
-        # action -- the lamplighter_controller device's own on/off IS
-        # the global enable (its Devices.xml says so), so this is one
-        # of the few places a device write is the right mechanism and
-        # an action is not available to prefer.
-        sweep = _sweep_devices(indigo_module)
-        controller, skipped = _controller_payload(sweep)
-        if controller is None:
-            raise ValueError(
-                f"the Lamplighter plugin-wide enable could not be set: "
-                f"{skipped}. Nothing was performed. Pass `zone` to "
-                "enable/disable one zone instead."
-            )
-        controller_id = controller["id"]
-        if not isinstance(controller_id, int) or isinstance(controller_id, bool):
-            raise ValueError(
-                "the lamplighter_controller device reported a "
-                f"non-numeric id ({controller_id!r}); refusing to switch "
-                "it. Nothing was performed."
-            )
-        if enabled:
-            indigo_module.device.turnOn(controller_id)
-        else:
-            indigo_module.device.turnOff(controller_id)
-        return {
-            "status": "ok",
-            "zone": None,
-            "scope": "plugin",
-            "enabled": enabled,
-            "controller_id": controller_id,
-        }
+        return _set_plugin_enabled(indigo_module, enabled)
 
     if not isinstance(zone_name, str) or not zone_name:
         raise ValueError(
@@ -1074,9 +1414,13 @@ def _explain_handler(args, indigo_module):
         f"zone {zone_name!r} could not be explained",
     )
     if payload.get("ok") is not True:
+        # A refusal with no message must not render as the word "None",
+        # which reads like a reason and is not one.
+        message = payload.get("message")
+        if not isinstance(message, str) or not message:
+            message = "Lamplighter returned ok:false with no message"
         raise ValueError(
-            f"Lamplighter could not explain zone {zone_name!r}: "
-            f"{payload.get('message')}"
+            f"Lamplighter could not explain zone {zone_name!r}: {message}"
         )
     return payload
 
@@ -1165,9 +1509,17 @@ def register(handler, *, indigo_module, **_):
             "`backup`) and the new one written; Lamplighter hot-reloads "
             "it within about 5 seconds with overrides and presence "
             "carried across, so NO restart is needed and none is "
-            "performed. `reloaded` means evidence of that reload was "
-            "actually observed within 10s — false is not proof it did "
-            "not happen (see `reload_note`), so confirm with "
+            "performed. `reloaded` is true ONLY on strong evidence the "
+            "reload happened (the controller's config_loaded_at moving, "
+            "its zone count changing, or a new zone's device "
+            "appearing); a change that a reload would explain but does "
+            "not require — an explain line, a config_status — is "
+            "reported as `reload_evidence` with "
+            "`reload_evidence_strength: \"weak\"` and leaves `reloaded` "
+            "false. False therefore never means \"the plugin ignored "
+            "it\": read `reload_note` (nothing conclusive changed) or "
+            "`reload_check_skipped` (the check could not be run at all, "
+            "so nothing is claimed either way) and confirm with "
             "lamplighter_get_zone if it matters."
         ),
         input_schema={
@@ -1238,7 +1590,14 @@ def register(handler, *, indigo_module, **_):
             "no-ops on an unknown one. Note this is a RUNTIME switch: "
             "it does not edit `enabled` in lamplighter.json, so the "
             "next config reload restores whatever the file says (use "
-            "lamplighter_update_zone for a durable change)."
+            "lamplighter_update_zone for a durable change). The "
+            "plugin-wide form reads the controller back afterwards and "
+            "reports `enabled_after` plus `applied`: true when the "
+            "device confirms the requested state, false with `status: "
+            "not_applied` when it does not (a half-started Lamplighter "
+            "accepts the command and changes nothing), or null with "
+            "`status: unconfirmed` when the device could not be "
+            "re-read — which is unknown, not failed."
         ),
         input_schema={
             "type": "object",

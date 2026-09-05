@@ -211,6 +211,11 @@ def _controller_device(dev_id=9001, on=True, states=None):
     d.globalProps = {PLUGIN_ID: {}}
     d.states = {
         "config_status": "ok",
+        # The two states the reload check leans on. config_loaded_at is
+        # stamped only on a SUCCESSFUL load, so it is the signal that
+        # separates "reloaded" from "looked and refused".
+        "config_loaded_at": "2026-09-05T16:40:00",
+        "config_zone_count": 2,
         "zones": 2,
         "zones_enabled": 2,
         "zones_overridden": 0,
@@ -234,6 +239,72 @@ def _other_device(dev_id=5, type_id="zwColorDimmerType"):
     d.globalProps = {}
     d.states = {}
     return d
+
+
+#: Sentinel so ``verdict=None`` can mean "the action answered nothing"
+#: rather than "use the default verdict" -- the distinction the
+#: unusable-answer test turns on.
+_DEFAULT_VERDICT = object()
+
+
+def _validating_plugin(mock_indigo, verdict=_DEFAULT_VERDICT):
+    """A Lamplighter whose validate_config says yes and whose other
+    actions do nothing."""
+    if verdict is _DEFAULT_VERDICT:
+        verdict = {
+            "ok": True, "zones": ["Kitchen", "Hallway"],
+            "enabled": ["Kitchen", "Hallway"],
+        }
+    plugin = _install(mock_indigo)
+    plugin.executeAction = MagicMock(return_value=verdict)
+    return plugin
+
+
+def _prepare_update(mock_indigo, tmp_path, devices,
+                    verdict=_DEFAULT_VERDICT):
+    """Config on disk, a validating Lamplighter, and a device list."""
+    config_path = _write_config(mock_indigo, tmp_path, _sample_config())
+    _plain_dict_indigo(mock_indigo)
+    plugin = _validating_plugin(mock_indigo, verdict=verdict)
+    mock_indigo.devices = devices
+    return config_path, plugin
+
+
+def _recording_sleep(monkeypatch, on_sleep=None):
+    """Replace the poll's sleep with a recorder, optionally driving the
+    world forward on the Nth call. Returns the list of sleeps, so a
+    test can assert the poll STOPPED rather than ran its full cap."""
+    import tools.lamplighter as lamplighter_module
+
+    calls = []
+
+    def _fake(seconds):
+        calls.append(seconds)
+        if on_sleep is not None:
+            on_sleep(len(calls))
+
+    monkeypatch.setattr(lamplighter_module, "_sleep", _fake)
+    return calls
+
+
+class _UnreadableDevices:
+    """A device collection that will not iterate -- the IOM being
+    unavailable, not a house with no devices."""
+
+    def __init__(self, message="IOM unavailable"):
+        self.message = message
+
+    def __iter__(self):
+        raise RuntimeError(self.message)
+
+
+class _UnreadableDevice:
+    """One device whose type cannot be read; counts as an
+    attr_read_error and poisons the whole observation."""
+
+    @property
+    def deviceTypeId(self):
+        raise RuntimeError("stale device handle")
 
 
 def _backups(tmp_path):
@@ -625,6 +696,47 @@ def test_get_zone_says_so_when_the_zone_has_no_device(mock_indigo, tmp_path):
     )
 
 
+def test_get_zone_distinguishes_an_unnamed_device_from_no_device(
+        mock_indigo, tmp_path):
+    """Kills the mutation "report skipped_device and stop there".
+
+    "This zone has no device" and "there IS a zone device but its
+    zone_name could not be read" are different problems with different
+    fixes -- create the device, versus set the prop -- and the unnamed
+    device may well BE this zone's. skipped_device alone cannot tell
+    them apart, so a caller acting on it would create a duplicate.
+    """
+    from tools.lamplighter import _get_zone_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    nameless = _zone_device(104, "", name="Kitchen Lights")
+    nameless.ownerProps = {}
+    nameless.globalProps = {PLUGIN_ID: {}}
+    mock_indigo.devices = [nameless, _controller_device()]
+
+    result = _get_zone_handler({"zone": "Kitchen"}, mock_indigo)
+
+    assert result["device"] is None
+    assert "skipped_device" in result
+    assert result["unnamed_zone_devices"] == [
+        {"id": 104, "name": "Kitchen Lights"},
+    ]
+
+
+def test_get_zone_omits_unnamed_devices_when_there_are_none(
+        mock_indigo, tmp_path):
+    """The key must be absent, not an empty list -- an empty list reads
+    as "checked, none found" only if it is always present, and a noisy
+    always-present key trains callers to ignore it."""
+    from tools.lamplighter import _get_zone_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    mock_indigo.devices = [_zone_device(101, "Kitchen"), _controller_device()]
+
+    result = _get_zone_handler({"zone": "Kitchen"}, mock_indigo)
+    assert "unnamed_zone_devices" not in result
+
+
 def test_get_zone_requires_a_zone(mock_indigo, tmp_path):
     from tools.lamplighter import _get_zone_handler
 
@@ -638,25 +750,6 @@ def test_get_zone_requires_a_zone(mock_indigo, tmp_path):
 # ---------------------------------------------------------------------
 # lamplighter_update_zone -- happy path
 # ---------------------------------------------------------------------
-
-#: Sentinel so ``verdict=None`` can mean "the action answered nothing"
-#: rather than "use the default verdict" -- the distinction the
-#: unusable-answer test turns on.
-_DEFAULT_VERDICT = object()
-
-
-def _validating_plugin(mock_indigo, verdict=_DEFAULT_VERDICT):
-    """A Lamplighter whose validate_config says yes and whose other
-    actions do nothing."""
-    if verdict is _DEFAULT_VERDICT:
-        verdict = {
-            "ok": True, "zones": ["Kitchen", "Hallway"],
-            "enabled": ["Kitchen", "Hallway"],
-        }
-    plugin = _install(mock_indigo)
-    plugin.executeAction = MagicMock(return_value=verdict)
-    return plugin
-
 
 def test_update_zone_validates_the_whole_document_then_writes(
         mock_indigo, tmp_path):
@@ -1051,28 +1144,320 @@ def test_update_zone_non_object_patch_is_refused_before_any_read(
 
 def test_update_zone_reports_reload_evidence_when_it_sees_it(
         mock_indigo, tmp_path, monkeypatch):
-    """`reloaded: true` must mean something was actually observed, and
-    the payload must say what."""
+    """`reloaded: true` requires STRONG evidence and must say which.
+
+    Kills the mutation "treat any observable change as a reload":
+    config_loaded_at is stamped only on a successful load, so it is the
+    one signal that distinguishes a reload from a load that was
+    attempted and refused.
+    """
     import tools.lamplighter as lamplighter_module
 
-    _write_config(mock_indigo, tmp_path, _sample_config())
-    _plain_dict_indigo(mock_indigo)
-    _validating_plugin(mock_indigo)
     controller = _controller_device()
-    mock_indigo.devices = [_zone_device(101, "Kitchen"), controller]
+    _prepare_update(
+        mock_indigo, tmp_path, [_zone_device(101, "Kitchen"), controller]
+    )
 
-    def _reload_on_first_sleep(_seconds):
-        controller.states["config_status"] = "ok (reloaded)"
+    def _reload_on_first_sleep(_n):
+        controller.states["config_loaded_at"] = "2026-09-05T16:47:12"
 
-    monkeypatch.setattr(lamplighter_module, "_sleep", _reload_on_first_sleep)
+    _recording_sleep(monkeypatch, _reload_on_first_sleep)
 
     result = lamplighter_module._update_zone_handler(
         {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
     )
     assert result["reloaded"] is True
-    assert "config_status changed" in result["reload_evidence"]
-    assert result["config_status"] == "ok (reloaded)"
+    assert result["reload_evidence_strength"] == "strong"
+    assert "config_loaded_at moved" in result["reload_evidence"]
     assert "reload_note" not in result
+    assert "reload_check_skipped" not in result
+
+
+def test_update_zone_returns_as_soon_as_strong_evidence_appears(
+        mock_indigo, tmp_path, monkeypatch):
+    """Kills the mutation "poll the full 10s regardless".
+
+    Once config_loaded_at has moved the question is answered and a live
+    caller is waiting; sitting out the remaining nineteen ticks buys
+    nothing. The sleep count IS the assertion -- it is not observable
+    from the payload.
+    """
+    import tools.lamplighter as lamplighter_module
+
+    controller = _controller_device()
+    _prepare_update(
+        mock_indigo, tmp_path, [_zone_device(101, "Kitchen"), controller]
+    )
+
+    def _reload_immediately(_n):
+        controller.states["config_loaded_at"] = "2026-09-05T16:47:12"
+
+    sleeps = _recording_sleep(monkeypatch, _reload_immediately)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["reloaded"] is True
+    assert len(sleeps) == 1, (
+        "the poll must return on the first strong observation, not run "
+        f"its whole cap; it slept {len(sleeps)} times"
+    )
+
+
+def test_update_zone_explain_change_alone_is_weak_evidence(
+        mock_indigo, tmp_path, monkeypatch):
+    """Kills the mutation "an explain change means it reloaded".
+
+    explain is rewritten on every re-plan, and a re-plan happens on any
+    input edge -- somebody walking past a presence sensor mid-call
+    produces exactly this. It is reported, but it is not a reload.
+    """
+    import tools.lamplighter as lamplighter_module
+
+    zone_dev = _zone_device(101, "Kitchen")
+    _prepare_update(
+        mock_indigo, tmp_path, [zone_dev, _controller_device()]
+    )
+
+    def _replan_on_first_sleep(_n):
+        zone_dev.states["explain"] = "Kitchen: occupied in Dusk."
+
+    _recording_sleep(monkeypatch, _replan_on_first_sleep)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["reloaded"] is False
+    assert result["reload_evidence_strength"] == "weak"
+    assert "explain line changed" in result["reload_evidence"]
+    assert "only weak evidence" in result["reload_note"]
+
+
+def test_update_zone_config_status_change_alone_is_weak_evidence(
+        mock_indigo, tmp_path, monkeypatch):
+    """config_status moves when a load is ATTEMPTED -- including one
+    that was attempted and REFUSED, which is the opposite of what the
+    caller wants to hear. Weak, never strong."""
+    import tools.lamplighter as lamplighter_module
+
+    controller = _controller_device()
+    _prepare_update(
+        mock_indigo, tmp_path, [_zone_device(101, "Kitchen"), controller]
+    )
+
+    def _status_moves(_n):
+        controller.states["config_status"] = (
+            "lamplighter.json is invalid at zones/0/lux: bad"
+        )
+
+    _recording_sleep(monkeypatch, _status_moves)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["reloaded"] is False
+    assert result["reload_evidence_strength"] == "weak"
+    assert "config_status changed" in result["reload_evidence"]
+
+
+def test_update_zone_weak_evidence_does_not_end_the_wait(
+        mock_indigo, tmp_path, monkeypatch):
+    """Kills the mutation "return on the first evidence of any kind".
+
+    A sensor tripping in the first half second must not stop the poll
+    before the real reload lands three seconds later.
+    """
+    import tools.lamplighter as lamplighter_module
+
+    zone_dev = _zone_device(101, "Kitchen")
+    controller = _controller_device()
+    _prepare_update(mock_indigo, tmp_path, [zone_dev, controller])
+
+    def _weak_then_strong(n):
+        if n == 1:
+            zone_dev.states["explain"] = "Kitchen: occupied in Dusk."
+        if n == 3:
+            controller.states["config_loaded_at"] = "2026-09-05T16:47:35"
+
+    sleeps = _recording_sleep(monkeypatch, _weak_then_strong)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["reloaded"] is True
+    assert result["reload_evidence_strength"] == "strong"
+    assert len(sleeps) == 3
+
+
+def test_update_zone_config_zone_count_change_is_strong_evidence(
+        mock_indigo, tmp_path, monkeypatch):
+    """Only the loader writes the configured-zone count."""
+    import tools.lamplighter as lamplighter_module
+
+    controller = _controller_device()
+    _prepare_update(
+        mock_indigo, tmp_path, [_zone_device(101, "Kitchen"), controller]
+    )
+
+    def _count_moves(_n):
+        controller.states["config_zone_count"] = 3
+
+    _recording_sleep(monkeypatch, _count_moves)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["reloaded"] is True
+    assert result["reload_evidence_strength"] == "strong"
+    assert "config_zone_count changed" in result["reload_evidence"]
+
+
+# ---------------------------------------------------------------------
+# lamplighter_update_zone -- a failed observation is never evidence
+# ---------------------------------------------------------------------
+
+def test_update_zone_unreadable_baseline_skips_the_check_and_never_sleeps(
+        mock_indigo, tmp_path, monkeypatch):
+    """Kills the mutation "poll anyway when there is no baseline".
+
+    With no baseline there is nothing to compare against, so ten
+    seconds of polling proves nothing -- and `reloaded: false` must be
+    left UNCLAIMED, with no reassuring "nothing changed" note, because
+    nothing was looked at. The reason must carry the swallowed error
+    text or the caller cannot tell a broken IOM from a quiet one.
+    """
+    import tools.lamplighter as lamplighter_module
+
+    _prepare_update(
+        mock_indigo, tmp_path, _UnreadableDevices("IOM went away")
+    )
+    sleeps = _recording_sleep(monkeypatch)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["status"] == "ok"
+    assert result["reloaded"] is False
+    assert "IOM went away" in result["reload_check_skipped"]
+    assert "reload_note" not in result, (
+        "a benign note would describe an observation that never happened"
+    )
+    assert sleeps == [], "nothing to compare against: do not wait"
+
+
+def test_update_zone_attr_read_errors_are_not_an_observation(
+        mock_indigo, tmp_path, monkeypatch):
+    """Kills the mutation "compare a half-read sweep anyway".
+
+    The device that failed to read may be the very controller the
+    comparison rests on, so a sweep with attr_read_errors can neither
+    confirm nor deny. The distinct note must say the reload was not
+    OBSERVED (rather than that nothing changed), and the error count
+    must reach the payload.
+    """
+    import tools.lamplighter as lamplighter_module
+
+    devices = [_zone_device(101, "Kitchen"), _controller_device()]
+    _prepare_update(mock_indigo, tmp_path, devices)
+
+    def _break_a_device(n):
+        if n == 1:
+            devices.append(_UnreadableDevice())
+
+    _recording_sleep(monkeypatch, _break_a_device)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["reloaded"] is False
+    assert result["reload_evidence"] is None
+    assert result["attr_read_errors"] == 1
+    assert "could NOT BE OBSERVED" in result["reload_note"]
+    assert "not looked at" in result["reload_note"]
+    assert "reload_check_skipped" not in result
+
+
+def test_update_zone_controller_vanishing_is_not_an_observation(
+        mock_indigo, tmp_path, monkeypatch):
+    """Without a single controller, config_loaded_at cannot be read at
+    all, so no post-write poll is an observation -- and the note must
+    say so rather than claiming nothing changed."""
+    import tools.lamplighter as lamplighter_module
+
+    devices = [_zone_device(101, "Kitchen"), _controller_device()]
+    _prepare_update(mock_indigo, tmp_path, devices)
+
+    def _remove_controller(n):
+        if n == 1:
+            devices[:] = [_zone_device(101, "Kitchen")]
+
+    _recording_sleep(monkeypatch, _remove_controller)
+
+    result = lamplighter_module._update_zone_handler(
+        {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+    )
+    assert result["reloaded"] is False
+    assert "could NOT BE OBSERVED" in result["reload_note"]
+    assert "no lamplighter_controller device" in result["reload_note"]
+
+
+# ---------------------------------------------------------------------
+# lamplighter_update_zone -- anything after os.replace
+# ---------------------------------------------------------------------
+
+def test_update_zone_post_write_fault_says_the_file_was_written(
+        mock_indigo, tmp_path, monkeypatch):
+    """Kills the mutation "let a post-write exception escape unwrapped".
+
+    Past os.replace the write has SUCCEEDED. A raise that reaches the
+    caller looking like a failed call invites the obvious response --
+    retry -- which re-applies a patch that already landed. Both paths
+    must be in the text so the edit can be found and undone.
+    """
+    import tools.lamplighter as lamplighter_module
+
+    config_path, _plugin = _prepare_update(
+        mock_indigo, tmp_path, [_controller_device()]
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("device list exploded after the write")
+
+    monkeypatch.setattr(lamplighter_module, "_wait_for_reload", _boom)
+
+    with pytest.raises(RuntimeError) as exc:
+        lamplighter_module._update_zone_handler(
+            {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+        )
+    text = str(exc.value)
+    assert "WAS written" in text
+    assert str(config_path) in text
+    assert str(_backups(tmp_path)[0]) in text
+    assert "must NOT be blindly re-applied" in text
+    assert not isinstance(exc.value, (ValueError, TypeError))
+
+    # ...and the write really did land, which is why the wording matters.
+    written = json.loads(config_path.read_text())
+    assert written["zones"][0]["hold_seconds"] == 600
+
+
+def test_update_zone_validation_refusal_without_a_message_says_so(
+        mock_indigo, tmp_path):
+    """An ok:false carrying no message must not render as the word
+    "None", which reads like a reason and is not one."""
+    from tools.lamplighter import _update_zone_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    _plain_dict_indigo(mock_indigo)
+    _validating_plugin(mock_indigo, verdict={"ok": False})
+
+    with pytest.raises(ValueError) as exc:
+        _update_zone_handler(
+            {"zone": "Kitchen", "patch": {"hold_seconds": 600}}, mock_indigo
+        )
+    text = str(exc.value)
+    assert "ok:false with no message" in text
+    assert ": None." not in text
 
 
 def test_update_zone_reload_false_is_not_claimed_as_failure(
@@ -1276,16 +1661,64 @@ def test_set_enabled_false_sends_off(mock_indigo, tmp_path):
     )
 
 
-def test_set_enabled_without_a_zone_switches_the_controller_device(
-        mock_indigo, tmp_path):
-    """Lamplighter's Actions.xml has no global-enable action; the
-    controller relay's own on/off IS the plugin-wide enable."""
+def _switching_controller(mock_indigo, dev_id=9001, on=True,
+                          obeys=True, plugin_enabled=True):
+    """A controller device plus a turnOn/turnOff pair that actually
+    moves its onState -- the way a live, running Lamplighter behaves.
+
+    ``obeys=False`` models the failure the confirm read exists to
+    catch: the command is accepted by Indigo and the device never
+    changes, because nothing is on the other end of it.
+    """
+    controller = _controller_device(dev_id, on=on)
+    mock_indigo.devices = [controller, _zone_device(101, "Kitchen")]
+    _install(mock_indigo, enabled=plugin_enabled)
+
+    def _set(value):
+        def _do(_id):
+            if obeys:
+                controller.onState = value
+        return _do
+
+    mock_indigo.device.turnOn = MagicMock(side_effect=_set(True))
+    mock_indigo.device.turnOff = MagicMock(side_effect=_set(False))
+    return controller
+
+
+def test_plugin_wide_enable_is_gated_on_the_plugin_being_available(
+        mock_indigo):
+    """Kills the mutation "drop the plugin gate from the device path".
+
+    This replaces a test that asserted getPlugin must NOT be called --
+    which pinned the bug as intended behaviour. The controller device
+    OUTLIVES the plugin: with Lamplighter uninstalled or disabled its
+    device still sits in the Indigo database, so turnOn/turnOff
+    succeeds at the Indigo level, changes no automation whatsoever, and
+    without the gate the tool reports ok. The gate must run, and the
+    write must not.
+    """
     from tools.lamplighter import _set_enabled_handler
 
-    mock_indigo.devices = [_controller_device(9001), _zone_device(101, "Kitchen")]
-    mock_indigo.server.getPlugin.side_effect = _MustNotBeCalled(
-        "the plugin-wide enable is a device write, not an action"
-    )
+    _switching_controller(mock_indigo, plugin_enabled=False)
+
+    with pytest.raises(ValueError) as exc:
+        _set_enabled_handler({"enabled": False}, mock_indigo)
+    assert PLUGIN_ID in str(exc.value)
+    assert "The plugin-wide enable was NOT performed" in str(exc.value)
+    mock_indigo.server.getPlugin.assert_called_with(PLUGIN_ID)
+    mock_indigo.device.turnOff.assert_not_called()
+    mock_indigo.device.turnOn.assert_not_called()
+
+
+def test_plugin_wide_enable_switches_the_controller_and_reads_it_back(
+        mock_indigo):
+    """Lamplighter's Actions.xml has no global-enable action; the
+    controller relay's own on/off IS it. The result must report what
+    the device says AFTER the write, not merely that a command was
+    sent."""
+    from tools.lamplighter import _set_enabled_handler
+
+    _switching_controller(mock_indigo, on=True)
     mock_indigo.server.getInstallFolderPath.side_effect = _MustNotBeCalled(
         "the plugin-wide enable needs no config read"
     )
@@ -1294,8 +1727,101 @@ def test_set_enabled_without_a_zone_switches_the_controller_device(
 
     mock_indigo.device.turnOff.assert_called_once_with(9001)
     mock_indigo.device.turnOn.assert_not_called()
+    assert result["status"] == "ok"
+    assert result["applied"] is True
+    assert result["enabled_before"] is True
+    assert result["enabled_after"] is False
     assert result["scope"] == "plugin"
     assert result["controller_id"] == 9001
+
+
+def test_plugin_wide_enable_that_did_not_take_is_not_status_ok(
+        mock_indigo):
+    """Kills the mutation "return status ok without reading it back".
+
+    A half-started Lamplighter still reports isEnabled() true while its
+    device callbacks do nothing, so the command lands and the state
+    never moves. Reporting ok there is the exact silent no-op this
+    family exists to prevent.
+    """
+    from tools.lamplighter import _set_enabled_handler
+
+    _switching_controller(mock_indigo, on=True, obeys=False)
+
+    result = _set_enabled_handler({"enabled": False}, mock_indigo)
+
+    mock_indigo.device.turnOff.assert_called_once_with(9001)
+    assert result["status"] != "ok"
+    assert result["status"] == "not_applied"
+    assert result["applied"] is False
+    assert result["enabled_after"] is True
+    assert "NOT take effect" in result["note"]
+
+
+def test_plugin_wide_enable_already_in_the_wanted_state_is_applied(
+        mock_indigo):
+    """Switching an already-off controller off changes nothing and is
+    still correctly applied -- the check compares against what was
+    ASKED FOR, not against what moved. A "did it change?" test would
+    call this a failure."""
+    from tools.lamplighter import _set_enabled_handler
+
+    _switching_controller(mock_indigo, on=False)
+
+    result = _set_enabled_handler({"enabled": False}, mock_indigo)
+    assert result["applied"] is True
+    assert result["status"] == "ok"
+    assert result["enabled_before"] is False
+    assert result["enabled_after"] is False
+
+
+def test_plugin_wide_enable_unreadable_readback_is_unconfirmed(
+        mock_indigo):
+    """Kills the mutation "a failed read-back means it did not apply".
+
+    If the controller cannot be re-read, whether the write took effect
+    is UNKNOWN -- neither confirmed nor denied. Reporting applied:false
+    would blame the write for a broken read.
+    """
+    from tools.lamplighter import _set_enabled_handler
+
+    controller = _switching_controller(mock_indigo, on=True)
+
+    def _break_everything(_id):
+        controller.onState = False
+        mock_indigo.devices = _UnreadableDevices("IOM went away")
+
+    mock_indigo.device.turnOff = MagicMock(side_effect=_break_everything)
+
+    result = _set_enabled_handler({"enabled": False}, mock_indigo)
+    assert result["status"] == "unconfirmed"
+    assert result["applied"] is None
+    assert result["enabled_after"] is None
+    assert "IOM went away" in result["note"]
+    assert "UNKNOWN" in result["note"]
+
+
+def test_plugin_wide_enable_dispatch_fault_is_a_was_dispatched_error(
+        mock_indigo):
+    """Kills the mutation "let turnOn/turnOff raise unwrapped".
+
+    The command may have taken effect before the error, so this belongs
+    in the back-off bucket with the WAS-DISPATCHED warning, not in the
+    fix-your-arguments one.
+    """
+    from tools.lamplighter import _set_enabled_handler
+
+    _switching_controller(mock_indigo, on=False)
+    mock_indigo.device.turnOn = MagicMock(
+        side_effect=RuntimeError("server went away")
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        _set_enabled_handler({"enabled": True}, mock_indigo)
+    text = str(exc.value)
+    assert "WAS DISPATCHED" in text
+    assert "Do NOT blindly retry" in text
+    assert not isinstance(exc.value, (ValueError, TypeError))
 
 
 def test_set_enabled_without_a_controller_refuses_rather_than_no_op(
@@ -1471,6 +1997,26 @@ def test_explain_turns_the_plugins_refusal_into_a_failed_call(mock_indigo):
         _explain_handler({"zone": "Attic"}, mock_indigo)
 
 
+def test_explain_refusal_without_a_message_does_not_say_none(mock_indigo):
+    """Kills the mutation "interpolate payload['message'] raw".
+
+    An ok:false carrying no message renders as the word "None", which
+    reads like a reason Lamplighter gave and is not one. The caller is
+    usually a model relaying to a human; "could not explain zone
+    'Kitchen': None" invites it to report None as the cause.
+    """
+    from tools.lamplighter import _explain_handler
+
+    _plain_dict_indigo(mock_indigo)
+    _install(mock_indigo, execute_result={"ok": False})
+
+    with pytest.raises(ValueError) as exc:
+        _explain_handler({"zone": "Kitchen"}, mock_indigo)
+    text = str(exc.value)
+    assert "ok:false with no message" in text
+    assert "None" not in text
+
+
 def test_explain_no_answer_at_all_is_a_failed_call(mock_indigo):
     """A None back from waitUntilDone=True means the action raised.
     Never an empty explanation."""
@@ -1487,23 +2033,36 @@ def test_explain_no_answer_at_all_is_a_failed_call(mock_indigo):
 # the shared plugin gate + post-dispatch faults
 # ---------------------------------------------------------------------
 
-def test_disabled_plugin_is_refused_by_name_with_a_remedy(mock_indigo):
-    """Indigo's own PluginDisabled names neither Lamplighter nor what
-    to do; this layer exists to say both."""
+def test_unavailable_plugin_names_both_causes_and_both_remedies(
+        mock_indigo):
+    """Kills the mutation "say only: installed but not enabled".
+
+    indigo.server.getPlugin() never raises -- it hands back a handle
+    for a plugin id that names nothing at all, whose isEnabled() is
+    simply false. So a false isEnabled() is EITHER "not installed" OR
+    "installed but disabled", and this layer cannot tell them apart.
+    Asserting only the second sends somebody who has never installed
+    Lamplighter to a Plugins menu that does not list it.
+    """
     from tools.lamplighter import _reconcile_now_handler
 
     _plain_dict_indigo(mock_indigo)
     plugin = _install(mock_indigo, enabled=False)
     plugin.executeAction.side_effect = _MustNotBeCalled(
-        "a disabled plugin must be refused before dispatch"
+        "an unavailable plugin must be refused before dispatch"
     )
 
     with pytest.raises(ValueError) as exc:
         _reconcile_now_handler({}, mock_indigo)
     text = str(exc.value)
     assert PLUGIN_ID in text
-    assert "was NOT performed" in text
-    assert "Enable it" in text
+    assert "Action 'reconcile_now' was NOT performed" in text
+    # Both causes...
+    assert "NOT INSTALLED" in text
+    assert "not enabled/running" in text
+    # ...and both remedies.
+    assert "enable it there" in text
+    assert "install it first" in text
 
 
 def test_state_changing_action_fault_is_a_was_dispatched_runtime_error(
