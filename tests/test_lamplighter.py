@@ -146,13 +146,37 @@ def _wrapped(props):
     return out
 
 
-def _zone_device(dev_id, zone_name, on=True, states=None, name=None):
+def _zone_device(dev_id, zone_name, on=True, states=None, name=None,
+                 decoy_plugin_props_zone=None):
+    """A Lamplighter zone device shaped the way lite actually sees one.
+
+    The three prop dictionaries are NOT interchangeable and the fake
+    must not pretend they are:
+
+    - ``pluginProps`` is scoped to the CALLING plugin, so for a device
+      Lamplighter created it is EMPTY from lite's process. Defaulting
+      it to ``{}`` here is the whole point: a fake that put the zone
+      name in it would let a ``pluginProps`` read pass in tests and
+      fail on every live server (it did -- jarvis, 2026-09-05).
+    - ``ownerProps`` is the creating plugin's props. This is where the
+      zone name genuinely is.
+    - ``globalProps[<plugin id>]`` is the same data the long way round,
+      readable by anyone, and the fallback for Indigo < API 1.20.
+
+    ``decoy_plugin_props_zone`` deliberately puts a WRONG name in
+    ``pluginProps`` for the mutation test below.
+    """
     d = MagicMock()
     d.id = dev_id
     d.name = name or f"{zone_name} Lights"
     d.deviceTypeId = "lamplighter_zone"
     d.onState = on
-    d.pluginProps = {"zone_name": zone_name}
+    d.pluginProps = (
+        {} if decoy_plugin_props_zone is None
+        else {"zone_name": decoy_plugin_props_zone}
+    )
+    d.ownerProps = {"zone_name": zone_name}
+    d.globalProps = {PLUGIN_ID: {"zone_name": zone_name}}
     d.states = {
         "state": "vacant",
         "explain": f"{zone_name}: vacant in Dusk.",
@@ -180,7 +204,11 @@ def _controller_device(dev_id=9001, on=True, states=None):
     d.name = "Lamplighter Controller"
     d.deviceTypeId = "lamplighter_controller"
     d.onState = on
+    # The controller carries no zone_name; all three dicts are explicit
+    # so a stray MagicMock can never masquerade as one.
     d.pluginProps = {}
+    d.ownerProps = {}
+    d.globalProps = {PLUGIN_ID: {}}
     d.states = {
         "config_status": "ok",
         "zones": 2,
@@ -202,6 +230,8 @@ def _other_device(dev_id=5, type_id="zwColorDimmerType"):
     d.deviceTypeId = type_id
     d.onState = True
     d.pluginProps = {}
+    d.ownerProps = {}
+    d.globalProps = {}
     d.states = {}
     return d
 
@@ -317,8 +347,11 @@ def test_list_zones_flags_a_device_with_no_configured_zone(
 
     _write_config(mock_indigo, tmp_path, _sample_config())
     stray = _zone_device(103, "Conservatory")
+    # A zone device made by hand with no zone_name prop at all: none of
+    # the three dictionaries carries one.
     nameless = _zone_device(104, "")
-    nameless.pluginProps = {}
+    nameless.ownerProps = {}
+    nameless.globalProps = {PLUGIN_ID: {}}
     mock_indigo.devices = [
         _zone_device(101, "Kitchen"), _zone_device(102, "Hallway"),
         stray, nameless, _controller_device(),
@@ -435,6 +468,112 @@ def test_list_zones_rejects_unknown_args(mock_indigo, tmp_path):
     _write_config(mock_indigo, tmp_path, _sample_config())
     with pytest.raises(ValueError, match="unknown argument"):
         _list_zones_handler({"bogus": 1}, mock_indigo)
+
+
+# ---------------------------------------------------------------------
+# how a zone device is matched to its zone.
+#
+# Found by live test on jarvis, 2026-09-05, running in-process under
+# the Indigo plugin host: the join read `dev.pluginProps`, which Indigo
+# scopes to the CALLING plugin, so it was empty for every Lamplighter
+# device and the whole join silently collapsed -- zones reported
+# device-less, devices reported orphaned, and update_zone unable to
+# ever see a reload. The unit tests passed throughout, because the fake
+# put the zone name in pluginProps. These four pin the fix.
+# ---------------------------------------------------------------------
+
+def test_zone_name_is_read_from_owner_props_not_plugin_props(
+        mock_indigo, tmp_path):
+    """Kills the mutation "read pluginProps".
+
+    This is the exact live shape: a Lamplighter zone device seen from
+    lite's process has an EMPTY pluginProps and its zone name in
+    ownerProps. Reading pluginProps makes both configured zones look
+    device-less and both devices look orphaned -- the join collapses
+    entirely -- so this fails loudly under the mutation.
+    """
+    from tools.lamplighter import _list_zones_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    kitchen_dev = _zone_device(101, "Kitchen")
+    assert kitchen_dev.pluginProps == {}, "the fake must mirror the live shape"
+    mock_indigo.devices = [
+        kitchen_dev, _zone_device(102, "Hallway"), _controller_device(),
+    ]
+
+    result = _list_zones_handler({}, mock_indigo)
+
+    assert result["zones_without_device"] == []
+    assert result["orphan_zone_devices"] == []
+    by_name = {z["name"]: z for z in result["zones"]}
+    assert by_name["Kitchen"]["device"]["id"] == 101
+    assert by_name["Hallway"]["device"]["id"] == 102
+
+
+def test_zone_name_ignores_a_decoy_in_caller_scoped_plugin_props(
+        mock_indigo, tmp_path):
+    """The sharper half of the same mutation: reading pluginProps must
+    not merely fail to find the zone, it must not find the WRONG one.
+
+    The decoy is deliberately unrealistic (lite writes no props onto
+    Lamplighter's devices, so live pluginProps is empty) -- its job is
+    to make "read pluginProps" produce a visibly wrong join rather than
+    an empty one, so the mutation cannot hide behind a device simply
+    being absent from the fixture.
+    """
+    from tools.lamplighter import _get_zone_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    mock_indigo.devices = [
+        _zone_device(101, "Kitchen", decoy_plugin_props_zone="Hallway"),
+        _controller_device(),
+    ]
+
+    result = _get_zone_handler({"zone": "Kitchen"}, mock_indigo)
+    assert result["device"] is not None, result.get("skipped_device")
+    assert result["device"]["id"] == 101
+    assert result["device"]["zone_name"] == "Kitchen"
+
+    # ...and the decoy must not have stolen Hallway's slot either.
+    hallway = _get_zone_handler({"zone": "Hallway"}, mock_indigo)
+    assert hallway["device"] is None
+
+
+def test_zone_name_falls_back_to_global_props_without_owner_props(
+        mock_indigo, tmp_path):
+    """ownerProps is API 1.20. globalProps[<plugin id>] is the same
+    data by the long route and has been readable by anyone since 1.0,
+    so an older server must still join."""
+    from tools.lamplighter import _list_zones_handler
+
+    _write_config(mock_indigo, tmp_path, _sample_config())
+    dev = _zone_device(101, "Kitchen")
+    del dev.ownerProps  # pre-1.20: the attribute does not exist at all
+    mock_indigo.devices = [dev, _controller_device()]
+
+    result = _list_zones_handler({}, mock_indigo)
+    by_name = {z["name"]: z for z in result["zones"]}
+    assert by_name["Kitchen"]["device"]["id"] == 101
+    assert result["orphan_zone_devices"] == []
+
+
+def test_zone_name_ignores_a_non_string_prop_value(mock_indigo, tmp_path):
+    """A zone name must be a real string, never str()-ed from whatever
+    the attribute happened to hold.
+
+    This is the guard on the failure mode that let the pluginProps bug
+    through review: a MagicMock (or any object) coerced with str()
+    yields a plausible-looking non-empty name that matches no zone, so
+    the device is quietly filed as an orphan instead of the read being
+    recognised as broken.
+    """
+    from tools.lamplighter import _device_zone_name
+
+    dev = _zone_device(101, "Kitchen")
+    dev.ownerProps = {"zone_name": object()}
+    dev.globalProps = {PLUGIN_ID: {"zone_name": None}}
+
+    assert _device_zone_name(dev) == ""
 
 
 # ---------------------------------------------------------------------

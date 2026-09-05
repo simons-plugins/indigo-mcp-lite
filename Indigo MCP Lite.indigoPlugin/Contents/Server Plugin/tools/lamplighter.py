@@ -40,9 +40,13 @@ the running plugin changed:
   cannot: which state the machine is in, why (``explain``), whether
   presence is active, what the lux reading is, what is overridden and
   until when, and the daily counters. ``lamplighter_zone`` devices are
-  matched back to their zone by the ``zone_name`` plugin prop, never
-  by device name — Lamplighter itself does the same, because a user
-  may rename a device freely.
+  matched back to their zone by Lamplighter's own ``zone_name`` prop,
+  never by device name — Lamplighter itself does the same, because a
+  user may rename a device freely. That prop is read through
+  ``ownerProps``/``globalProps`` and never through ``pluginProps``,
+  which Indigo scopes to the calling plugin and which is therefore
+  empty from this process; see ``_device_zone_name`` for the live
+  evidence.
 
 Two Lamplighter actions RETURN a value rather than logging one, and
 both are reachable only with ``waitUntilDone=True``:
@@ -277,10 +281,46 @@ def _merge_patch(target, patch):
 
 
 def _device_zone_name(dev):
-    props = getattr(dev, "pluginProps", None)
-    if props is None or not hasattr(props, "get"):
-        return ""
-    return str(props.get("zone_name", "") or "")
+    """The zone a ``lamplighter_zone`` device belongs to.
+
+    Read from the OWNER plugin's props. NEVER ``pluginProps``: Indigo
+    scopes that to the CALLING plugin -- the IOM base class defines it
+    as "the name/value pairs defined by YOUR plugin for the device" --
+    so from lite's process it is EMPTY for a device Lamplighter
+    created. The failure it produces is silent and total: every zone
+    device reads as unnamed, so every configured zone reads as
+    device-less, ``lamplighter_get_zone`` reports ``skipped_device``,
+    and ``lamplighter_update_zone`` can never find reload evidence.
+    Confirmed live on jarvis 2026-09-05, running in-process under the
+    Indigo plugin host against the real ``indigo`` module: the Hallway
+    zone device came back with ``zone_name: ''`` and was reported as an
+    orphan.
+
+    ``ownerProps`` (API 1.20) is the right one -- "the name/value pairs
+    defined by the plugin that created the device ... a shortcut into
+    the owner plugin's globalProps". ``globalProps[<plugin id>]`` is
+    the long way round to the same dictionary, readable by anyone, and
+    covers both an Indigo older than API 1.20 and an ``ownerProps``
+    that answers nothing. ``tools/lookup.py`` reads ``globalProps`` for
+    exactly this reason.
+
+    Only a genuine non-empty ``str`` counts. An ``indigo.Dict`` holds
+    strings, so anything else here is a broken read rather than a zone
+    name, and coercing it with ``str()`` would invent one that matches
+    no zone -- which is how a test double silently passes while the
+    live join is broken.
+    """
+    sources = [getattr(dev, "ownerProps", None)]
+    global_props = getattr(dev, "globalProps", None)
+    if global_props is not None and hasattr(global_props, "get"):
+        sources.append(global_props.get(LAMPLIGHTER_PLUGIN_ID))
+    for props in sources:
+        if props is None or not hasattr(props, "get"):
+            continue
+        value = props.get("zone_name")
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _states_of(dev):
