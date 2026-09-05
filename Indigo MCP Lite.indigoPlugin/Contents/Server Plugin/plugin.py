@@ -52,6 +52,12 @@ A plugin action step's target device is sometimes only inside its
 `props` (e.g. `dimmer_device_id`), never in `device_id`. Likewise a
 device's behaviour often lives in its configuration, not its states —
 get_device_by_id returns `plugin_props` for that.
+
+Lighting automation has its own family: `lamplighter_*` reads and
+patches the Lamplighter plugin's zone configuration, releases overrides
+and locks, switches a zone or the whole plugin, and `lamplighter_explain`
+asks the plugin itself why a zone is doing what it is doing (or would
+at a given time) rather than inferring it from the event log.
 """
 
 

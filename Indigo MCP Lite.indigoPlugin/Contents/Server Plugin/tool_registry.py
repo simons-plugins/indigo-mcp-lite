@@ -11,7 +11,7 @@ indexer through without breaking the existing call sites.
 
 from tools import (auto_lights, automation_contents, automations, control,
                    find_devices, history, introspection, irrigation_speed,
-                   lookup, plugin_actions, system, zwave)
+                   lamplighter, lookup, plugin_actions, system, zwave)
 
 
 def register_all(handler, *, indigo_module, indexer=None,
@@ -46,6 +46,10 @@ def register_all(handler, *, indigo_module, indexer=None,
     # Reads/writes its own Preferences JSON file directly; no
     # dependency on this plugin's indexer/history collaborators.
     auto_lights.register(handler, indigo_module=indigo_module)
+    # Scoped config + zone-lifecycle tools for the Lamplighter plugin
+    # (its PRD 5.12). Reads/writes its own Preferences JSON file and
+    # calls its own Actions.xml actions; no indexer/history dependency.
+    lamplighter.register(handler, indigo_module=indigo_module)
     # Generic cross-plugin action discovery + dispatch (issue #71) —
     # the sanctioned write surface for every action-bearing plugin,
     # not just Auto Lights. No indexer/history dependency. Logger

@@ -17,7 +17,7 @@ Stdlib-only MCP server plugin. Replaces mlamoure's [`indigomcp`](../indigomcp/) 
 Intel Mac under Indigo 2025.2 / Python 3.13, where LanceDB no longer installs and
 the upstream embedding-based search is unusable.
 
-Surface: 78 deterministic tools matching (and now exceeding) the upstream `indigo-mcp-server` API
+Surface: 86 deterministic tools matching (and now exceeding) the upstream `indigo-mcp-server` API
 (devices, variables, action groups, plugins, event log, thermostat/dimmer/relay
 control) plus one novel `find_devices` tool backed by SQLite FTS5 — no
 embeddings, no third-party APIs, no network calls beyond what Indigo itself
