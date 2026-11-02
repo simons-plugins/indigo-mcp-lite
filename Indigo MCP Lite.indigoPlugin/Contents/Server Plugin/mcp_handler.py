@@ -60,6 +60,13 @@ class MCPHandler:
         self._tools: Dict[str, Dict[str, Any]] = {}
         self._resources: Dict[str, Dict[str, Any]] = {}
 
+        # Lite-only addition (not in Home Intelligence's copy of this
+        # file): tool names deliberately not registered, mapped to the
+        # message a tools/call for one returns instead of "Unknown
+        # tool". tool_registry.register_all fills it on Indigo 2026.1+,
+        # where the server's built-in MCP provides those tools.
+        self.relocated_tools: Dict[str, str] = {}
+
         # Lightweight session tracking. Not enforced in Phase 1 (the
         # plugin is single-user and we don't gate tool calls on session
         # presence), but we issue Mcp-Session-Id on initialize so
@@ -344,6 +351,9 @@ class MCPHandler:
         tool_args = raw_args or {}
 
         if tool_name not in self._tools:
+            # relocated_tools: lite-only addition, see __init__.
+            if tool_name in self.relocated_tools:
+                return _json_rpc_error(msg_id, -32602, self.relocated_tools[tool_name])
             return _json_rpc_error(msg_id, -32602, f"Unknown tool: {tool_name}")
 
         handler = self._tools[tool_name]["handler"]

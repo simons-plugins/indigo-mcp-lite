@@ -77,14 +77,16 @@ def test_every_registered_tool_survives_a_wire_round_trip(mock_indigo):
     from tool_registry import register_all
 
     handler = MCPHandler(server_name="test", server_version="0")
-    register_all(handler, indigo_module=mock_indigo)
+    result = register_all(handler, indigo_module=mock_indigo)
 
+    # Preconditions, stated rather than assumed: the MagicMock server
+    # version is not a 2026.1+ string, so the built-in MCP gate stays
+    # open and the sweep covers the full surface (86 tools less
+    # find_devices, which needs an indexer). A slim registration here
+    # would silently shrink the sweep to the 33 extension tools.
+    assert result["slim"] is False
     tool_names = list(handler._tools.keys())
-    # A generous floor, not an exact count -- pins that register_all
-    # actually ran (an empty registry would trivially "pass" the loop
-    # below) without this test needing to change every time a tool is
-    # added.
-    assert len(tool_names) >= 70, tool_names
+    assert len(tool_names) == 85, tool_names
 
     failures = []
     for name in tool_names:
