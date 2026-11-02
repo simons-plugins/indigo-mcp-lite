@@ -86,9 +86,12 @@ def test_plugin_ships_instructions_naming_every_tool_family():
     assert "acts_on_via_props" in text
     # Plugin-specific families a client would never guess from the
     # four generic groups above. Without this line the lamplighter_*
-    # tools are discoverable only by reading 86 tool descriptions.
+    # tools are discoverable only by reading 89 tool descriptions.
     assert "lamplighter_" in text
     assert "lamplighter_explain" in text
+    # Tag writes exist only here (the built-in server reads tags).
+    assert "manage_tags" in text
+    assert "tag_objects" in text
 
 
 def test_slim_instructions_route_to_builtin_and_keep_the_warnings():
@@ -109,7 +112,8 @@ def test_slim_instructions_route_to_builtin_and_keep_the_warnings():
     for family_tool in ("query_sql_logger", "plugin_execute_action",
                         "auto_lights_", "list_zwave_devices", "trigger_enable",
                         "variable_move_to_folder", "device_ping",
-                        "get_device_group", "list_uncataloged_devices"):
+                        "get_device_group", "list_uncataloged_devices",
+                        "manage_tags", "tag_objects", "list_tagged"):
         assert family_tool in text, family_tool
 
 

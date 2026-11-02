@@ -81,12 +81,12 @@ def test_every_registered_tool_survives_a_wire_round_trip(mock_indigo):
 
     # Preconditions, stated rather than assumed: the MagicMock server
     # version is not a 2026.1+ string, so the built-in MCP gate stays
-    # open and the sweep covers the full surface (86 tools less
+    # open and the sweep covers the full surface (89 tools less
     # find_devices, which needs an indexer). A slim registration here
-    # would silently shrink the sweep to the 33 extension tools.
+    # would silently shrink the sweep to the 36 extension tools.
     assert result["slim"] is False
     tool_names = list(handler._tools.keys())
-    assert len(tool_names) == 85, tool_names
+    assert len(tool_names) == 88, tool_names
 
     failures = []
     for name in tool_names:

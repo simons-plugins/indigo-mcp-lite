@@ -97,14 +97,14 @@ def test_slim_startup_skips_index_and_subscriptions(fatal_indexing):
     })
     assert init["instructions"] == module.SERVER_INSTRUCTIONS_SLIM
     tools = _rpc(plugin.mcp_handler, "tools/list")["tools"]
-    assert len(tools) == 33
+    assert len(tools) == 36
     assert "find_devices" not in {t["name"] for t in tools}
 
     # One info line naming the counts and the way back.
     lines = [c.args[0] for c in plugin.logger.info.call_args_list]
     gate = [line for line in lines if "/v3/api/mcp" in line]
     assert len(gate) == 1, lines
-    assert "2026.1.0" in gate[0] and "53" in gate[0] and "33" in gate[0]
+    assert "2026.1.0" in gate[0] and "53" in gate[0] and "36" in gate[0]
     assert "Legacy tools" in gate[0]
     assert gate[0].endswith("restart the plugin to restore them.")
 
@@ -139,11 +139,11 @@ def test_legacy_pref_restores_full_surface_on_2026_1(fake_indigo, stub_indexer, 
     fake_indigo.devices.subscribeToChanges.assert_called_once()
     assert plugin.mcp_handler.instructions == module.SERVER_INSTRUCTIONS
     names = {t["name"] for t in _rpc(plugin.mcp_handler, "tools/list")["tools"]}
-    assert len(names) == 86
+    assert len(names) == 89
     assert "find_devices" in names
     infos = [c.args[0] for c in plugin.logger.info.call_args_list]
     assert ('Indigo 2026.1.0 has its own MCP server at /v3/api/mcp; '
-            '"Legacy tools" is on, so all 86 tools registered') in infos
+            '"Legacy tools" is on, so all 89 tools registered') in infos
 
 
 def test_legacy_pref_string_false_stays_slim(fatal_indexing):
@@ -176,11 +176,11 @@ def test_unreadable_version_falls_back_to_full_surface(fake_indigo, stub_indexer
     assert plugin.indexer is stub_indexer[0]
     assert plugin.mcp_handler.instructions == module.SERVER_INSTRUCTIONS
     names = {t["name"] for t in _rpc(plugin.mcp_handler, "tools/list")["tools"]}
-    assert len(names) == 86
+    assert len(names) == 89
     warnings = [c.args[0] for c in plugin.logger.warning.call_args_list]
     assert any("RuntimeError" in w and "registering all tools" in w for w in warnings), warnings
     infos = [c.args[0] for c in plugin.logger.info.call_args_list]
-    assert "Indigo unknown: no built-in MCP server, all 86 tools registered" in infos
+    assert "Indigo unknown: no built-in MCP server, all 89 tools registered" in infos
 
 
 def test_pre_2026_1_startup_states_full_mode(fake_indigo, stub_indexer):
@@ -189,7 +189,7 @@ def test_pre_2026_1_startup_states_full_mode(fake_indigo, stub_indexer):
     plugin = _make_plugin(module, {})
     plugin.startup()
     infos = [c.args[0] for c in plugin.logger.info.call_args_list]
-    assert "Indigo 2025.2.5: no built-in MCP server, all 86 tools registered" in infos
+    assert "Indigo 2025.2.5: no built-in MCP server, all 89 tools registered" in infos
 
 
 def test_registration_failure_is_logged_and_reraised(fatal_indexing, monkeypatch):

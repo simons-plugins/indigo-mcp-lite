@@ -106,9 +106,16 @@ def _is_lamplighter(n):
     return n.startswith("lamplighter_")
 
 
+# Indigo 2026.1 tag tools. A frozenset, checked before the generic
+# list_*/get_* Lookup rule: list_tagged would otherwise land in Lookup
+# while manage_tags / tag_objects matched no group at all.
+_TAG_TOOLS = frozenset({"manage_tags", "tag_objects", "list_tagged"})
+
+
 def _is_lookup(n):
     if (n in _SYSTEM_TOOLS or n in _AUTOMATION_CONTENT_TOOLS
-            or n in _AUTO_LIGHTS_TOOLS or _is_lamplighter(n)):
+            or n in _AUTO_LIGHTS_TOOLS or _is_lamplighter(n)
+            or n in _TAG_TOOLS):
         return False
     return n.startswith("list_") or n.startswith("get_")
 
@@ -138,6 +145,7 @@ _GROUPS = (
     ("Search", lambda n: n == "find_devices"),
     ("Auto Lights config", lambda n: n in _AUTO_LIGHTS_TOOLS),
     ("Lamplighter", _is_lamplighter),
+    ("Tags", lambda n: n in _TAG_TOOLS),
 )
 
 

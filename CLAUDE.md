@@ -17,7 +17,8 @@ Stdlib-only MCP server plugin. Replaces mlamoure's [`indigomcp`](../indigomcp/) 
 Intel Mac under Indigo 2025.2 / Python 3.13, where LanceDB no longer installs and
 the upstream embedding-based search is unusable.
 
-Surface before Indigo 2026.1: 86 deterministic tools, including a novel
+Surface before Indigo 2026.1: 89 deterministic tools (the three tag tools
+register but fail with a version message there), including a novel
 `find_devices`, matching (and now exceeding) the upstream `indigo-mcp-server`
 API (devices, variables, action groups, plugins, event log,
 thermostat/dimmer/relay control). `find_devices` is backed by SQLite FTS5 — no
@@ -27,7 +28,8 @@ makes.
 Surface on Indigo 2026.1+: the server ships its own MCP at `/v3/api/mcp`
 covering lookup and control, so lite registers only its extension tools
 (automation contents, SQL Logger history, plugin actions, Lamplighter / Auto
-Lights, Z-Wave, enable/disable, variable delete/move, diagnostics) and skips
+Lights, Z-Wave, enable/disable, variable delete/move, tags (`tools/tags.py`:
+create/assign/list; the built-in only reads tags), diagnostics) and skips
 the FTS5 index. The built-in-covered names are `BUILTIN_COVERED` in
 `tool_registry.py` (counts: the marker line at the top of the README's tool
 table); the "Legacy tools" plugin pref (`legacyTools`) restores them.
