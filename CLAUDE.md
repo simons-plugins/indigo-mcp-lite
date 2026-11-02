@@ -17,19 +17,22 @@ Stdlib-only MCP server plugin. Replaces mlamoure's [`indigomcp`](../indigomcp/) 
 Intel Mac under Indigo 2025.2 / Python 3.13, where LanceDB no longer installs and
 the upstream embedding-based search is unusable.
 
-Surface on Indigo 2025.x: 86 deterministic tools matching (and now exceeding) the upstream `indigo-mcp-server` API
-(devices, variables, action groups, plugins, event log, thermostat/dimmer/relay
-control) plus one novel `find_devices` tool backed by SQLite FTS5 — no
+Surface before Indigo 2026.1: 86 deterministic tools, including a novel
+`find_devices`, matching (and now exceeding) the upstream `indigo-mcp-server`
+API (devices, variables, action groups, plugins, event log,
+thermostat/dimmer/relay control). `find_devices` is backed by SQLite FTS5 — no
 embeddings, no third-party APIs, no network calls beyond what Indigo itself
 makes.
 
 Surface on Indigo 2026.1+: the server ships its own MCP at `/v3/api/mcp`
-covering lookup and control, so lite registers only its 33 extension tools
+covering lookup and control, so lite registers only its extension tools
 (automation contents, SQL Logger history, plugin actions, Lamplighter / Auto
-Lights, Z-Wave, enable/disable, diagnostics) and skips the FTS5 index. The 53
-built-in-covered names are `BUILTIN_COVERED` in `tool_registry.py`; the
-"Legacy tools" plugin pref (`legacyTools`) restores them. Decision: workspace
-[ADR-0009](../docs/adr/0009-builtin-mcp-is-general-surface-lite-is-extension.md).
+Lights, Z-Wave, enable/disable, variable delete/move, diagnostics) and skips
+the FTS5 index. The built-in-covered names are `BUILTIN_COVERED` in
+`tool_registry.py` (counts: the marker line at the top of the README's tool
+table); the "Legacy tools" plugin pref (`legacyTools`) restores them.
+Decision: [ADR-0003](./docs/adr/0003-extension-layer-on-indigo-2026-1.md)
+(follows workspace ADR-0009).
 Don't add lookup or device-control tools for 2026.1+ servers.
 
 Sibling to [`../indigo-home-intelligence/`](../indigo-home-intelligence/) (HI):

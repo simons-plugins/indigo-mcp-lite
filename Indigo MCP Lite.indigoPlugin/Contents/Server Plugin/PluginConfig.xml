@@ -12,7 +12,7 @@
 
     <Field id="legacyTools" type="checkbox" defaultValue="false">
         <Label>Legacy tools:</Label>
-        <Description>Also register the 53 lookup/control tools that Indigo 2026.1's own MCP server provides (needed only to reach objects without Remote Display). Ignored on Indigo 2025.x. Takes effect after the plugin restarts.</Description>
+        <Description>Also register the lookup/control tools that Indigo 2026.1's own MCP server provides. Needed to reach objects without Remote Display, the second white channel (white2), or multi-key state search. Ignored before Indigo 2026.1. Takes effect after the plugin restarts.</Description>
     </Field>
 
     <Field id="separator1" type="separator" />

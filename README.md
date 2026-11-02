@@ -15,15 +15,15 @@ Ask Claude things like:
 - "Show me errors in the event log from the last hour"
 - "Run the goodnight scene"
 
-Lite exposes 86 MCP tools — full read access to devices/variables/action groups/triggers/schedules, automation contents (decoded action steps, condition trees, and embedded scripts read from the Indigo database file), write control of dimmers/relays/thermostats/variables/action groups, system introspection (event log, plugin status), and a single FTS5-backed `find_devices` search. Device details are enriched with capability flags from a vendored snapshot of the [community device catalog](https://github.com/simons-plugins/indigo-device-catalog) (regenerated per release — no network at runtime), the colour/white control tools use the same data for friendly refusals on unsupported devices, and `list_uncataloged_devices` reports the catalog gaps.
+Before Indigo 2026.1, lite exposes 86 MCP tools — full read access to devices/variables/action groups/triggers/schedules, automation contents (decoded action steps, condition trees, and embedded scripts read from the Indigo database file), write control of dimmers/relays/thermostats/variables/action groups, system introspection (event log, plugin status), and a single FTS5-backed `find_devices` search. Device details are enriched with capability flags from a vendored snapshot of the [community device catalog](https://github.com/simons-plugins/indigo-device-catalog) (regenerated per release — no network at runtime), the colour/white control tools use the same data for friendly refusals on unsupported devices, and `list_uncataloged_devices` reports the catalog gaps.
 
 ### Indigo 2026.1 and later
 
-Indigo 2026.1 ships its own MCP server at `/v3/api/mcp`, which covers lookup and control. On a 2026.1+ server lite registers only its **33 extension tools**, the things the built-in server does not do: automation contents (`get_automation_contents`, `find_automation_references`, `list_automation_scripts`), SQL Logger history, cross-plugin actions (`list_plugin_actions` / `plugin_execute_action`), Lamplighter and Auto Lights configuration, Z-Wave detail, enable/disable and variable delete/move, and diagnostics (`device_ping`, `device_beep`, `device_status_request`, `device_reset_energy_accum`, `get_dependencies`, `get_device_group`, `list_uncataloged_devices`). It also skips building the `find_devices` search index. Tools marked † in the [Tools](#tools) table are the 53 it leaves to the built-in server. On Indigo 2025.x nothing changes: all 86 tools register.
+Indigo 2026.1 ships its own MCP server at `/v3/api/mcp`, which covers lookup and control. On a 2026.1+ server lite registers only its **33 extension tools**, the things the built-in server does not do: automation contents (`get_automation_contents`, `find_automation_references`, `list_automation_scripts`), SQL Logger history, cross-plugin actions (`list_plugin_actions` / `plugin_execute_action`), Lamplighter and Auto Lights configuration, Z-Wave detail, enable/disable and variable delete/move, and diagnostics (`device_ping`, `device_beep`, `device_status_request`, `device_reset_energy_accum`, `get_dependencies`, `get_device_group`, `list_uncataloged_devices`). It also skips building the `find_devices` search index. Tools marked † in the [Tools](#tools) table are the 53 it leaves to the built-in server. Before Indigo 2026.1 nothing changes: all 86 tools register.
 
-Two things have no built-in equivalent and are lost on 2026.1+: `device_set_white_levels`'s second white channel (`white2`, for two-white-level strips) and multi-key `get_devices_by_state` (the built-in takes one key plus an operator). Lock/unlock on the built-in server is `turn_on`/`turn_off` on a lock device and is confirm-gated.
+Two things have no built-in equivalent and are lost on 2026.1+: `device_set_white_levels`'s second white channel (`white2`, for two-white-level strips) and multi-key `get_devices_by_state` (the built-in takes one key plus an operator). Locking and unlocking on the built-in server is expected to be `turn_on`/`turn_off` on a lock-subtype device, behind a confirm token; that is not yet verified on real lock hardware. If it does not work for your locks, the **Legacy tools** preference restores `device_lock`/`device_unlock`.
 
-The built-in server sees only objects with Remote Display turned on (on the object and its folder). If you need lite's view of unpublished objects, or one of the two capabilities above, turn on the **Legacy tools** plugin preference (Plugins → Indigo MCP Lite → Configure…) and restart the plugin: lite then registers all 86 tools again, the 2025.x behaviour.
+The built-in server sees only objects with Remote Display turned on (on the object and its folder). If you need lite's view of unpublished objects, or one of the two capabilities above, turn on the **Legacy tools** plugin preference (Plugins → Indigo MCP Lite → Configure…) and restart the plugin: lite then registers all 86 tools again, as it does before Indigo 2026.1.
 
 ## Server requirements
 
@@ -60,7 +60,7 @@ Three configuration patterns. Pick the one that matches your situation.
 Point the `indigo` key at the server's own MCP and run lite alongside it under `indigo-lite` (tools appear as `mcp__indigo_lite__*`). The built-in server speaks Streamable HTTP, so Claude Code connects to it natively:
 
 ```bash
-claude mcp add --transport http indigo https://YOUR-REFLECTOR.indigodomo.net/v3/api/mcp --header "Authorization: Bearer YOUR-KEY"
+claude mcp add --transport http indigo https://your-reflector.indigodomo.net/v3/api/mcp --header "Authorization: Bearer YOUR_TOKEN"
 ```
 
 Or in `.mcp.json`, with lite next to it:
@@ -86,7 +86,7 @@ Or in `.mcp.json`, with lite next to it:
 }
 ```
 
-On Indigo 2025.x there is no built-in server; use Pattern A or B below.
+Before Indigo 2026.1 there is no built-in server; use Pattern A or B below.
 
 ### Pattern A — Drop-in replacement (recommended for most users)
 
@@ -180,11 +180,11 @@ Claude Code reads **`.mcp.json`** (dotfile) for project-local MCP servers. Cowor
 
 The `env.PATH` block in the configs above pins Homebrew's Node to the front of PATH **for the bridge subprocess only**, sidestepping the issue without changing your shell setup.
 
-### Don't use `type: "http"` in Claude Code's MCP config
+### Don't use `type: "http"` for lite's own endpoint
 
-Claude Code's `type: "http"` form expects Server-Sent Events (SSE) transport. Lite (and Home Intelligence) speak plain HTTP POST JSON-RPC, not SSE — the connection silently fails at session start. **Use the `mcp-remote` bridge form (`command + args + env`) instead.** `mcp-remote` translates between Claude Code's SSE expectation and the plugin's plain JSON-RPC.
+In Claude Code, `type: "http"` is the Streamable HTTP transport (`type: "sse"` is the legacy one). Lite (and Home Intelligence) answer plain JSON-RPC POSTs and do not implement the Streamable HTTP session handshake that Claude Code's `http` transport expects, so pointing `type: "http"` at lite's endpoint (`/message/com.simons-plugins.indigo-mcp-lite/mcp`) fails at session start. **Use the `mcp-remote` bridge form (`command + args + env`) instead**: `mcp-remote` runs as a local stdio server for Claude Code and forwards each request to the plugin as a JSON-RPC POST.
 
-This applies to lite's own endpoint (`/message/com.simons-plugins.indigo-mcp-lite/mcp`) only. Indigo 2026.1's built-in server at `/v3/api/mcp` speaks Streamable HTTP and **should** use `type: "http"`, as shown above.
+Indigo 2026.1's built-in server at `/v3/api/mcp` is a real Streamable HTTP server and **does** use `type: "http"`, as shown above.
 
 ### Cold-start race
 
@@ -197,7 +197,7 @@ If `mcp-remote` isn't yet cached locally, `npx -y mcp-remote ...` has to fetch t
 ## Tools
 
 <!-- BEGIN TOOL TABLE -->
-<!-- AUTO-GENERATED by scripts/generate_tool_doc.py — 86 tools -->
+<!-- AUTO-GENERATED by scripts/generate_tool_doc.py — 86 tools, 53 marked † -->
 
 † Not registered on Indigo 2026.1+ (the server's own MCP at `/v3/api/mcp` provides it) unless the **Legacy tools** preference is on.
 
