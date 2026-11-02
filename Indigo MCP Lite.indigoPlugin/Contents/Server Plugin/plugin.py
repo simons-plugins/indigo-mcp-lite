@@ -61,19 +61,108 @@ at a given time) rather than inferring it from the event log.
 """
 
 
+# Instructions for Indigo 2026.1+, where the server's own MCP covers
+# lookup and control and lite registers only its extension tools
+# (workspace ADR-0009). Same job as SERVER_INSTRUCTIONS: route the
+# client to the right server and family, and keep the three
+# incomplete-looking answers in front of it.
+SERVER_INSTRUCTIONS_SLIM = """\
+Indigo home automation (indigodomo.com), extension tools.
+
+This Indigo server (2026.1 or later) runs its own MCP server at
+/v3/api/mcp. Use THAT server for lookup and control: finding and
+reading devices, variables, action groups, triggers, schedules and
+plugins; on/off, dimming, colour, thermostats, sprinklers, speed
+controls, locks; executing action groups; the event log; plugin status
+and restarts. This server (indigo-mcp-lite) is the extension layer and
+registers only what the built-in server does not do:
+
+- CONTENTS: what an automation DOES and WHEN. get_automation_contents,
+  find_automation_references, list_automation_scripts decode the
+  Indigo database file; no lookup tool on either server can see it.
+- HISTORY: SQL Logger queries (query_sql_logger,
+  list_sql_logger_columns).
+- PLUGIN ACTIONS: list_plugin_actions / plugin_execute_action discover
+  and run any plugin's own actions.
+- LAMPLIGHTER: lamplighter_* (below).
+- AUTO LIGHTS: auto_lights_* read and set the Auto Lights plugin's
+  zone configuration.
+- Z-WAVE: list_zwave_devices, get_zwave_device_details.
+- LIFECYCLE: trigger_enable, schedule_enable, device_enable,
+  variable_delete, variable_move_to_folder.
+- DIAGNOSTICS: device_ping, device_beep, device_status_request,
+  device_reset_energy_accum, get_dependencies, get_device_group,
+  list_uncataloged_devices.
+
+Three answers that look complete but are not:
+
+1. A schedule's `next_execution` is the next TIMESTAMP, not the rule.
+   It cannot distinguish an absolute 06:00 schedule from one tracking
+   sunrise, so it cannot show a misconfigured time. For when a schedule
+   actually fires, call get_automation_contents(entity_type="schedule")
+   here and read its `schedule` block.
+2. The built-in server's get_trigger_by_id / get_schedule_by_id /
+   get_action_group_by_id return METADATA only: name, folder, enabled.
+   They never show the action steps or conditions.
+   get_automation_contents does.
+3. get_dependencies wraps Indigo's own dependency check, which does NOT
+   see devices referenced from inside a plugin action's parameters. It
+   can report zero dependents for a device that several action groups
+   genuinely drive. find_automation_references DOES see those and
+   reports them as `acts_on_via_props`; ask it before concluding
+   nothing uses a device.
+
+A plugin action step's target device is sometimes only inside its
+`props` (e.g. `dimmer_device_id`), never in `device_id`;
+find_automation_references resolves those. Likewise a device's
+behaviour often lives in its configuration (plugin props), not its
+states.
+
+The built-in server sees only objects with Remote Display turned on
+(on the object and its folder). If it cannot find something the user
+says exists, the object may simply not be published; say so rather
+than concluding it does not exist.
+
+Lighting automation has its own family: `lamplighter_*` reads and
+patches the Lamplighter plugin's zone configuration, releases overrides
+and locks, switches a zone or the whole plugin, and `lamplighter_explain`
+asks the plugin itself why a zone is doing what it is doing (or would
+at a given time) rather than inferring it from the event log.
+"""
+
+
+def _pref_bool(value):
+    """Plugin prefs may hold a checkbox as a bool or as "true"/"false"."""
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
 class Plugin(indigo.PluginBase):
     def __init__(self, plugin_id, plugin_display_name, plugin_version, plugin_prefs):
         super().__init__(plugin_id, plugin_display_name, plugin_version, plugin_prefs)
         self._apply_log_level()
+        # Deferred import, same reason as in startup(): importing
+        # `plugin` must not pull in the whole tool tree.
+        from tool_registry import server_has_builtin_mcp
+
+        # Decided once: the tool set and the instructions text must
+        # agree, and the handler is built here (before any IWS call).
+        # A changed "Legacy tools" pref takes effect on restart.
+        self._legacy_tools = _pref_bool(self.pluginPrefs.get("legacyTools", False))
+        self._builtin_mcp = server_has_builtin_mcp(indigo, self.logger)
+        self._slim = self._builtin_mcp and not self._legacy_tools
         self.mcp_handler = MCPHandler(
             logger=self.logger,
             server_name="indigo-mcp-lite",
             server_version=plugin_version,
-            instructions=SERVER_INSTRUCTIONS,
+            instructions=SERVER_INSTRUCTIONS_SLIM if self._slim else SERVER_INSTRUCTIONS,
         )
         # Built in startup()/_build_history_db(); None = history tools
         # report "not configured".
         self.history_db = None
+        # Built in startup() on a full (non-slim) server only.
+        self.indexer = None
 
     def _apply_log_level(self):
         level_name = self.pluginPrefs.get("logLevel", "INFO")
@@ -85,24 +174,40 @@ class Plugin(indigo.PluginBase):
         self.logger.info("indigo-mcp-lite startup")
         # Deferred imports: keep test imports of `plugin` from pulling
         # in the whole tool tree / indexer at module-load time.
-        from indexer import Indexer
         from tool_registry import register_all
 
-        self.indexer = Indexer(indigo_module=indigo, logger=self.logger)
-        self.indexer.build()
+        if self._slim:
+            # find_devices (the index's only consumer) is not
+            # registered on a server with the built-in MCP, so neither
+            # the index nor the change subscriptions that feed it are
+            # needed.
+            self.indexer = None
+        else:
+            from indexer import Indexer
 
-        # Subscribe to all entity-change streams. Without these, our
-        # deviceCreated/Updated/Deleted etc. callbacks never fire and
-        # the index goes stale on the first object change.
-        indigo.devices.subscribeToChanges()
-        indigo.variables.subscribeToChanges()
-        indigo.actionGroups.subscribeToChanges()
+            self.indexer = Indexer(indigo_module=indigo, logger=self.logger)
+            self.indexer.build()
+
+            # Subscribe to all entity-change streams. Without these, our
+            # deviceCreated/Updated/Deleted etc. callbacks never fire and
+            # the index goes stale on the first object change.
+            indigo.devices.subscribeToChanges()
+            indigo.variables.subscribeToChanges()
+            indigo.actionGroups.subscribeToChanges()
 
         self._build_history_db()
-        register_all(self.mcp_handler, indigo_module=indigo,
-                     indexer=self.indexer,
-                     history_db_provider=lambda: self.history_db,
-                     logger=self.logger)
+        result = register_all(self.mcp_handler, indigo_module=indigo,
+                              indexer=self.indexer,
+                              history_db_provider=lambda: self.history_db,
+                              logger=self.logger,
+                              legacy_tools=self._legacy_tools)
+        if result["slim"]:
+            self.logger.info(
+                f"Indigo {indigo.server.version} has its own MCP server at /v3/api/mcp: "
+                f"{result['skipped']} lookup/control tools it provides were not registered, "
+                f"{result['registered']} extension tools remain. Turn on the "
+                f"\"Legacy tools\" plugin preference to restore them."
+            )
 
     def shutdown(self):
         self.logger.info("indigo-mcp-lite shutdown")
@@ -110,6 +215,18 @@ class Plugin(indigo.PluginBase):
     def closedPrefsConfigUi(self, valuesDict, userCancelled):
         if not userCancelled:
             self._apply_log_level()
+            legacy = _pref_bool(valuesDict.get("legacyTools", False))
+            if legacy != self._legacy_tools:
+                if self._builtin_mcp:
+                    self.logger.warning(
+                        "Legacy tools preference changed; it takes effect after the plugin "
+                        "restarts (Plugins > Indigo MCP Lite > Reload)."
+                    )
+                else:
+                    self.logger.info(
+                        "Legacy tools preference changed; it has no effect on this Indigo "
+                        "version (no built-in MCP server), so every tool stays registered."
+                    )
             # Rebuild the SQL Logger connection so pref edits take
             # effect without a plugin restart. The history tools hold a
             # provider (not the instance), so the swap is picked up on
@@ -135,8 +252,14 @@ class Plugin(indigo.PluginBase):
         change-subscription streams might have missed, or when
         debugging stale-index suspicions.
         """
-        if not hasattr(self, "indexer") or self.indexer is None:
-            self.logger.warning("Reindex Now: indexer not yet ready")
+        if getattr(self, "indexer", None) is None:
+            if getattr(self, "_slim", False):
+                self.logger.warning(
+                    "Reindex Now: find_devices is not registered on this server (Indigo's "
+                    "built-in MCP provides search), so there is no index to rebuild"
+                )
+            else:
+                self.logger.warning("Reindex Now: indexer not yet ready")
             return
         self.logger.info("Reindex Now: rebuilding entity index")
         self.indexer.build()

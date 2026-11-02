@@ -56,9 +56,7 @@ def test_instructions_do_not_disturb_the_rest_of_initialize():
     assert "serverInfo" in result
 
 
-def test_plugin_ships_instructions_naming_every_tool_family():
-    # The plugin's own text, not a fixture — if it stops orienting a
-    # client, this fails.
+def _plugin_module():
     import importlib.util
     import pathlib
     import sys
@@ -70,8 +68,13 @@ def test_plugin_ships_instructions_naming_every_tool_family():
     spec = importlib.util.spec_from_file_location("_lite_plugin", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
 
-    text = module.SERVER_INSTRUCTIONS
+
+def test_plugin_ships_instructions_naming_every_tool_family():
+    # The plugin's own text, not a fixture — if it stops orienting a
+    # client, this fails.
+    text = _plugin_module().SERVER_INSTRUCTIONS
     # Names the tool that answers "what does this do / when".
     assert "get_automation_contents" in text
     # Names the three incomplete-looking answers it exists to correct.
@@ -86,6 +89,28 @@ def test_plugin_ships_instructions_naming_every_tool_family():
     # tools are discoverable only by reading 86 tool descriptions.
     assert "lamplighter_" in text
     assert "lamplighter_explain" in text
+
+
+def test_slim_instructions_route_to_builtin_and_keep_the_warnings():
+    # Indigo 2026.1+: lookup/control live on the server's own MCP, so
+    # the slim text must send the client there, describe what lite still
+    # does, and keep the three incomplete-looking answers.
+    text = _plugin_module().SERVER_INSTRUCTIONS_SLIM
+    assert "/v3/api/mcp" in text
+    assert "extension" in text
+    assert "get_automation_contents" in text
+    assert "next_execution" in text
+    assert "get_dependencies" in text
+    assert "props" in text
+    assert "acts_on_via_props" in text
+    assert "lamplighter" in text
+    assert "lamplighter_explain" in text
+    assert "Remote Display" in text
+    for family_tool in ("query_sql_logger", "plugin_execute_action",
+                        "auto_lights_", "list_zwave_devices", "trigger_enable",
+                        "variable_move_to_folder", "device_ping",
+                        "get_device_group", "list_uncataloged_devices"):
+        assert family_tool in text, family_tool
 
 
 def _descriptions(mock_indigo):
