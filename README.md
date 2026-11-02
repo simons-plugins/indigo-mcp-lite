@@ -15,15 +15,15 @@ Ask Claude things like:
 - "Show me errors in the event log from the last hour"
 - "Run the goodnight scene"
 
-Before Indigo 2026.1, lite exposes 86 MCP tools — full read access to devices/variables/action groups/triggers/schedules, automation contents (decoded action steps, condition trees, and embedded scripts read from the Indigo database file), write control of dimmers/relays/thermostats/variables/action groups, system introspection (event log, plugin status), and a single FTS5-backed `find_devices` search. Device details are enriched with capability flags from a vendored snapshot of the [community device catalog](https://github.com/simons-plugins/indigo-device-catalog) (regenerated per release — no network at runtime), the colour/white control tools use the same data for friendly refusals on unsupported devices, and `list_uncataloged_devices` reports the catalog gaps.
+Before Indigo 2026.1, lite exposes 89 MCP tools (the three tag tools among them register but need Indigo 2026.1 to do anything) — full read access to devices/variables/action groups/triggers/schedules, automation contents (decoded action steps, condition trees, and embedded scripts read from the Indigo database file), write control of dimmers/relays/thermostats/variables/action groups, system introspection (event log, plugin status), and a single FTS5-backed `find_devices` search. Device details are enriched with capability flags from a vendored snapshot of the [community device catalog](https://github.com/simons-plugins/indigo-device-catalog) (regenerated per release — no network at runtime), the colour/white control tools use the same data for friendly refusals on unsupported devices, and `list_uncataloged_devices` reports the catalog gaps.
 
 ### Indigo 2026.1 and later
 
-Indigo 2026.1 ships its own MCP server at `/v3/api/mcp`, which covers lookup and control. On a 2026.1+ server lite registers only its **33 extension tools**, the things the built-in server does not do: automation contents (`get_automation_contents`, `find_automation_references`, `list_automation_scripts`), SQL Logger history, cross-plugin actions (`list_plugin_actions` / `plugin_execute_action`), Lamplighter and Auto Lights configuration, Z-Wave detail, enable/disable and variable delete/move, and diagnostics (`device_ping`, `device_beep`, `device_status_request`, `device_reset_energy_accum`, `get_dependencies`, `get_device_group`, `list_uncataloged_devices`). It also skips building the `find_devices` search index. Tools marked † in the [Tools](#tools) table are the 53 it leaves to the built-in server. Before Indigo 2026.1 nothing changes: all 86 tools register.
+Indigo 2026.1 ships its own MCP server at `/v3/api/mcp`, which covers lookup and control. On a 2026.1+ server lite registers only its **36 extension tools**, the things the built-in server does not do: automation contents (`get_automation_contents`, `find_automation_references`, `list_automation_scripts`), SQL Logger history, cross-plugin actions (`list_plugin_actions` / `plugin_execute_action`), Lamplighter and Auto Lights configuration, Z-Wave detail, enable/disable and variable delete/move, tag management (`manage_tags`, `tag_objects`, `list_tagged`), and diagnostics (`device_ping`, `device_beep`, `device_status_request`, `device_reset_energy_accum`, `get_dependencies`, `get_device_group`, `list_uncataloged_devices`). It also skips building the `find_devices` search index. Tools marked † in the [Tools](#tools) table are the 53 it leaves to the built-in server. Before Indigo 2026.1 nothing changes: all 89 tools register.
 
 Two things have no built-in equivalent and are lost on 2026.1+: `device_set_white_levels`'s second white channel (`white2`, for two-white-level strips) and multi-key `get_devices_by_state` (the built-in takes one key plus an operator). Locking and unlocking on the built-in server is expected to be `turn_on`/`turn_off` on a lock-subtype device, behind a confirm token; that is not yet verified on real lock hardware. If it does not work for your locks, the **Legacy tools** preference restores `device_lock`/`device_unlock`.
 
-The built-in server sees only objects with Remote Display turned on (on the object and its folder). If you need lite's view of unpublished objects, or one of the two capabilities above, turn on the **Legacy tools** plugin preference (Plugins → Indigo MCP Lite → Configure…) and restart the plugin: lite then registers all 86 tools again, as it does before Indigo 2026.1.
+The built-in server sees only objects with Remote Display turned on (on the object and its folder). If you need lite's view of unpublished objects, or one of the two capabilities above, turn on the **Legacy tools** plugin preference (Plugins → Indigo MCP Lite → Configure…) and restart the plugin: lite then registers all 89 tools again, as it does before Indigo 2026.1.
 
 ## Server requirements
 
@@ -337,6 +337,17 @@ If `mcp-remote` isn't yet cached locally, `npx -y mcp-remote ...` has to fetch t
 <!-- END TOOL TABLE -->
 
 To regenerate the table from the live registry: `python3 scripts/generate_tool_doc.py`. Single source of truth is `tool_registry.register_all` — adding a tool to any `tools/*.py` module automatically shows up on the next regenerate.
+
+### Tags (Indigo 2026.1+)
+
+Indigo 2026.1 added [tags](https://docs.indigodomo.com/2026.1/user/concepts/tags/): coloured labels from one server-wide library that devices, variables, triggers, schedules, action groups and control pages can carry. The built-in MCP server reads tags and filters its `list_*` tools by them, but cannot create or assign them; these three tools do that.
+
+- **`manage_tags`** creates, renames/recolours (`update`) or deletes a tag in the library. Names are lowercase letters separated by single dashes (`kitchen`, `holiday-lighting`); a bad name is refused with the rule and a suggestion. Colours are six hex digits, `#` optional, default `4A90D9`. Every change is read back from the library and reported as `verified`.
+- **Deleting a tag is gated twice.** Deleting strips the tag from every object carrying it and cannot be undone, so it needs the **Allow tag delete** plugin preference (off by default; read on every call, no restart) *and* `confirm: true`. A call without `confirm` deletes nothing and returns `requires_confirmation` with how many objects carry the tag and (up to 25 of) their names.
+- **`tag_objects`** adds a tag to, or removes it from, up to **200** objects per call (`{"type": "device", "id": 123}`, …). The tag must already exist; it is never created on the fly. Each object reports `added`, `already`, `removed`, `absent`, `not_found` or `error`, and one bad object never stops the rest. `dry_run: true` reports `would_add` / `would_remove` without changing anything. Removing from more than 25 objects needs `confirm: true`. Each change is read back; a read-back that does not show it marks that object `error` and the call `verified: false`.
+- **`list_tagged`** lists every object carrying a tag, across all six types or one, with `remote_display` on each row. Unlike the built-in server's tag filter, which sees only objects with **Remote Display** on, it includes unpublished objects too.
+
+Before Indigo 2026.1 the tools still register, and every call fails with a message naming the server version.
 
 ## Search behaviour
 
