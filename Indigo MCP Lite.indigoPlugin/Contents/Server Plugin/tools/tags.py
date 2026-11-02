@@ -39,8 +39,9 @@ an empty result.
 Error buckets follow the rest of the repo: ``ValueError`` for anything
 the caller can fix (``isError`` tool result); ``RuntimeError`` for a
 fault after a command was dispatched, where blind retrying is wrong.
-Every write is read back, and the payload says whether the read-back
-confirmed it (``verified``).
+Every write is read back. ``accepted`` says only that Indigo took the
+command without raising; ``verified`` says whether the read-back
+showed the change, and is the field to trust.
 """
 
 import re
@@ -138,8 +139,25 @@ def _normalize_color(value):
     return cleaned
 
 
+def _same_color(stored, wanted):
+    """Whether a library colour (``#4a90d9``, ``4A90D9``...) is ``wanted``.
+
+    ``wanted`` is already normalised; the stored side is normalised the
+    same way so a server that keeps a ``#`` or lower case does not read
+    as a failed write.
+    """
+    return str(stored or "").strip().lstrip("#").upper() == wanted
+
+
 def _optional_bool(args, key):
-    raw = args.get(key, False)
+    """``args[key]`` as a bool; absent or None is False.
+
+    Strings, including "true" and "yes", are refused rather than
+    guessed at, as everywhere else in the repo.
+    """
+    raw = args.get(key)
+    if raw is None:
+        return False
     if not isinstance(raw, bool):
         raise ValueError(f"{key} must be true or false; got {raw!r}")
     return raw
@@ -196,24 +214,35 @@ def _unknown_tag(tag, library):
 # -- dispatch ----------------------------------------------------------------
 
 
+def _is_refusal(exc):
+    """Whether ``exc`` is one of the two documented tag-command refusals.
+
+    The documented shapes are exactly ``ValueError`` (unknown or
+    already-existing tag) and ``indigo.utils.ValidationError``
+    (malformed value). Matched exactly: a ValueError SUBCLASS such as
+    ``json.JSONDecodeError`` or ``UnicodeDecodeError`` is a fault in
+    whatever ran after the command was sent, not a refusal.
+    """
+    return type(exc) is ValueError or type(exc).__name__ == "ValidationError"  # pylint: disable=unidiomatic-typecheck
+
+
 def _dispatch(command, what, *args, **kwargs):
     """Call a server tag command, sorting its failures into the buckets.
 
-    Indigo validates a tag command before changing anything: a
-    malformed value raises ``ValidationError`` and an unknown or
-    already-existing tag raises ``ValueError``. Either is a refusal
-    the caller can act on, so it stays a ValueError. Anything else is
-    a fault after dispatch and becomes a RuntimeError telling the
-    caller to read before retrying.
+    A documented refusal (see ``_is_refusal``) stays a ValueError the
+    caller can act on. This code cannot tell whether Indigo checks a
+    command before or after changing anything, so every other failure
+    becomes a RuntimeError saying the command was dispatched and may
+    have taken effect: read before retrying.
     """
     try:
         return command(*args, **kwargs)
     except Exception as exc:  # pylint: disable=broad-except
-        if isinstance(exc, ValueError) or type(exc).__name__ == "ValidationError":
+        if _is_refusal(exc):
             raise ValueError(f"Indigo refused {what}: {exc}") from exc
         raise RuntimeError(
             f"{what} WAS DISPATCHED and failed ({type(exc).__name__}: {exc}); it may or may not "
-            "have taken effect. Read the tag library back (list_tagged, or the built-in "
+            "have taken effect. Read the current state back (list_tagged, or the built-in "
             "server's tag listing) before retrying."
         ) from exc
 
@@ -241,33 +270,77 @@ def _row(type_name, obj):
 
 
 def _scan_carriers(indigo_module, tag, types):
-    """Every object of ``types`` carrying ``tag``.
+    """Every object of ``types`` carrying ``tag``, and how complete that is.
 
-    Returns ``(rows, collections_unreadable, attr_read_errors)``. A
-    collection that cannot be iterated, and an object whose ``tags``
-    cannot be read, are reported rather than skipped silently: either
-    makes the row list incomplete, and a count used to warn about a
-    delete must say when it is a lower bound.
+    Returns a dict: ``rows``; ``collections_unreadable`` (one
+    ``{type, error}`` per collection that could not be iterated);
+    ``attr_read_errors`` (objects whose ``tags`` could not be read) with
+    the first failure as ``attr_read_error_example``; ``readable`` (objects
+    whose tags were read); and ``complete``. Failures are reported,
+    never skipped silently: either makes the row list incomplete, and a
+    count used to warn about a delete must say when it is a lower bound.
     """
-    rows, unreadable, attr_errors = [], [], 0
+    scan = {"rows": [], "collections_unreadable": [], "attr_read_errors": 0,
+            "attr_read_error_example": None, "readable": 0}
     for type_name in types:
-        collection_attr = OBJECT_TYPES[type_name][0]
         try:
-            objects = list(getattr(indigo_module, collection_attr))
+            objects = list(getattr(indigo_module, OBJECT_TYPES[type_name][0]))
         except Exception as exc:  # pylint: disable=broad-except
-            unreadable.append({"type": type_name, "error": f"{type(exc).__name__}: {exc}"})
+            scan["collections_unreadable"].append({"type": type_name, "error": f"{type(exc).__name__}: {exc}"})
             continue
         for obj in objects:
             try:
-                carries = tag in _object_tags(obj)
-            except Exception:  # pylint: disable=broad-except
-                attr_errors += 1
+                row = _row(type_name, obj) if tag in _object_tags(obj) else None
+            except Exception as exc:  # pylint: disable=broad-except
+                scan["attr_read_errors"] += 1
+                if scan["attr_read_error_example"] is None:
+                    scan["attr_read_error_example"] = f"{type(exc).__name__}: {exc}"
                 continue
-            if carries:
-                rows.append(_row(type_name, obj))
+            scan["readable"] += 1
+            if row is not None:
+                scan["rows"].append(row)
     order = {name: i for i, name in enumerate(OBJECT_TYPES)}
-    rows.sort(key=lambda r: (order[r["type"]], str(r["name"] or "").lower(), str(r["id"])))
-    return rows, unreadable, attr_errors
+    scan["rows"].sort(key=lambda r: (order[r["type"]], str(r["name"] or "").lower(), str(r["id"])))
+    scan["complete"] = not scan["collections_unreadable"] and not scan["attr_read_errors"]
+    return scan
+
+
+def _require_readable_scan(scan, tag, types):
+    """Raise unless the scan read at least one object's tags.
+
+    When something failed and nothing was readable, "0 objects carry
+    the tag" would be a confident wrong answer: a failed call instead.
+    """
+    if scan["complete"] or scan["readable"]:
+        return
+    unreadable = scan["collections_unreadable"]
+    if len(unreadable) == len(types):
+        raise ValueError(f"no object collection could be read ({unreadable}); cannot say what carries {tag!r}.")
+    raise ValueError(
+        f"no object's tags could be read (collections unreadable: {unreadable}; "
+        f"{scan['attr_read_errors']} object(s)' tags unreadable, e.g. {scan['attr_read_error_example']}); "
+        f"cannot say what carries {tag!r}."
+    )
+
+
+def _scan_report(scan, complete_key):
+    """The completeness fields every scan-based payload carries, clean or not."""
+    return {
+        complete_key: scan["complete"],
+        "collections_unreadable": scan["collections_unreadable"],
+        "attr_read_errors": scan["attr_read_errors"],
+        "attr_read_error_example": scan["attr_read_error_example"],
+    }
+
+
+def _carrier_text(scan):
+    """``the N object(s)``, or a lower bound saying what could not be read."""
+    count = len(scan["rows"])
+    if scan["complete"]:
+        return f"the {count} object(s)"
+    cols = ", ".join(u["type"] for u in scan["collections_unreadable"]) or "no collections"
+    return (f"at least {count} object(s) (count incomplete: {cols} unreadable, "
+            f"{scan['attr_read_errors']} objects' tags unreadable)")
 
 
 # -- manage_tags ----------------------------------------------------------------
@@ -301,13 +374,13 @@ def _create(args, indigo_module):
         )
     _dispatch(indigo_module.server.create_tag, f"create_tag({tag!r})", tag, color)
     after, read_error = _read_back_library(indigo_module)
-    out = {"action": "create", "tag": tag, "created": True}
+    out = {"action": "create", "tag": tag, "accepted": True}
     if after is None:
         out.update({"entry": None, "verified": None, "read_back_error": read_error})
         return out
     entry = after.get(tag)
     out["entry"] = _entry(entry) if entry is not None else None
-    out["verified"] = entry is not None and str(_entry(entry).get("color") or "").upper() == color
+    out["verified"] = entry is not None and _same_color(_entry(entry).get("color"), color)
     if not out["verified"]:
         out["note"] = "create_tag was accepted but the library read back does not show the tag with this colour."
     return out
@@ -336,7 +409,7 @@ def _update(args, indigo_module):
     _dispatch(indigo_module.server.update_tag, f"update_tag({tag!r})", tag, **kwargs)
     final = new_tag or tag
     renamed = final != tag
-    out = {"action": "update", "tag": final, "previous_tag": tag, "renamed": renamed,
+    out = {"action": "update", "tag": final, "previous_tag": tag, "accepted": True, "renamed": renamed,
            "recolored": color is not None}
     after, read_error = _read_back_library(indigo_module)
     if after is None:
@@ -346,7 +419,7 @@ def _update(args, indigo_module):
     out["entry"] = _entry(entry) if entry is not None else None
     verified = entry is not None
     if verified and color is not None:
-        verified = str(_entry(entry).get("color") or "").upper() == color
+        verified = _same_color(_entry(entry).get("color"), color)
     if verified and renamed:
         verified = tag not in after
     out["verified"] = verified
@@ -368,28 +441,34 @@ def _delete(args, indigo_module, allow_delete, confirm):
     library = _read_library(indigo_module)
     if tag not in library:
         raise _unknown_tag(tag, library)
-    carriers, unreadable, attr_errors = _scan_carriers(indigo_module, tag, OBJECT_TYPES)
-    out = {"action": "delete", "tag": tag, "carrier_count": len(carriers)}
-    if unreadable or attr_errors:
-        out["carrier_count_complete"] = False
-        out["collections_unreadable"] = unreadable
-        out["attr_read_errors"] = attr_errors
+    scan = _scan_carriers(indigo_module, tag, OBJECT_TYPES)
+    _require_readable_scan(scan, tag, OBJECT_TYPES)
+    carriers = scan["rows"]
+    count = len(carriers)
+    count_text = _carrier_text(scan)
+    out = {"action": "delete", "tag": tag, "carrier_count": count}
+    out.update(_scan_report(scan, "carrier_count_complete"))
+    if confirm and not scan["complete"]:
+        # The one irreversible path: never delete on a count known to be short.
+        raise ValueError(
+            f"Nothing was deleted. {tag!r} is carried by {count_text}; deleting on an incomplete "
+            "count is refused because it cannot be undone. Retry when every collection is readable."
+        )
     if not confirm:
         out.update({
-            "deleted": False,
+            "accepted": False,
             "requires_confirmation": True,
             "carriers": [{"type": r["type"], "id": r["id"], "name": r["name"]}
                          for r in carriers[:CARRIER_LIST_CAP]],
-            "carriers_truncated": len(carriers) > CARRIER_LIST_CAP,
+            "carriers_truncated": count > CARRIER_LIST_CAP,
             "message": (
-                f"Nothing was deleted. Deleting {tag!r} removes it from the library and from the "
-                f"{len(carriers)} object(s) carrying it, and cannot be undone. Call again with "
-                "confirm=true to delete."
+                f"Nothing was deleted. Deleting {tag!r} removes it from the library and from "
+                f"{count_text} carrying it, and cannot be undone. Call again with confirm=true to delete."
             ),
         })
         return out
-    _dispatch(indigo_module.server.delete_tag, f"delete_tag({tag!r})", tag)
-    out["deleted"] = True
+    _dispatch(indigo_module.server.delete_tag, f"delete_tag({tag!r}) on a tag carried by {count} object(s)", tag)
+    out["accepted"] = True
     after, read_error = _read_back_library(indigo_module)
     if after is None:
         out.update({"verified": None, "read_back_error": read_error})
@@ -404,7 +483,12 @@ def _delete(args, indigo_module, allow_delete, confirm):
 
 
 def _parse_objects(raw):
-    """Validate the whole ``objects`` list before anything is touched."""
+    """Validate the whole ``objects`` list before anything is touched.
+
+    Returns ``(entries, duplicates_ignored)``: the distinct ``(type, id)``
+    pairs in first-seen order. A repeated entry is dropped up front so a
+    dry run and the real call report the same rows.
+    """
     if not isinstance(raw, list) or not raw:
         raise ValueError('objects must be a non-empty list of {"type": ..., "id": ...}')
     if len(raw) > MAX_OBJECTS:
@@ -420,7 +504,8 @@ def _parse_objects(raw):
         if obj_id is None or obj_id < 0:
             raise ValueError(f"objects[{index}].id must be a non-negative integer; got {item.get('id')!r}")
         parsed.append((type_name, obj_id))
-    return parsed
+    distinct = list(dict.fromkeys(parsed))
+    return distinct, len(parsed) - len(distinct)
 
 
 def _inspect(indigo_module, type_name, obj_id, tag):
@@ -448,64 +533,90 @@ def _inspect(indigo_module, type_name, obj_id, tag):
     return (collection, has_tag), fragment
 
 
-def _change(indigo_module, collection, *, type_name, obj_id, tag, adding):
-    """Dispatch one add/remove and read the object back.
+def _change(command, collection, *, obj_id, tag, adding):
+    """Dispatch one add/remove and read the object back; the row fragment.
 
-    Returns ``(fragment, confirmed)``. Indigo objects are copies, so
-    the read-back re-fetches the object rather than re-reading the
-    one already in hand.
+    Indigo objects are copies, so the read-back re-fetches the object
+    rather than re-reading the one already in hand. Only a read-back
+    showing the change yields ``added``/``removed``; anything else is an
+    ``error`` whose message says whether the change may have happened.
     """
     verb = "add_tag" if adding else "remove_tag"
     try:
-        getattr(getattr(indigo_module, OBJECT_TYPES[type_name][1]), verb)(obj_id, tag)
-    except Exception as exc:  # pylint: disable=broad-except
-        return {"outcome": "error", "message": f"{verb} failed: {type(exc).__name__}: {exc}"}, False
+        _dispatch(command, f"{verb}({obj_id}, {tag!r})", obj_id, tag)
+    except (ValueError, RuntimeError) as exc:
+        return {"outcome": "error", "message": str(exc)}
     try:
         has_after = tag in _object_tags(collection[obj_id])
     except Exception as exc:  # pylint: disable=broad-except
         return {"outcome": "error",
-                "message": f"command accepted but read-back failed: {type(exc).__name__}: {exc}"}, False
+                "message": f"command accepted but read-back failed ({type(exc).__name__}: {exc}); "
+                           "the change may have taken effect"}
     if has_after != adding:
-        return {"outcome": "error", "message": "command accepted but read-back does not show the change"}, False
-    return {"outcome": "added" if adding else "removed"}, True
+        return {"outcome": "error", "message": "command accepted but read-back does not show the change"}
+    return {"outcome": "added" if adding else "removed"}
 
 
 def _tag_one(indigo_module, item, tag, *, adding, dry_run):
-    """One object's row, and whether a dispatched change was confirmed
-    (True), refuted or unconfirmed (False), or never attempted (None).
-    Never raises an ``Exception``: one bad object must not abort the
-    batch."""
+    """One object's row. Never raises an ``Exception``: one bad object
+    must not abort the batch, whatever part of the work fails.
+
+    ``dispatched`` says whether ``add_tag``/``remove_tag`` was sent, so a
+    caller can tell "nothing touched" from "sent, state unknown". A
+    dispatched row that is not ``error`` was confirmed by read-back.
+    """
     type_name, obj_id = item
-    out = {"type": type_name, "id": obj_id}
-    found, fragment = _inspect(indigo_module, type_name, obj_id, tag)
-    out.update(fragment)
-    if found is None:
-        return out, None
-    collection, has_tag = found
-    if has_tag == adding:
-        out["outcome"] = "already" if adding else "absent"
-    elif dry_run:
-        out["outcome"] = "would_add" if adding else "would_remove"
-    else:
-        fragment, confirmed = _change(indigo_module, collection, type_name=type_name,
-                                      obj_id=obj_id, tag=tag, adding=adding)
+    out = {"type": type_name, "id": obj_id, "dispatched": False}
+    try:
+        found, fragment = _inspect(indigo_module, type_name, obj_id, tag)
         out.update(fragment)
-        return out, confirmed
-    return out, None
+        if found is None:
+            return out
+        collection, has_tag = found
+        if has_tag == adding:
+            out["outcome"] = "already" if adding else "absent"
+        elif dry_run:
+            out["outcome"] = "would_add" if adding else "would_remove"
+        else:
+            # Resolve the command first: a failure finding it sent nothing.
+            command = getattr(getattr(indigo_module, OBJECT_TYPES[type_name][1]),
+                              "add_tag" if adding else "remove_tag")
+            out["dispatched"] = True
+            out.update(_change(command, collection, obj_id=obj_id, tag=tag, adding=adding))
+    except Exception as exc:  # pylint: disable=broad-except
+        out.update({"outcome": "error", "message": f"failed: {type(exc).__name__}: {exc}; " + (
+            "the change may have taken effect" if out["dispatched"] else "nothing was sent")})
+    return out
 
 
-def _needs_remove_confirmation(tag, action, objects, args):
-    """The requires_confirmation payload for a large remove, or None."""
-    if action != "remove" or args["dry_run"] or args["confirm"] or len(objects) <= REMOVE_CONFIRM_THRESHOLD:
+def _needs_remove_confirmation(tag, action, entries, flags):
+    """The requires_confirmation payload for a large remove, or None.
+
+    Counts the distinct entries requested, not the objects that turn
+    out to carry the tag: the gate runs before anything is read.
+    """
+    if action != "remove" or flags["dry_run"] or flags["confirm"] or len(entries) <= REMOVE_CONFIRM_THRESHOLD:
         return None
     return {
         "tag": tag, "action": action, "dry_run": False, "requires_confirmation": True,
-        "requested": len(objects), "verified": None,
+        "verified": None,
         "message": (
-            f"Nothing was changed. Removing {tag!r} from {len(objects)} objects (more than "
+            f"Nothing was changed. A remove of {tag!r} with {len(entries)} entries (more than "
             f"{REMOVE_CONFIRM_THRESHOLD}) needs confirm=true; dry_run=true previews it."
         ),
     }
+
+
+def _batch_verified(results):
+    """``verified`` for a batch: False if any row is ``error``; None if
+    nothing was dispatched (a dry run, or every row not_found / already /
+    absent); otherwise True, since a dispatched row is only non-error
+    when its read-back confirmed it."""
+    if any(row["outcome"] == "error" for row in results):
+        return False
+    if not any(row["dispatched"] for row in results):
+        return None
+    return True
 
 
 def _tag_objects_handler(args, indigo_module):
@@ -515,36 +626,45 @@ def _tag_objects_handler(args, indigo_module):
     action = args.get("action")
     if action not in ("add", "remove"):
         raise ValueError(f"action must be 'add' or 'remove'; got {action!r}")
-    objects = _parse_objects(args.get("objects"))
+    entries, duplicates = _parse_objects(args.get("objects"))
     flags = {"dry_run": _optional_bool(args, "dry_run"), "confirm": _optional_bool(args, "confirm")}
     library = _read_library(indigo_module)
     if tag not in library:
         raise _unknown_tag(tag, library)
-    pending = _needs_remove_confirmation(tag, action, objects, flags)
+    counts = {"requested": len(args["objects"]), "duplicates_ignored": duplicates}
+    pending = _needs_remove_confirmation(tag, action, entries, flags)
     if pending is not None:
+        pending.update(counts)
         return pending
-    results, confirmations = [], []
-    for item in objects:
-        row, confirmed = _tag_one(indigo_module, item, tag, adding=action == "add", dry_run=flags["dry_run"])
-        results.append(row)
-        if confirmed is not None:
-            confirmations.append(confirmed)
-    summary = {}
+    results = [_tag_one(indigo_module, item, tag, adding=action == "add", dry_run=flags["dry_run"])
+               for item in entries]
+    summary = {"error": 0}
     for row in results:
         summary[row["outcome"]] = summary.get(row["outcome"], 0) + 1
     return {
         "tag": tag,
         "action": action,
         "dry_run": flags["dry_run"],
-        # null on a dry run: nothing was changed, so nothing to verify.
-        "verified": None if flags["dry_run"] else all(confirmations),
-        "requested": len(objects),
+        "verified": _batch_verified(results),
+        **counts,
         "summary": summary,
         "results": results,
     }
 
 
 # -- list_tagged -------------------------------------------------------------------
+
+
+def _pagination(args):
+    """``(limit, offset)``; a bool is refused (it is not an integer here)."""
+    raw = {"limit": args.get("limit", _DEFAULT_LIST_LIMIT), "offset": args.get("offset", 0)}
+    for key, value in raw.items():
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be an integer; got {value!r}")
+    try:
+        return _normalize_pagination(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"limit and offset must be integers ({exc})") from exc
 
 
 def _list_tagged_handler(args, indigo_module):
@@ -554,22 +674,15 @@ def _list_tagged_handler(args, indigo_module):
     type_name = args.get("type")
     if type_name is not None and type_name not in OBJECT_TYPES:
         raise ValueError(f"type must be one of {list(OBJECT_TYPES)}; got {type_name!r}")
-    try:
-        limit, offset = _normalize_pagination(
-            {"limit": args.get("limit", _DEFAULT_LIST_LIMIT), "offset": args.get("offset", 0)}
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"limit and offset must be integers ({exc})") from exc
+    limit, offset = _pagination(args)
     library = _read_library(indigo_module)
     if tag not in library:
         # A mistyped tag is a failed call, not "nothing carries it".
         raise _unknown_tag(tag, library)
     types = [type_name] if type_name else list(OBJECT_TYPES)
-    rows, unreadable, attr_errors = _scan_carriers(indigo_module, tag, types)
-    if unreadable and len(unreadable) == len(types):
-        raise ValueError(
-            f"no object collection could be read ({unreadable}); cannot say what carries {tag!r}."
-        )
+    scan = _scan_carriers(indigo_module, tag, types)
+    _require_readable_scan(scan, tag, types)
+    rows = scan["rows"]
     total = len(rows)
     out = {
         "tag": tag,
@@ -579,10 +692,8 @@ def _list_tagged_handler(args, indigo_module):
         "limit": limit,
         "has_more": offset + limit < total,
     }
-    if unreadable or attr_errors:
-        # The list is incomplete; say so rather than pass it off as whole.
-        out["collections_unreadable"] = unreadable
-        out["attr_read_errors"] = attr_errors
+    # Always present: an incomplete list must say so rather than pass as whole.
+    out.update(_scan_report(scan, "total_count_complete"))
     return out
 
 
@@ -610,8 +721,11 @@ def register(handler, *, indigo_module, allow_tag_delete=None, **_):
             "color. delete is gated twice: the plugin's 'Allow tag delete' preference must be "
             "on, AND confirm must be true. Without confirm it deletes nothing and returns "
             "requires_confirmation with how many objects carry the tag (deleting strips it "
-            "from all of them and cannot be undone). Every change is read back from the "
-            "library and reported as `verified`. Assign tags to objects with tag_objects."
+            "from all of them and cannot be undone); carrier_count_complete is false when "
+            "some objects could not be read, and a confirmed delete is then refused. "
+            "`accepted` means only that Indigo took the command; every change is read back "
+            "from the library and `verified` says whether it shows (null if the read-back "
+            "failed). Assign tags to objects with tag_objects."
         ),
         input_schema={
             "type": "object",
@@ -633,11 +747,13 @@ def register(handler, *, indigo_module, allow_tag_delete=None, **_):
             "2026.1+). objects is a list of {type, id} with type one of device, variable, "
             "trigger, schedule, action_group, control_page. The tag must already exist "
             "(create it with manage_tags; it is never created here). Each object gets an "
-            "outcome: added, already, removed, absent, not_found, or error (with a message); "
-            "one failing object never stops the rest. dry_run=true changes nothing and "
-            "reports would_add / would_remove instead. Removing from more than 25 objects "
-            "needs confirm=true. Every change is read back from the object; `verified` is "
-            "false if any read-back does not show it (that object's outcome is then error)."
+            "outcome: added, already, removed, absent, not_found, or error (with a message), "
+            "and `dispatched` says whether a command was sent for it (an error with "
+            "dispatched: true may have taken effect). One failing object never stops the "
+            "rest; repeated entries are dropped (duplicates_ignored). dry_run=true changes "
+            "nothing and reports would_add / would_remove instead. A remove with more than "
+            "25 entries needs confirm=true. Every change is read back from the object. "
+            "`verified` is false if any row is error, null if nothing was sent, else true."
         ),
         input_schema={
             "type": "object",
@@ -658,7 +774,7 @@ def register(handler, *, indigo_module, allow_tag_delete=None, **_):
                     },
                 },
                 "dry_run": {"type": "boolean"},
-                "confirm": {"type": "boolean", "description": "needed to remove from more than 25 objects"},
+                "confirm": {"type": "boolean", "description": "needed for a remove with more than 25 entries"},
             },
         },
         handler=lambda **args: _tag_objects_handler(args, indigo_module),
@@ -672,7 +788,8 @@ def register(handler, *, indigo_module, allow_tag_delete=None, **_):
             "WITHOUT Remote Display turned on (remote_display: false), so it shows what the "
             "built-in server's tag filter cannot see. remote_display is null for triggers, "
             "which have no such setting. An unknown tag is an error listing the library, "
-            "never an empty result."
+            "never an empty result. total_count_complete is false (with "
+            "collections_unreadable / attr_read_errors) when some objects could not be read."
         ),
         input_schema={
             "type": "object",
