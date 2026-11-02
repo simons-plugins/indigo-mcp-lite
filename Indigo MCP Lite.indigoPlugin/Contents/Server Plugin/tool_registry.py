@@ -13,13 +13,20 @@ covers lookup and control; there ``register_all`` drops the tools in
 ``BUILTIN_COVERED`` unless the "Legacy tools" pref is on (lite ADR-0003,
 ``docs/adr/0003-extension-layer-on-indigo-2026-1.md``). The gate lives
 here so the ``tools/*.py`` modules stay unaware of it.
+
+Tag tools (``tools/tags.py``: ``manage_tags``, ``tag_objects``,
+``list_tagged``) are extension tools: the built-in server reads tags
+but cannot create or assign them, so they are never in
+``BUILTIN_COVERED``. Before Indigo 2026.1 they still register and
+every call fails with a message naming the server version.
 """
 
 import re
 
 from tools import (auto_lights, automation_contents, automations, control,
                    find_devices, history, introspection, irrigation_speed,
-                   lamplighter, lookup, plugin_actions, system, zwave)
+                   lamplighter, lookup, plugin_actions, system, tags,
+                   zwave)
 
 
 # Tools that Indigo 2026.1's built-in MCP server (/v3/api/mcp) already
@@ -147,7 +154,7 @@ class _GatedRegistrar:
 
 def register_all(handler, *, indigo_module, indexer=None,
                  history_db_provider=None, logger=None,
-                 legacy_tools=False, slim=None, **_):
+                 legacy_tools=False, slim=None, allow_tag_delete=None, **_):
     """Register every tool onto ``handler``.
 
     ``indexer`` is required for ``find_devices``; if it isn't
@@ -168,6 +175,10 @@ def register_all(handler, *, indigo_module, indexer=None,
     ``find_devices`` is skipped even when an indexer is supplied, and
     ``handler.relocated_tools`` maps each skipped name to a hint that
     the handler returns instead of "Unknown tool".
+
+    ``allow_tag_delete`` is a zero-argument callable returning the
+    ``allowTagDelete`` preference, read on every ``manage_tags`` delete;
+    absent, tag deletes are refused.
 
     Returns ``{"slim": bool, "registered": int, "skipped": int}`` so
     the caller can log what this server ended up exposing.
@@ -208,6 +219,10 @@ def register_all(handler, *, indigo_module, indexer=None,
     # from plugin_execute_action can still log its WAS-DISPATCHED
     # disclosure (post-merge review, item 1).
     plugin_actions.register(handler, indigo_module=indigo_module, logger=logger)
+    # Indigo 2026.1 tags (create / assign / list). The built-in MCP only
+    # reads tags, so these are extension tools on every server.
+    tags.register(handler, indigo_module=indigo_module,
+                  allow_tag_delete=allow_tag_delete)
     if indexer is not None and not slim:
         find_devices.register(handler, indexer=indexer)
     elif slim:

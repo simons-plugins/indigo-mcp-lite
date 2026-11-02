@@ -15,6 +15,11 @@
         <Description>Also register the lookup/control tools that Indigo 2026.1's own MCP server provides. Needed to reach objects without Remote Display, the second white channel (white2), or multi-key state search. Ignored before Indigo 2026.1. Takes effect after the plugin restarts.</Description>
     </Field>
 
+    <Field id="allowTagDelete" type="checkbox" defaultValue="false">
+        <Label>Allow tag delete:</Label>
+        <Description>Let manage_tags delete tags (Indigo 2026.1+). Deleting a tag strips it from every object carrying it and cannot be undone; each delete also needs confirm=true.</Description>
+    </Field>
+
     <Field id="separator1" type="separator" />
 
     <Field id="historyLabel" type="label">

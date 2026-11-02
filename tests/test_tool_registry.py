@@ -44,6 +44,9 @@ EXTENSION_TOOLS = frozenset({
     "variable_move_to_folder", "device_status_request", "device_ping",
     "device_beep", "device_reset_energy_accum", "get_dependencies",
     "get_device_group", "list_uncataloged_devices",
+    # Indigo 2026.1 tags: the built-in server reads tags but cannot
+    # create or assign them.
+    "manage_tags", "tag_objects", "list_tagged",
 })
 
 
@@ -62,8 +65,8 @@ def _register(mock_indigo, **kwargs):
     return _registered(handler), result
 
 
-def test_extension_set_is_33_tools():
-    assert len(EXTENSION_TOOLS) == 33
+def test_extension_set_is_36_tools():
+    assert len(EXTENSION_TOOLS) == 36
 
 
 def test_2026_1_registers_only_the_extension_tools(mock_indigo):
@@ -73,11 +76,11 @@ def test_2026_1_registers_only_the_extension_tools(mock_indigo):
     names, result = _register(mock_indigo, indexer=MagicMock())
 
     assert set(names) == EXTENSION_TOOLS
-    assert len(names) == len(set(names)) == 33
+    assert len(names) == len(set(names)) == 36
     assert not set(names) & BUILTIN_COVERED
     # find_devices is skipped even though an indexer was supplied.
     assert "find_devices" not in names
-    assert result == {"slim": True, "registered": 33, "skipped": 53}
+    assert result == {"slim": True, "registered": 36, "skipped": 53}
 
 
 def test_2025_2_registers_everything(mock_indigo):
@@ -89,7 +92,7 @@ def test_2025_2_registers_everything(mock_indigo):
     assert EXTENSION_TOOLS <= set(names)
     assert result["slim"] is False
     assert result["skipped"] == 0
-    assert result["registered"] == len(names) == 86
+    assert result["registered"] == len(names) == 89
 
 
 def test_2026_1_with_legacy_tools_registers_everything(mock_indigo):
@@ -101,8 +104,8 @@ def test_2026_1_with_legacy_tools_registers_everything(mock_indigo):
 
     assert BUILTIN_COVERED <= set(names)
     assert EXTENSION_TOOLS <= set(names)
-    assert len(names) == 86
-    assert result == {"slim": False, "registered": 86, "skipped": 0}
+    assert len(names) == 89
+    assert result == {"slim": False, "registered": 89, "skipped": 0}
 
 
 def test_slim_without_indexer_matches_production_call_shape(mock_indigo):
@@ -112,7 +115,7 @@ def test_slim_without_indexer_matches_production_call_shape(mock_indigo):
     names, result = _register(mock_indigo, indexer=None)
 
     assert set(names) == EXTENSION_TOOLS
-    assert result == {"slim": True, "registered": 33, "skipped": 53}
+    assert result == {"slim": True, "registered": 36, "skipped": 53}
 
 
 def _fatal_version_probe(monkeypatch):
@@ -129,8 +132,8 @@ def test_explicit_slim_false_wins_over_a_2026_1_version(mock_indigo, monkeypatch
     mock_indigo.server.version = "2026.1.0"
     names, result = _register(mock_indigo, indexer=MagicMock(), slim=False)
 
-    assert len(names) == 86
-    assert result == {"slim": False, "registered": 86, "skipped": 0}
+    assert len(names) == 89
+    assert result == {"slim": False, "registered": 89, "skipped": 0}
 
 
 def test_explicit_slim_true_wins_over_a_2025_2_version(mock_indigo, monkeypatch):
@@ -139,7 +142,7 @@ def test_explicit_slim_true_wins_over_a_2025_2_version(mock_indigo, monkeypatch)
     names, result = _register(mock_indigo, indexer=None, slim=True)
 
     assert set(names) == EXTENSION_TOOLS
-    assert result == {"slim": True, "registered": 33, "skipped": 53}
+    assert result == {"slim": True, "registered": 36, "skipped": 53}
 
 
 @pytest.mark.parametrize("version", ["MISSING", "MAGICMOCK", "garbage", "", 2026.1])
@@ -155,7 +158,7 @@ def test_unknown_server_version_falls_back_to_everything(mock_indigo, version):
 
     assert "list_devices" in names
     assert "find_devices" in names
-    assert len(names) == 86
+    assert len(names) == 89
     assert result["slim"] is False
 
 

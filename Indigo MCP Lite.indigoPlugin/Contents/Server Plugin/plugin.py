@@ -30,6 +30,12 @@ Indigo home automation (indigodomo.com). Tools fall into four groups:
 - CONTROL — change state: turn on/off, dim, colour, setpoints, execute,
   enable/disable.
 - SYSTEM/HISTORY — event log, plugin status, SQL Logger queries.
+- TAGS (Indigo 2026.1+) — manage_tags creates, renames, recolours and
+  deletes tags; tag_objects adds or removes a tag on objects;
+  list_tagged lists everything carrying one. On 2026.1+ the server's
+  own MCP at /v3/api/mcp reads tags and filters its list_* tools by
+  them, but sees only objects with Remote Display on. Tag names are
+  lowercase letters separated by single dashes.
 
 Three answers that look complete but are not:
 
@@ -94,6 +100,13 @@ only what the built-in server does not do:
 - Z-WAVE: list_zwave_devices, get_zwave_device_details.
 - LIFECYCLE: trigger_enable, schedule_enable, device_enable,
   variable_delete, variable_move_to_folder.
+- TAGS: manage_tags creates, renames, recolours and deletes tags in the
+  library; tag_objects adds or removes a tag on devices, variables,
+  triggers, schedules, action groups and control pages; list_tagged
+  lists everything carrying a tag. The built-in server only READS tags
+  (and filters its list_* tools by them), and its tag filter sees only
+  objects with Remote Display on; list_tagged sees all of them. Tag
+  names are lowercase letters separated by single dashes.
 - DIAGNOSTICS: device_ping, device_beep, device_status_request,
   device_reset_energy_accum, get_dependencies, get_device_group,
   list_uncataloged_devices.
@@ -228,7 +241,11 @@ class Plugin(indigo.PluginBase):
                                   history_db_provider=lambda: self.history_db,
                                   logger=self.logger,
                                   legacy_tools=self._legacy_tools,
-                                  slim=self._slim)
+                                  slim=self._slim,
+                                  # Read per call, so the pref applies
+                                  # without a restart.
+                                  allow_tag_delete=lambda: _pref_bool(
+                                      self.pluginPrefs.get("allowTagDelete", False), self.logger))
         except Exception:
             self.logger.exception(
                 "Tool registration failed part-way; the server may be serving a partial tool set"
