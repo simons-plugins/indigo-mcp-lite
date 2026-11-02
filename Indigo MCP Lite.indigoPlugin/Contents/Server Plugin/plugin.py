@@ -63,9 +63,10 @@ at a given time) rather than inferring it from the event log.
 
 # Instructions for Indigo 2026.1+, where the server's own MCP covers
 # lookup and control and lite registers only its extension tools
-# (workspace ADR-0009). Same job as SERVER_INSTRUCTIONS: route the
-# client to the right server and family, and keep the three
-# incomplete-looking answers in front of it.
+# (lite ADR-0003, docs/adr/0003-extension-layer-on-indigo-2026-1.md).
+# Same job as SERVER_INSTRUCTIONS: route the client to the right server
+# and family, and keep the three incomplete-looking answers in front
+# of it.
 SERVER_INSTRUCTIONS_SLIM = """\
 Indigo home automation (indigodomo.com), extension tools.
 
@@ -73,9 +74,12 @@ This Indigo server (2026.1 or later) runs its own MCP server at
 /v3/api/mcp. Use THAT server for lookup and control: finding and
 reading devices, variables, action groups, triggers, schedules and
 plugins; on/off, dimming, colour, thermostats, sprinklers, speed
-controls, locks; executing action groups; the event log; plugin status
-and restarts. This server (indigo-mcp-lite) is the extension layer and
-registers only what the built-in server does not do:
+controls, locks; executing action groups, triggers and schedules;
+creating and updating variables; the event log; plugin status and
+restarts. The built-in server's execute, lock and restart_plugin calls
+return a confirmation token that must be passed to its `confirm` tool.
+This server (indigo-mcp-lite) is the extension layer and registers
+only what the built-in server does not do:
 
 - CONTENTS: what an automation DOES and WHEN. get_automation_contents,
   find_automation_references, list_automation_scripts decode the
@@ -131,11 +135,22 @@ at a given time) rather than inferring it from the event log.
 """
 
 
-def _pref_bool(value):
-    """Plugin prefs may hold a checkbox as a bool or as "true"/"false"."""
+def _pref_bool(value, logger):
+    """Read a checkbox pref, which may be a bool, an int or "true"/"false".
+
+    Anything else (another string, an unexpected type) is logged as a
+    warning naming the value and read as False. ``None`` (pref absent)
+    is False without a warning.
+    """
+    if isinstance(value, (bool, int)):
+        return bool(value)
     if isinstance(value, str):
-        return value.strip().lower() == "true"
-    return bool(value)
+        lowered = value.strip().lower()
+        if lowered in ("true", "false"):
+            return lowered == "true"
+    if value is not None:
+        logger.warning(f"Unexpected checkbox preference value {value!r}; treating it as off")
+    return False
 
 
 class Plugin(indigo.PluginBase):
@@ -144,12 +159,23 @@ class Plugin(indigo.PluginBase):
         self._apply_log_level()
         # Deferred import, same reason as in startup(): importing
         # `plugin` must not pull in the whole tool tree.
-        from tool_registry import server_has_builtin_mcp
+        from tool_registry import server_has_builtin_mcp  # pylint: disable=import-outside-toplevel
+
+        # Read once for the startup log lines; the gate below does its
+        # own (logged) read and treats anything unusable as "no
+        # built-in MCP".
+        try:
+            version = indigo.server.version
+        except Exception:  # pylint: disable=broad-except
+            version = None
+        self._server_version = version if isinstance(version, str) else "unknown"
 
         # Decided once: the tool set and the instructions text must
         # agree, and the handler is built here (before any IWS call).
-        # A changed "Legacy tools" pref takes effect on restart.
-        self._legacy_tools = _pref_bool(self.pluginPrefs.get("legacyTools", False))
+        # register_all is handed this decision (slim=) rather than
+        # re-deriving it. A changed "Legacy tools" pref takes effect
+        # on restart.
+        self._legacy_tools = _pref_bool(self.pluginPrefs.get("legacyTools", False), self.logger)
         self._builtin_mcp = server_has_builtin_mcp(indigo, self.logger)
         self._slim = self._builtin_mcp and not self._legacy_tools
         self.mcp_handler = MCPHandler(
@@ -196,17 +222,35 @@ class Plugin(indigo.PluginBase):
             indigo.actionGroups.subscribeToChanges()
 
         self._build_history_db()
-        result = register_all(self.mcp_handler, indigo_module=indigo,
-                              indexer=self.indexer,
-                              history_db_provider=lambda: self.history_db,
-                              logger=self.logger,
-                              legacy_tools=self._legacy_tools)
+        try:
+            result = register_all(self.mcp_handler, indigo_module=indigo,
+                                  indexer=self.indexer,
+                                  history_db_provider=lambda: self.history_db,
+                                  logger=self.logger,
+                                  legacy_tools=self._legacy_tools,
+                                  slim=self._slim)
+        except Exception:
+            self.logger.exception(
+                "Tool registration failed part-way; the server may be serving a partial tool set"
+            )
+            raise
+        # One line on every startup stating which surface this is.
         if result["slim"]:
             self.logger.info(
-                f"Indigo {indigo.server.version} has its own MCP server at /v3/api/mcp: "
+                f"Indigo {self._server_version} has its own MCP server at /v3/api/mcp: "
                 f"{result['skipped']} lookup/control tools it provides were not registered, "
                 f"{result['registered']} extension tools remain. Turn on the "
-                f"\"Legacy tools\" plugin preference to restore them."
+                f"\"Legacy tools\" plugin preference and restart the plugin to restore them."
+            )
+        elif self._builtin_mcp:
+            self.logger.info(
+                f"Indigo {self._server_version} has its own MCP server at /v3/api/mcp; "
+                f"\"Legacy tools\" is on, so all {result['registered']} tools registered"
+            )
+        else:
+            self.logger.info(
+                f"Indigo {self._server_version}: no built-in MCP server, "
+                f"all {result['registered']} tools registered"
             )
 
     def shutdown(self):
@@ -215,7 +259,7 @@ class Plugin(indigo.PluginBase):
     def closedPrefsConfigUi(self, valuesDict, userCancelled):
         if not userCancelled:
             self._apply_log_level()
-            legacy = _pref_bool(valuesDict.get("legacyTools", False))
+            legacy = _pref_bool(valuesDict.get("legacyTools", False), self.logger)
             if legacy != self._legacy_tools:
                 if self._builtin_mcp:
                     self.logger.warning(
