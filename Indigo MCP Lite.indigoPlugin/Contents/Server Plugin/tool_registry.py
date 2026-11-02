@@ -10,9 +10,9 @@ indexer through without breaking the existing call sites.
 
 On Indigo 2026.1+ the server ships its own MCP (``/v3/api/mcp``) that
 covers lookup and control; there ``register_all`` drops the tools in
-``BUILTIN_COVERED`` unless the "Legacy tools" pref is on (workspace
-ADR-0009). The gate lives here so the ``tools/*.py`` modules stay
-unaware of it.
+``BUILTIN_COVERED`` unless the "Legacy tools" pref is on (lite ADR-0003,
+``docs/adr/0003-extension-layer-on-indigo-2026-1.md``). The gate lives
+here so the ``tools/*.py`` modules stay unaware of it.
 """
 
 import re
@@ -24,9 +24,9 @@ from tools import (auto_lights, automation_contents, automations, control,
 
 # Tools that Indigo 2026.1's built-in MCP server (/v3/api/mcp) already
 # provides. Not registered on a 2026.1+ server unless the "Legacy tools"
-# pref is on. Decision and tool-by-tool mapping: workspace ADR-0009
-# (docs/adr/0009-builtin-mcp-is-general-surface-lite-is-extension.md)
-# and docs/plans/2026-11-02-indigo-mcp-lite-builtin-overlap.md.
+# pref is on. Decision: lite ADR-0003
+# (docs/adr/0003-extension-layer-on-indigo-2026-1.md), which records
+# the workspace-level ADR-0009 it follows.
 BUILTIN_COVERED = frozenset({
     # Lookup
     "list_devices", "list_variables", "list_action_groups", "list_triggers",
@@ -60,21 +60,40 @@ _BUILTIN_MCP_MIN_VERSION = (2026, 1)
 
 _VERSION_RE = re.compile(r"\s*(\d+)\.(\d+)")
 
+_FALLBACK_NOTE = (
+    "registering all tools. On Indigo 2026.1+ the built-in MCP at /v3/api/mcp "
+    f"duplicates {len(BUILTIN_COVERED)} of them."
+)
+
+
+def relocated_hint(name):
+    """Error text for a call to a tool the gate left to the built-in MCP."""
+    return (
+        f"{name} is provided by Indigo's built-in MCP server at /v3/api/mcp on this "
+        "server (Indigo 2026.1+); indigo-mcp-lite no longer registers it. Turn on the "
+        "'Legacy tools' plugin preference and restart the plugin to restore it here."
+    )
+
 
 def server_has_builtin_mcp(indigo_module, logger=None):
     """True iff the connected Indigo server is 2026.1 or later.
 
     ``indigo.server.version`` is a string such as ``"2026.1.0"``.
-    Anything else (attribute missing, a non-string such as the
-    MagicMock the test suite and doc generator use, or an unparsable
+    Anything else (attribute missing, a non-string, or an unparsable
     string) answers False, so lite falls back to registering every
-    tool rather than registering too few.
+    tool rather than registering too few. An unreadable or unparsable
+    version is a warning: on a real 2026.1+ server it means lite is
+    duplicating the built-in surface. A non-string (only ever a test
+    double) stays at debug so the suite is not noisy.
     """
     try:
         version = indigo_module.server.version
     except Exception as exc:  # pylint: disable=broad-except
         if logger is not None:
-            logger.debug(f"Indigo server version unreadable ({exc}); assuming no built-in MCP")
+            logger.warning(
+                f"Indigo server version unreadable ({type(exc).__name__}: {exc}); "
+                f"{_FALLBACK_NOTE}"
+            )
         return False
     if not isinstance(version, str):
         if logger is not None:
@@ -83,31 +102,41 @@ def server_has_builtin_mcp(indigo_module, logger=None):
     match = _VERSION_RE.match(version)
     if match is None:
         if logger is not None:
-            logger.debug(f"Indigo server version {version!r} unparsable; assuming no built-in MCP")
+            logger.warning(f"Indigo server version {version!r} unparsable; {_FALLBACK_NOTE}")
         return False
     return (int(match.group(1)), int(match.group(2))) >= _BUILTIN_MCP_MIN_VERSION
 
 
 class _GatedRegistrar:
-    """Handler proxy that drops (and counts) excluded tool names.
+    """Handler proxy that drops (and records) excluded tool names.
 
     ``register_tool`` skips names in ``excluded`` and forwards
-    everything else, counting both; every other attribute,
-    ``register_resource`` included, goes straight to the real handler.
+    everything else, counting both and keeping the skipped names in
+    ``skipped_names``; every other attribute, ``register_resource``
+    included, goes straight to the real handler.
     """
 
     def __init__(self, handler, excluded):
         self._handler = handler
         self._excluded = excluded
         self.registered = 0
-        self.skipped = 0
+        self.skipped_names = []
+
+    @property
+    def skipped(self):
+        """How many tool names were left to the built-in server."""
+        return len(self.skipped_names)
+
+    def skip(self, name):
+        """Record ``name`` as left to the built-in server."""
+        self.skipped_names.append(name)
 
     def register_tool(self, *args, **kwargs):
         """Forward to the real handler exactly as called, unless the
         tool name (``name=`` or first positional) is excluded."""
         name = kwargs["name"] if "name" in kwargs else args[0]
         if name in self._excluded:
-            self.skipped += 1
+            self.skip(name)
             return None
         self.registered += 1
         return self._handler.register_tool(*args, **kwargs)
@@ -118,7 +147,7 @@ class _GatedRegistrar:
 
 def register_all(handler, *, indigo_module, indexer=None,
                  history_db_provider=None, logger=None,
-                 legacy_tools=False, **_):
+                 legacy_tools=False, slim=None, **_):
     """Register every tool onto ``handler``.
 
     ``indexer`` is required for ``find_devices``; if it isn't
@@ -128,14 +157,24 @@ def register_all(handler, *, indigo_module, indexer=None,
     future phases can add more collaborators without touching every
     call site at once.
 
-    On a server with the built-in MCP (2026.1+) and ``legacy_tools``
-    off, the tools in ``BUILTIN_COVERED`` are not registered and
-    ``find_devices`` is skipped even when an indexer is supplied.
+    ``slim`` is the gate decision. A bool is used as given and the
+    server version is not read (plugin.py decides once in ``__init__``
+    so the tool set and the instructions text cannot disagree;
+    ``legacy_tools`` is then ignored, already folded in). ``None``
+    (tests, the doc generator) computes it here: the server has the
+    built-in MCP (2026.1+) and ``legacy_tools`` is off.
+
+    When slim, the tools in ``BUILTIN_COVERED`` are not registered,
+    ``find_devices`` is skipped even when an indexer is supplied, and
+    ``handler.relocated_tools`` maps each skipped name to a hint that
+    the handler returns instead of "Unknown tool".
 
     Returns ``{"slim": bool, "registered": int, "skipped": int}`` so
     the caller can log what this server ended up exposing.
     """
-    slim = server_has_builtin_mcp(indigo_module, logger) and not legacy_tools
+    if slim is None:
+        slim = server_has_builtin_mcp(indigo_module, logger) and not legacy_tools
+    real_handler = handler
     handler = _GatedRegistrar(handler, BUILTIN_COVERED if slim else frozenset())
     lookup.register(handler, indigo_module=indigo_module)
     # Logger threads into the catalog capability pre-checks so skipped
@@ -173,8 +212,9 @@ def register_all(handler, *, indigo_module, indexer=None,
         find_devices.register(handler, indexer=indexer)
     elif slim:
         # Not registered and never built (plugin.py skips the indexer
-        # on a slim server); counted so the log line's total is honest.
-        handler.skipped += 1
+        # on a slim server); recorded so the log line's total is honest
+        # and a call to it gets the relocation hint.
+        handler.skip("find_devices")
     # History tools always register; an absent provider yields the
     # friendly "not configured" tool-result error rather than a missing
     # tool, so agents can discover the capability and tell the user
@@ -182,5 +222,9 @@ def register_all(handler, *, indigo_module, indexer=None,
     history.register(
         handler, history_db_provider=history_db_provider or (lambda: None)
     )
+    if slim:
+        real_handler.relocated_tools = {
+            name: relocated_hint(name) for name in handler.skipped_names
+        }
     return {"slim": slim, "registered": handler.registered,
             "skipped": handler.skipped}
